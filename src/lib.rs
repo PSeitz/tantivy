@@ -126,13 +126,16 @@ mod macros;
 
 pub use chrono;
 
-pub use crate::error::TantivyError;
+pub use crate::error::{AsyncIoError, TantivyError};
 
 /// Tantivy result.
 ///
 /// Within tantivy, please avoid importing `Result` using `use crate::Result`
 /// and instead, refer to this as `crate::Result<T>`.
 pub type Result<T> = std::result::Result<T, TantivyError>;
+
+#[doc(hidden)]
+pub type AsyncIoResult<T> = std::result::Result<T, AsyncIoError>;
 
 /// Tantivy DateTime
 pub type DateTime = chrono::DateTime<chrono::Utc>;
@@ -167,6 +170,7 @@ mod docset;
 use std::fmt;
 
 pub use census::{Inventory, TrackedObject};
+pub use common;
 pub use common::{f64_to_u64, i64_to_u64, u64_to_f64, u64_to_i64, HasLen};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};

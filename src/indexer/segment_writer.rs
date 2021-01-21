@@ -326,6 +326,7 @@ fn remap_and_write(
     mut serializer: SegmentSerializer,
     doc_id_map: Option<&DocIdMapping>,
 ) -> crate::Result<()> {
+    debug!("remap-and-write");
     if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
         fieldnorms_writer.serialize(fieldnorms_serializer, doc_id_map)?;
     }
@@ -333,6 +334,7 @@ fn remap_and_write(
         .segment()
         .open_read(SegmentComponent::FieldNorms)?;
     let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+    debug!("postings-serialize");
     let term_ord_map = serialize_postings(
         ctx,
         per_field_postings_writers,
@@ -341,12 +343,14 @@ fn remap_and_write(
         schema,
         serializer.get_postings_serializer(),
     )?;
+    debug!("fastfield-serialize");
     fast_field_writers.serialize(
         serializer.get_fast_field_serializer(),
         &term_ord_map,
         doc_id_map,
     )?;
 
+    debug!("resort-docstore");
     // finalize temp docstore and create version, which reflects the doc_id_map
     if let Some(doc_id_map) = doc_id_map {
         let store_write = serializer
@@ -369,6 +373,7 @@ fn remap_and_write(
         }
     }
 
+    debug!("serializer-close");
     serializer.close()?;
 
     Ok(())

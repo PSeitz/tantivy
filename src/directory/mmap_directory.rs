@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::convert::From;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::{fmt, result};
+use std::{fmt, io, result};
 
 use fs2::FileExt;
 use memmap2::Mmap;

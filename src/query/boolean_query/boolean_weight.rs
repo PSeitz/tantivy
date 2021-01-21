@@ -47,7 +47,9 @@ where TScoreCombiner: ScoreCombiner {
     SpecializedScorer::Other(Box::new(Union::<_, TScoreCombiner>::from(scorers)))
 }
 
-fn into_box_scorer<TScoreCombiner: ScoreCombiner>(scorer: SpecializedScorer) -> Box<dyn Scorer> {
+fn into_box_scorer<TScoreCombiner: ScoreCombiner + Send>(
+    scorer: SpecializedScorer,
+) -> Box<dyn Scorer> {
     match scorer {
         SpecializedScorer::TermUnion(term_scorers) => {
             let union_scorer = Union::<TermScorer, TScoreCombiner>::from(term_scorers);
@@ -76,10 +78,10 @@ impl BooleanWeight {
         boost: Score,
     ) -> crate::Result<HashMap<Occur, Vec<Box<dyn Scorer>>>> {
         let mut per_occur_scorers: HashMap<Occur, Vec<Box<dyn Scorer>>> = HashMap::new();
-        for &(ref occur, ref subweight) in &self.weights {
+        for &(occur, ref subweight) in &self.weights {
             let sub_scorer: Box<dyn Scorer> = subweight.scorer(reader, boost)?;
             per_occur_scorers
-                .entry(*occur)
+                .entry(occur)
                 .or_insert_with(Vec::new)
                 .push(sub_scorer);
         }
