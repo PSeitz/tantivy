@@ -14,6 +14,7 @@ pub struct StatsAggregation {
     /// The field name to compute the stats on.
     pub field: String,
 }
+
 impl StatsAggregation {
     /// Create new StatsAggregation from a field.
     pub fn from_field_name(field_name: String) -> Self {
@@ -32,14 +33,14 @@ pub struct Stats {
     pub count: usize,
     /// The sum of the fast field values.
     pub sum: f64,
-    /// The standard deviation of the fast field values.
-    pub standard_deviation: f64,
+    /// The standard deviation of the fast field values. None for count == 0.
+    pub standard_deviation: Option<f64>,
     /// The min value of the fast field values.
     pub min: f64,
     /// The max value of the fast field values.
     pub max: f64,
-    /// The average of the values.
-    pub avg: f64,
+    /// The average of the values. None for count == 0.
+    pub avg: Option<f64>,
 }
 
 /// IntermediateStats contains the mergeable version for stats.
@@ -63,17 +64,24 @@ impl IntermediateStats {
         }
     }
 
-    pub(crate) fn avg(&self) -> f64 {
-        self.sum / (self.count as f64)
+    pub(crate) fn avg(&self) -> Option<f64> {
+        if self.count == 0 {
+            None
+        } else {
+            Some(self.sum / (self.count as f64))
+        }
     }
 
     fn square_mean(&self) -> f64 {
         self.squared_sum / (self.count as f64)
     }
 
-    pub(crate) fn standard_deviation(&self) -> f64 {
-        let average = self.avg();
-        (self.square_mean() - average * average).sqrt()
+    pub(crate) fn standard_deviation(&self) -> Option<f64> {
+        if let Some(average) = self.avg() {
+            Some((self.square_mean() - average * average).sqrt())
+        } else {
+            None
+        }
     }
 
     /// Merge data from other stats into this instance.
@@ -199,7 +207,11 @@ mod tests {
                 Aggregation::Bucket(BucketAggregation {
                     bucket_agg: BucketAggregationType::Range(RangeAggregation {
                         field: "score".to_string(),
-                        ranges: vec![(3f64..7f64).into(), (7f64..20f64).into()],
+                        ranges: vec![
+                            (3f64..7f64).into(),
+                            (7f64..19f64).into(),
+                            (19f64..20f64).into(),
+                        ],
                     }),
                     sub_aggregation: iter::once((
                         "stats".to_string(),
@@ -265,6 +277,18 @@ mod tests {
                 "min": 7.0,
                 "standard_deviation": 2.867441755680877,
                 "sum": 32.0
+            })
+        );
+
+        assert_eq!(
+            res["range"]["buckets"][3]["stats"],
+            json!({
+                "avg": serde_json::Value::Null,
+                "count": 0,
+                "max": f64::MIN,
+                "min": f64::MAX,
+                "standard_deviation": serde_json::Value::Null,
+                "sum": 0.0,
             })
         );
 
