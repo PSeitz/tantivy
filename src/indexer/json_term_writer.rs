@@ -1,4 +1,3 @@
-use chrono::Utc;
 use fnv::FnvHashMap;
 use murmurhash32::murmurhash2;
 
@@ -6,8 +5,10 @@ use crate::fastfield::FastValue;
 use crate::postings::{IndexingContext, IndexingPosition, PostingsWriter};
 use crate::schema::term::{JSON_END_OF_PATH, JSON_PATH_SEGMENT_SEP};
 use crate::schema::Type;
+use crate::time::format_description::well_known::Rfc3339;
+use crate::time::{OffsetDateTime, UtcOffset};
 use crate::tokenizer::TextAnalyzer;
-use crate::{DocId, Term};
+use crate::{DateTime, DocId, Term};
 
 /// This object is a map storing the last position for a given path for the current document
 /// being indexed.
@@ -56,7 +57,7 @@ struct IndexingPositionsPerPath {
 impl IndexingPositionsPerPath {
     fn get_position(&mut self, term: &Term) -> &mut IndexingPosition {
         self.positions_per_path
-            .entry(murmurhash2(term.as_slice()))
+            .entry(murmurhash2(term.value_bytes()))
             .or_insert_with(Default::default)
     }
 }
@@ -148,10 +149,11 @@ fn index_json_value<'a>(
                     json_term_writer.term_buffer,
                     ctx,
                     indexing_position,
+                    None,
                 );
             }
             TextOrDateTime::DateTime(dt) => {
-                json_term_writer.set_fast_value(dt);
+                json_term_writer.set_fast_value(DateTime::from_utc(dt));
                 postings_writer.subscribe(doc, 0u32, json_term_writer.term(), ctx);
             }
         },
@@ -184,13 +186,13 @@ fn index_json_value<'a>(
 
 enum TextOrDateTime<'a> {
     Text(&'a str),
-    DateTime(crate::DateTime),
+    DateTime(OffsetDateTime),
 }
 
 fn infer_type_from_str(text: &str) -> TextOrDateTime {
-    match chrono::DateTime::parse_from_rfc3339(text) {
+    match OffsetDateTime::parse(text, &Rfc3339) {
         Ok(dt) => {
-            let dt_utc = dt.with_timezone(&Utc);
+            let dt_utc = dt.to_offset(UtcOffset::UTC);
             TextOrDateTime::DateTime(dt_utc)
         }
         Err(_) => TextOrDateTime::Text(text),
@@ -206,7 +208,7 @@ impl<'a> JsonTermWriter<'a> {
     pub fn wrap(term_buffer: &'a mut Term) -> Self {
         term_buffer.clear_with_type(Type::Json);
         let mut path_stack = Vec::with_capacity(10);
-        path_stack.push(5);
+        path_stack.push(5); // magic number?
         Self {
             term_buffer,
             path_stack,
@@ -248,8 +250,8 @@ impl<'a> JsonTermWriter<'a> {
     /// Returns the json path of the term being currently built.
     #[cfg(test)]
     pub(crate) fn path(&self) -> &[u8] {
-        let end_of_path = self.path_stack.last().cloned().unwrap_or(6);
-        &self.term().as_slice()[5..end_of_path - 1]
+        let end_of_path = self.path_stack.last().cloned().unwrap_or(6); // TODO remove magic number
+        &self.term().value_bytes()[..end_of_path - 1]
     }
 
     pub fn set_fast_value<T: FastValue>(&mut self, val: T) {
@@ -319,10 +321,7 @@ mod tests {
         let mut json_writer = JsonTermWriter::wrap(&mut term);
         json_writer.push_path_segment("color");
         json_writer.set_str("red");
-        assert_eq!(
-            json_writer.term().as_slice(),
-            b"\x00\x00\x00\x01jcolor\x00sred"
-        )
+        assert_eq!(json_writer.term().value_bytes(), b"color\x00sred")
     }
 
     #[test]
@@ -334,8 +333,8 @@ mod tests {
         json_writer.push_path_segment("color");
         json_writer.set_fast_value(-4i64);
         assert_eq!(
-            json_writer.term().as_slice(),
-            b"\x00\x00\x00\x01jcolor\x00i\x7f\xff\xff\xff\xff\xff\xff\xfc"
+            json_writer.term().value_bytes(),
+            b"color\x00i\x7f\xff\xff\xff\xff\xff\xff\xfc"
         )
     }
 
@@ -348,8 +347,8 @@ mod tests {
         json_writer.push_path_segment("color");
         json_writer.set_fast_value(4u64);
         assert_eq!(
-            json_writer.term().as_slice(),
-            b"\x00\x00\x00\x01jcolor\x00u\x00\x00\x00\x00\x00\x00\x00\x04"
+            json_writer.term().value_bytes(),
+            b"color\x00u\x00\x00\x00\x00\x00\x00\x00\x04"
         )
     }
 
@@ -362,8 +361,8 @@ mod tests {
         json_writer.push_path_segment("color");
         json_writer.set_fast_value(4.0f64);
         assert_eq!(
-            json_writer.term().as_slice(),
-            b"\x00\x00\x00\x01jcolor\x00f\xc0\x10\x00\x00\x00\x00\x00\x00"
+            json_writer.term().value_bytes(),
+            b"color\x00f\xc0\x10\x00\x00\x00\x00\x00\x00"
         )
     }
 
@@ -378,8 +377,8 @@ mod tests {
         json_writer.push_path_segment("color");
         json_writer.set_str("red");
         assert_eq!(
-            json_writer.term().as_slice(),
-            b"\x00\x00\x00\x01jattribute\x01color\x00sred"
+            json_writer.term().value_bytes(),
+            b"attribute\x01color\x00sred"
         )
     }
 
@@ -393,10 +392,7 @@ mod tests {
         json_writer.push_path_segment("hue");
         json_writer.pop_path_segment();
         json_writer.set_str("red");
-        assert_eq!(
-            json_writer.term().as_slice(),
-            b"\x00\x00\x00\x01jcolor\x00sred"
-        )
+        assert_eq!(json_writer.term().value_bytes(), b"color\x00sred")
     }
 
     #[test]

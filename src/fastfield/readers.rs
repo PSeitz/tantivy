@@ -5,7 +5,7 @@ use crate::fastfield::{
 };
 use crate::schema::{Cardinality, Field, FieldType, Schema};
 use crate::space_usage::PerFieldSpaceUsage;
-use crate::TantivyError;
+use crate::{DateTime, TantivyError};
 
 /// Provides access to all of the BitpackedFastFieldReader.
 ///
@@ -39,6 +39,9 @@ pub(crate) fn type_and_cardinality(field_type: &FieldType) -> Option<(FastType, 
             .get_fastfield_cardinality()
             .map(|cardinality| (FastType::Date, cardinality)),
         FieldType::Facet(_) => Some((FastType::U64, Cardinality::MultiValues)),
+        FieldType::Str(options) if options.is_fast() => {
+            Some((FastType::U64, Cardinality::MultiValues))
+        }
         _ => None,
     }
 }
@@ -147,10 +150,10 @@ impl FastFieldReaders {
         self.typed_fast_field_reader(field)
     }
 
-    /// Returns the `i64` fast field reader reader associated to `field`.
+    /// Returns the `date` fast field reader reader associated to `field`.
     ///
-    /// If `field` is not a i64 fast field, this method returns an Error.
-    pub fn date(&self, field: Field) -> crate::Result<DynamicFastFieldReader<crate::DateTime>> {
+    /// If `field` is not a date fast field, this method returns an Error.
+    pub fn date(&self, field: Field) -> crate::Result<DynamicFastFieldReader<DateTime>> {
         self.check_type(field, FastType::Date, Cardinality::SingleValue)?;
         self.typed_fast_field_reader(field)
     }
@@ -195,13 +198,12 @@ impl FastFieldReaders {
         self.typed_fast_field_multi_reader(field)
     }
 
-    /// Returns a `crate::DateTime` multi-valued fast field reader reader associated to `field`.
+    /// Returns a `time::OffsetDateTime` multi-valued fast field reader reader associated to
+    /// `field`.
     ///
-    /// If `field` is not a `crate::DateTime` multi-valued fast field, this method returns an Error.
-    pub fn dates(
-        &self,
-        field: Field,
-    ) -> crate::Result<MultiValuedFastFieldReader<crate::DateTime>> {
+    /// If `field` is not a `time::OffsetDateTime` multi-valued fast field, this method returns an
+    /// Error.
+    pub fn dates(&self, field: Field) -> crate::Result<MultiValuedFastFieldReader<DateTime>> {
         self.check_type(field, FastType::Date, Cardinality::MultiValues)?;
         self.typed_fast_field_multi_reader(field)
     }

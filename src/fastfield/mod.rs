@@ -30,9 +30,8 @@ pub use self::readers::FastFieldReaders;
 pub(crate) use self::readers::{type_and_cardinality, FastType};
 pub use self::serializer::{CompositeFastFieldSerializer, FastFieldDataAccess, FastFieldStats};
 pub use self::writer::{FastFieldsWriter, IntFastFieldWriter};
-use crate::chrono::{NaiveDateTime, Utc};
 use crate::schema::{Cardinality, FieldType, Type, Value};
-use crate::DocId;
+use crate::{DateTime, DocId};
 
 mod alive_bitset;
 mod bytes;
@@ -161,14 +160,14 @@ impl FastValue for f64 {
     }
 }
 
-impl FastValue for crate::DateTime {
+impl FastValue for DateTime {
     fn from_u64(timestamp_u64: u64) -> Self {
-        let timestamp_i64 = i64::from_u64(timestamp_u64);
-        crate::DateTime::from_utc(NaiveDateTime::from_timestamp(timestamp_i64, 0), Utc)
+        let unix_timestamp = i64::from_u64(timestamp_u64);
+        Self::from_unix_timestamp(unix_timestamp)
     }
 
     fn to_u64(&self) -> u64 {
-        self.timestamp().to_u64()
+        self.into_unix_timestamp().to_u64()
     }
 
     fn fast_field_cardinality(field_type: &FieldType) -> Option<Cardinality> {
@@ -179,7 +178,7 @@ impl FastValue for crate::DateTime {
     }
 
     fn as_u64(&self) -> u64 {
-        self.timestamp().as_u64()
+        self.into_unix_timestamp().as_u64()
     }
 
     fn to_type() -> Type {
@@ -188,12 +187,32 @@ impl FastValue for crate::DateTime {
 }
 
 fn value_to_u64(value: &Value) -> u64 {
-    match *value {
-        Value::U64(ref val) => *val,
-        Value::I64(ref val) => common::i64_to_u64(*val),
-        Value::F64(ref val) => common::f64_to_u64(*val),
-        Value::Date(ref datetime) => common::i64_to_u64(datetime.timestamp()),
-        _ => panic!("Expected a u64/i64/f64 field, got {:?} ", value),
+    match value {
+        Value::U64(val) => val.to_u64(),
+        Value::I64(val) => val.to_u64(),
+        Value::F64(val) => val.to_u64(),
+        Value::Date(val) => val.to_u64(),
+        _ => panic!("Expected a u64/i64/f64/date field, got {:?} ", value),
+    }
+}
+
+/// The fast field type
+pub enum FastFieldType {
+    /// Numeric type, e.g. f64.
+    Numeric,
+    /// Fast field stores string ids.
+    String,
+    /// Fast field stores string ids for facets.
+    Facet,
+}
+
+impl FastFieldType {
+    fn is_storing_term_ids(&self) -> bool {
+        matches!(self, FastFieldType::String | FastFieldType::Facet)
+    }
+
+    fn is_facet(&self) -> bool {
+        matches!(self, FastFieldType::Facet)
     }
 }
 
@@ -201,6 +220,7 @@ fn value_to_u64(value: &Value) -> u64 {
 mod tests {
 
     use std::collections::HashMap;
+    use std::ops::Range;
     use std::path::Path;
 
     use common::HasLen;
@@ -212,7 +232,8 @@ mod tests {
     use super::*;
     use crate::directory::{CompositeFile, Directory, RamDirectory, WritePtr};
     use crate::merge_policy::NoMergePolicy;
-    use crate::schema::{Document, Field, NumericOptions, Schema, FAST};
+    use crate::schema::{Document, Field, NumericOptions, Schema, FAST, STRING, TEXT};
+    use crate::time::OffsetDateTime;
     use crate::{Index, SegmentId, SegmentReader};
 
     pub static SCHEMA: Lazy<Schema> = Lazy::new(|| {
@@ -233,7 +254,7 @@ mod tests {
 
     #[test]
     pub fn test_fastfield_i64_u64() {
-        let datetime = crate::DateTime::from_utc(NaiveDateTime::from_timestamp(0i64, 0), Utc);
+        let datetime = DateTime::from_utc(OffsetDateTime::UNIX_EPOCH);
         assert_eq!(i64::from_u64(datetime.to_u64()), 0i64);
     }
 
@@ -489,7 +510,8 @@ mod tests {
         let index = Index::create_in_ram(schema);
         let mut index_writer = index.writer_for_tests().unwrap();
         index_writer.set_merge_policy(Box::new(NoMergePolicy));
-        index_writer.add_document(doc!(date_field =>crate::chrono::prelude::Utc::now()))?;
+        index_writer
+            .add_document(doc!(date_field =>DateTime::from_utc(OffsetDateTime::now_utc())))?;
         index_writer.commit()?;
         index_writer.add_document(doc!())?;
         index_writer.commit()?;
@@ -501,8 +523,7 @@ mod tests {
             .map(SegmentReader::segment_id)
             .collect();
         assert_eq!(segment_ids.len(), 2);
-        let merge_future = index_writer.merge(&segment_ids[..]);
-        futures::executor::block_on(merge_future)?;
+        index_writer.merge(&segment_ids[..]).wait().unwrap();
         reader.reload()?;
         assert_eq!(reader.searcher().segment_readers().len(), 1);
         Ok(())
@@ -510,7 +531,206 @@ mod tests {
 
     #[test]
     fn test_default_datetime() {
-        assert_eq!(crate::DateTime::make_zero().timestamp(), 0i64);
+        assert_eq!(0, DateTime::make_zero().into_unix_timestamp());
+    }
+
+    fn get_vals_for_docs(ff: &MultiValuedFastFieldReader<u64>, docs: Range<u32>) -> Vec<u64> {
+        let mut all = vec![];
+
+        for doc in docs {
+            let mut out = vec![];
+            ff.get_vals(doc, &mut out);
+            all.extend(out);
+        }
+        all
+    }
+
+    #[test]
+    fn test_text_fastfield() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT | FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        {
+            // first segment
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            index_writer.add_document(doc!(
+                text_field => "BBBBB AAAAA", // term_ord 1,2
+            ))?;
+            index_writer.add_document(doc!())?;
+            index_writer.add_document(doc!(
+                text_field => "AAAAA", // term_ord 0
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "AAAAA BBBBB", // term_ord 0
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "zumberthree", // term_ord 2, after merge term_ord 3
+            ))?;
+
+            index_writer.add_document(doc!())?;
+            index_writer.commit()?;
+
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            assert_eq!(searcher.segment_readers().len(), 1);
+            let segment_reader = searcher.segment_reader(0);
+            let fast_fields = segment_reader.fast_fields();
+            let text_fast_field = fast_fields.u64s(text_field).unwrap();
+
+            assert_eq!(
+                get_vals_for_docs(&text_fast_field, 0..5),
+                vec![1, 0, 0, 0, 1, 2]
+            );
+
+            let mut out = vec![];
+            text_fast_field.get_vals(3, &mut out);
+            assert_eq!(out, vec![0, 1]);
+
+            let inverted_index = segment_reader.inverted_index(text_field)?;
+            assert_eq!(inverted_index.terms().num_terms(), 3);
+            let mut bytes = vec![];
+            assert!(inverted_index.terms().ord_to_term(0, &mut bytes)?);
+            // default tokenizer applies lower case
+            assert_eq!(bytes, "aaaaa".as_bytes());
+        }
+
+        {
+            // second segment
+            let mut index_writer = index.writer_for_tests()?;
+
+            index_writer.add_document(doc!(
+                text_field => "AAAAA", // term_ord 0
+            ))?;
+
+            index_writer.add_document(doc!(
+                text_field => "CCCCC AAAAA", // term_ord 1, after merge 2
+            ))?;
+
+            index_writer.add_document(doc!())?;
+            index_writer.commit()?;
+
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            assert_eq!(searcher.segment_readers().len(), 2);
+            let segment_reader = searcher.segment_reader(1);
+            let fast_fields = segment_reader.fast_fields();
+            let text_fast_field = fast_fields.u64s(text_field).unwrap();
+
+            assert_eq!(get_vals_for_docs(&text_fast_field, 0..3), vec![0, 1, 0]);
+        }
+        // Merging the segments
+        {
+            let segment_ids = index.searchable_segment_ids()?;
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.merge(&segment_ids).wait()?;
+            index_writer.wait_merging_threads()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let fast_fields = segment_reader.fast_fields();
+        let text_fast_field = fast_fields.u64s(text_field).unwrap();
+
+        assert_eq!(
+            get_vals_for_docs(&text_fast_field, 0..8),
+            vec![1, 0, 0, 0, 1, 3 /* next segment */, 0, 2, 0]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_string_fastfield() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", STRING | FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        {
+            // first segment
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            index_writer.add_document(doc!(
+                text_field => "BBBBB", // term_ord 1
+            ))?;
+            index_writer.add_document(doc!())?;
+            index_writer.add_document(doc!(
+                text_field => "AAAAA", // term_ord 0
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "AAAAA", // term_ord 0
+            ))?;
+            index_writer.add_document(doc!(
+                text_field => "zumberthree", // term_ord 2, after merge term_ord 3
+            ))?;
+
+            index_writer.add_document(doc!())?;
+            index_writer.commit()?;
+
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            assert_eq!(searcher.segment_readers().len(), 1);
+            let segment_reader = searcher.segment_reader(0);
+            let fast_fields = segment_reader.fast_fields();
+            let text_fast_field = fast_fields.u64s(text_field).unwrap();
+
+            assert_eq!(get_vals_for_docs(&text_fast_field, 0..6), vec![1, 0, 0, 2]);
+
+            let inverted_index = segment_reader.inverted_index(text_field)?;
+            assert_eq!(inverted_index.terms().num_terms(), 3);
+            let mut bytes = vec![];
+            assert!(inverted_index.terms().ord_to_term(0, &mut bytes)?);
+            assert_eq!(bytes, "AAAAA".as_bytes());
+        }
+
+        {
+            // second segment
+            let mut index_writer = index.writer_for_tests()?;
+
+            index_writer.add_document(doc!(
+                text_field => "AAAAA", // term_ord 0
+            ))?;
+
+            index_writer.add_document(doc!(
+                text_field => "CCCCC", // term_ord 1, after merge 2
+            ))?;
+
+            index_writer.add_document(doc!())?;
+            index_writer.commit()?;
+
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+            assert_eq!(searcher.segment_readers().len(), 2);
+            let segment_reader = searcher.segment_reader(1);
+            let fast_fields = segment_reader.fast_fields();
+            let text_fast_field = fast_fields.u64s(text_field).unwrap();
+
+            assert_eq!(get_vals_for_docs(&text_fast_field, 0..2), vec![0, 1]);
+        }
+        // Merging the segments
+        {
+            let segment_ids = index.searchable_segment_ids()?;
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.merge(&segment_ids).wait()?;
+            index_writer.wait_merging_threads()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let fast_fields = segment_reader.fast_fields();
+        let text_fast_field = fast_fields.u64s(text_field).unwrap();
+
+        assert_eq!(
+            get_vals_for_docs(&text_fast_field, 0..9),
+            vec![1, 0, 0, 3 /* next segment */, 0, 2]
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -527,16 +747,16 @@ mod tests {
         let mut index_writer = index.writer_for_tests()?;
         index_writer.set_merge_policy(Box::new(NoMergePolicy));
         index_writer.add_document(doc!(
-            date_field => crate::DateTime::from_u64(1i64.to_u64()),
-            multi_date_field => crate::DateTime::from_u64(2i64.to_u64()),
-            multi_date_field => crate::DateTime::from_u64(3i64.to_u64())
+            date_field => DateTime::from_u64(1i64.to_u64()),
+            multi_date_field => DateTime::from_u64(2i64.to_u64()),
+            multi_date_field => DateTime::from_u64(3i64.to_u64())
         ))?;
         index_writer.add_document(doc!(
-            date_field => crate::DateTime::from_u64(4i64.to_u64())
+            date_field => DateTime::from_u64(4i64.to_u64())
         ))?;
         index_writer.add_document(doc!(
-            multi_date_field => crate::DateTime::from_u64(5i64.to_u64()),
-            multi_date_field => crate::DateTime::from_u64(6i64.to_u64())
+            multi_date_field => DateTime::from_u64(5i64.to_u64()),
+            multi_date_field => DateTime::from_u64(6i64.to_u64())
         ))?;
         index_writer.commit()?;
         let reader = index.reader()?;
@@ -548,23 +768,23 @@ mod tests {
         let dates_fast_field = fast_fields.dates(multi_date_field).unwrap();
         let mut dates = vec![];
         {
-            assert_eq!(date_fast_field.get(0u32).timestamp(), 1i64);
+            assert_eq!(date_fast_field.get(0u32).into_unix_timestamp(), 1i64);
             dates_fast_field.get_vals(0u32, &mut dates);
             assert_eq!(dates.len(), 2);
-            assert_eq!(dates[0].timestamp(), 2i64);
-            assert_eq!(dates[1].timestamp(), 3i64);
+            assert_eq!(dates[0].into_unix_timestamp(), 2i64);
+            assert_eq!(dates[1].into_unix_timestamp(), 3i64);
         }
         {
-            assert_eq!(date_fast_field.get(1u32).timestamp(), 4i64);
+            assert_eq!(date_fast_field.get(1u32).into_unix_timestamp(), 4i64);
             dates_fast_field.get_vals(1u32, &mut dates);
             assert!(dates.is_empty());
         }
         {
-            assert_eq!(date_fast_field.get(2u32).timestamp(), 0i64);
+            assert_eq!(date_fast_field.get(2u32).into_unix_timestamp(), 0i64);
             dates_fast_field.get_vals(2u32, &mut dates);
             assert_eq!(dates.len(), 2);
-            assert_eq!(dates[0].timestamp(), 5i64);
-            assert_eq!(dates[1].timestamp(), 6i64);
+            assert_eq!(dates[0].into_unix_timestamp(), 5i64);
+            assert_eq!(dates[1].into_unix_timestamp(), 6i64);
         }
         Ok(())
     }

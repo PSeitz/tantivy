@@ -1,3 +1,17 @@
+Unreleased
+================================
+- For date values `chrono` has been replaced with `time` (@uklotzde) #1304 :
+  - The `time` crate is re-exported as `tantivy::time` instead of `tantivy::chrono`.
+  - The type alias `tantivy::DateTime` has been removed.
+  - `Value::Date` wraps `time::PrimitiveDateTime` without time zone information.
+  - Internally date/time values are stored as seconds since UNIX epoch in UTC.
+  - Converting a `time::OffsetDateTime` to `Value::Date` implicitly converts the value into UTC.
+    If this is not desired do the time zone conversion yourself and use `time::PrimitiveDateTime`
+    directly instead.
+- Add [histogram](https://github.com/quickwit-oss/tantivy/pull/1306) aggregation (@PSeitz)
+- Add support for fastfield on text fields (@PSeitz)
+- Add terms aggregation (@PSeitz)
+
 Tantivy 0.17
 ================================
 - LogMergePolicy now triggers merges if the ratio of deleted documents reaches a threshold (@shikhar @fulmicoton) [#115](https://github.com/quickwit-oss/tantivy/issues/115)
@@ -8,7 +22,7 @@ Tantivy 0.17
 - Schema now offers not indexing fieldnorms (@lpouget) [#922](https://github.com/quickwit-oss/tantivy/issues/922)
 - Reduce the number of fsync calls [#1225](https://github.com/quickwit-oss/tantivy/issues/1225)
 - Fix opening bytes index with dynamic codec (@PSeitz) [#1278](https://github.com/quickwit-oss/tantivy/issues/1278)
-- Added an aggregation collector compatible with Elasticsearch (@PSeitz)
+- Added an aggregation collector for range, average and stats compatible with Elasticsearch. (@PSeitz)
 - Added a JSON schema type @fulmicoton [#1251](https://github.com/quickwit-oss/tantivy/issues/1251)
 - Added support for slop in phrase queries @halvorboe [#1068](https://github.com/quickwit-oss/tantivy/issues/1068)
 

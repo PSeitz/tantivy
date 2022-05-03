@@ -1,5 +1,7 @@
 use std::io;
 
+use super::stacker::TermHashMap;
+use crate::fastfield::MultiValuedFastFieldWriter;
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::postings::postings_writer::SpecializedPostingsWriter;
 use crate::postings::recorder::{BufferLender, NothingRecorder, Recorder};
@@ -25,6 +27,14 @@ impl<Rec: Recorder> From<JsonPostingsWriter<Rec>> for Box<dyn PostingsWriter> {
 }
 
 impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
+    fn mem_usage(&self) -> usize {
+        self.str_posting_writer.mem_usage() + self.non_str_posting_writer.mem_usage()
+    }
+
+    fn term_map(&self) -> &TermHashMap {
+        self.str_posting_writer.term_map()
+    }
+
     fn subscribe(
         &mut self,
         doc: crate::DocId,
@@ -42,6 +52,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
         term_buffer: &mut Term,
         ctx: &mut IndexingContext,
         indexing_position: &mut IndexingPosition,
+        _fast_field_writer: Option<&mut MultiValuedFastFieldWriter>,
     ) {
         self.str_posting_writer.index_text(
             doc_id,
@@ -49,6 +60,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
             term_buffer,
             ctx,
             indexing_position,
+            None,
         );
     }
 
@@ -71,6 +83,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
                         doc_id_map,
                         &mut buffer_lender,
                         ctx,
+                        &self.str_posting_writer.term_map,
                         serializer,
                     )?;
                 } else {
@@ -80,6 +93,7 @@ impl<Rec: Recorder> PostingsWriter for JsonPostingsWriter<Rec> {
                         doc_id_map,
                         &mut buffer_lender,
                         ctx,
+                        &self.str_posting_writer.term_map,
                         serializer,
                     )?;
                 }

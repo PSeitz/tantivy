@@ -49,13 +49,79 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 pub use super::bucket::RangeAggregation;
+use super::bucket::{HistogramAggregation, TermsAggregation};
 use super::metric::{AverageAggregation, StatsAggregation};
+use super::VecWithNames;
 
 /// The top-level aggregation request structure, which contains [Aggregation] and their user defined
 /// names. It is also used in [buckets](BucketAggregation) to define sub-aggregations.
 ///
 /// The key is the user defined name of the aggregation.
 pub type Aggregations = HashMap<String, Aggregation>;
+
+/// Like Aggregations, but optimized to work with the aggregation result
+#[derive(Clone, Debug)]
+pub(crate) struct AggregationsInternal {
+    pub(crate) metrics: VecWithNames<MetricAggregation>,
+    pub(crate) buckets: VecWithNames<BucketAggregationInternal>,
+}
+
+impl From<Aggregations> for AggregationsInternal {
+    fn from(aggs: Aggregations) -> Self {
+        let mut metrics = vec![];
+        let mut buckets = vec![];
+        for (key, agg) in aggs {
+            match agg {
+                Aggregation::Bucket(bucket) => buckets.push((
+                    key,
+                    BucketAggregationInternal {
+                        bucket_agg: bucket.bucket_agg,
+                        sub_aggregation: bucket.sub_aggregation.into(),
+                    },
+                )),
+                Aggregation::Metric(metric) => metrics.push((key, metric)),
+            }
+        }
+        Self {
+            metrics: VecWithNames::from_entries(metrics),
+            buckets: VecWithNames::from_entries(buckets),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+// Like BucketAggregation, but optimized to work with the result
+pub(crate) struct BucketAggregationInternal {
+    /// Bucket aggregation strategy to group documents.
+    pub bucket_agg: BucketAggregationType,
+    /// The sub_aggregations in the buckets. Each bucket will aggregate on the document set in the
+    /// bucket.
+    pub sub_aggregation: AggregationsInternal,
+}
+
+impl BucketAggregationInternal {
+    pub(crate) fn as_histogram(&self) -> Option<&HistogramAggregation> {
+        match &self.bucket_agg {
+            BucketAggregationType::Histogram(histogram) => Some(histogram),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_term(&self) -> Option<&TermsAggregation> {
+        match &self.bucket_agg {
+            BucketAggregationType::Terms(terms) => Some(terms),
+            _ => None,
+        }
+    }
+}
+
+/// Extract all fields, where the term directory is used in the tree.
+pub fn get_term_dict_field_names(aggs: &Aggregations) -> HashSet<String> {
+    let mut term_dict_field_names = Default::default();
+    for el in aggs.values() {
+        el.get_term_dict_field_names(&mut term_dict_field_names)
+    }
+    term_dict_field_names
+}
 
 /// Extract all fast field names used in the tree.
 pub fn get_fast_field_names(aggs: &Aggregations) -> HashSet<String> {
@@ -79,6 +145,12 @@ pub enum Aggregation {
 }
 
 impl Aggregation {
+    fn get_term_dict_field_names(&self, term_field_names: &mut HashSet<String>) {
+        if let Aggregation::Bucket(bucket) = self {
+            bucket.get_term_dict_field_names(term_field_names)
+        }
+    }
+
     fn get_fast_field_names(&self, fast_field_names: &mut HashSet<String>) {
         match self {
             Aggregation::Bucket(bucket) => bucket.get_fast_field_names(fast_field_names),
@@ -111,6 +183,12 @@ pub struct BucketAggregation {
 }
 
 impl BucketAggregation {
+    fn get_term_dict_field_names(&self, term_dict_field_names: &mut HashSet<String>) {
+        if let BucketAggregationType::Terms(terms) = &self.bucket_agg {
+            term_dict_field_names.insert(terms.field.to_string());
+        }
+        term_dict_field_names.extend(get_term_dict_field_names(&self.sub_aggregation));
+    }
     fn get_fast_field_names(&self, fast_field_names: &mut HashSet<String>) {
         self.bucket_agg.get_fast_field_names(fast_field_names);
         fast_field_names.extend(get_fast_field_names(&self.sub_aggregation));
@@ -123,12 +201,22 @@ pub enum BucketAggregationType {
     /// Put data into buckets of user-defined ranges.
     #[serde(rename = "range")]
     Range(RangeAggregation),
+    /// Put data into buckets of user-defined ranges.
+    #[serde(rename = "histogram")]
+    Histogram(HistogramAggregation),
+    /// Put data into buckets of terms.
+    #[serde(rename = "terms")]
+    Terms(TermsAggregation),
 }
 
 impl BucketAggregationType {
     fn get_fast_field_names(&self, fast_field_names: &mut HashSet<String>) {
         match self {
+            BucketAggregationType::Terms(terms) => fast_field_names.insert(terms.field.to_string()),
             BucketAggregationType::Range(range) => fast_field_names.insert(range.field.to_string()),
+            BucketAggregationType::Histogram(histogram) => {
+                fast_field_names.insert(histogram.field.to_string())
+            }
         };
     }
 }

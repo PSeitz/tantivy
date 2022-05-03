@@ -123,10 +123,95 @@ mod functional_test;
 
 #[macro_use]
 mod macros;
+mod future_result;
 
-pub use chrono;
+/// Re-export of the `time` crate
+///
+/// Tantivy uses [`time`](https://crates.io/crates/time) for dates.
+pub use time;
+
+use crate::time::format_description::well_known::Rfc3339;
+use crate::time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
+
+/// A date/time value with second precision.
+///
+/// This timestamp does not carry any explicit time zone information.
+/// Users are responsible for applying the provided conversion
+/// functions consistently. Internally the time zone is assumed
+/// to be UTC, which is also used implicitly for JSON serialization.
+///
+/// All constructors and conversions are provided as explicit
+/// functions and not by implementing any `From`/`Into` traits
+/// to prevent unintended usage.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DateTime {
+    unix_timestamp: i64,
+}
+
+impl DateTime {
+    /// Create new from UNIX timestamp
+    pub const fn from_unix_timestamp(unix_timestamp: i64) -> Self {
+        Self { unix_timestamp }
+    }
+
+    /// Create new from `OffsetDateTime`
+    ///
+    /// The given date/time is converted to UTC and the actual
+    /// time zone is discarded.
+    pub const fn from_utc(dt: OffsetDateTime) -> Self {
+        Self::from_unix_timestamp(dt.unix_timestamp())
+    }
+
+    /// Create new from `PrimitiveDateTime`
+    ///
+    /// Implicitly assumes that the given date/time is in UTC!
+    /// Otherwise the original value must only be reobtained with
+    /// [`Self::into_primitive()`].
+    pub const fn from_primitive(dt: PrimitiveDateTime) -> Self {
+        Self::from_utc(dt.assume_utc())
+    }
+
+    /// Convert to UNIX timestamp
+    pub const fn into_unix_timestamp(self) -> i64 {
+        let Self { unix_timestamp } = self;
+        unix_timestamp
+    }
+
+    /// Convert to UTC `OffsetDateTime`
+    pub fn into_utc(self) -> OffsetDateTime {
+        let Self { unix_timestamp } = self;
+        let utc_datetime =
+            OffsetDateTime::from_unix_timestamp(unix_timestamp).expect("valid UNIX timestamp");
+        debug_assert_eq!(UtcOffset::UTC, utc_datetime.offset());
+        utc_datetime
+    }
+
+    /// Convert to `OffsetDateTime` with the given time zone
+    pub fn into_offset(self, offset: UtcOffset) -> OffsetDateTime {
+        self.into_utc().to_offset(offset)
+    }
+
+    /// Convert to `PrimitiveDateTime` without any time zone
+    ///
+    /// The value should have been constructed with [`Self::from_primitive()`].
+    /// Otherwise the time zone is implicitly assumed to be UTC.
+    pub fn into_primitive(self) -> PrimitiveDateTime {
+        let utc_datetime = self.into_utc();
+        // Discard the UTC time zone offset
+        debug_assert_eq!(UtcOffset::UTC, utc_datetime.offset());
+        PrimitiveDateTime::new(utc_datetime.date(), utc_datetime.time())
+    }
+}
+
+impl fmt::Debug for DateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let utc_rfc3339 = self.into_utc().format(&Rfc3339).map_err(|_| fmt::Error)?;
+        f.write_str(&utc_rfc3339)
+    }
+}
 
 pub use crate::error::TantivyError;
+pub use crate::future_result::FutureResult;
 
 /// Tantivy result.
 ///
@@ -137,9 +222,6 @@ pub type Result<T> = std::result::Result<T, TantivyError>;
 /// Result for an Async io operation.
 #[cfg(feature = "quickwit")]
 pub type AsyncIoResult<T> = std::result::Result<T, crate::error::AsyncIoError>;
-
-/// Tantivy DateTime
-pub type DateTime = chrono::DateTime<chrono::Utc>;
 
 mod core;
 mod indexer;
@@ -308,6 +390,7 @@ pub mod tests {
     use crate::core::SegmentReader;
     use crate::docset::{DocSet, TERMINATED};
     use crate::fastfield::FastFieldReader;
+    use crate::merge_policy::NoMergePolicy;
     use crate::query::BooleanQuery;
     use crate::schema::*;
     use crate::{DocAddress, Index, Postings, ReloadPolicy};
@@ -935,8 +1018,6 @@ pub mod tests {
     // motivated by #729
     #[test]
     fn test_update_via_delete_insert() -> crate::Result<()> {
-        use futures::executor::block_on;
-
         use crate::collector::Count;
         use crate::indexer::NoMergePolicy;
         use crate::query::AllQuery;
@@ -990,8 +1071,7 @@ pub mod tests {
             .iter()
             .map(|reader| reader.segment_id())
             .collect();
-        block_on(index_writer.merge(&segment_ids)).unwrap();
-
+        index_writer.merge(&segment_ids).wait()?;
         index_reader.reload()?;
         let searcher = index_reader.searcher();
         assert_eq!(searcher.search(&AllQuery, &Count)?, DOC_COUNT as usize);
@@ -1006,6 +1086,7 @@ pub mod tests {
         let schema = builder.build();
         let index = Index::create_in_dir(&index_path, schema)?;
         let mut writer = index.writer(50_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
         for _ in 0..5000 {
             writer.add_document(doc!(body => "foo"))?;
             writer.add_document(doc!(body => "boo"))?;
@@ -1017,8 +1098,7 @@ pub mod tests {
         writer.delete_term(Term::from_field_text(body, "foo"));
         writer.commit()?;
         let segment_ids = index.searchable_segment_ids()?;
-        let _ = futures::executor::block_on(writer.merge(&segment_ids));
-
+        writer.merge(&segment_ids).wait()?;
         assert!(index.validate_checksum()?.is_empty());
         Ok(())
     }

@@ -1,13 +1,12 @@
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::core::Segment;
-use crate::fastfield::FastFieldsWriter;
+use crate::fastfield::{FastFieldsWriter, FastValue as _};
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::indexer::json_term_writer::index_json_values;
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::postings::{
-    compute_table_size, serialize_postings, IndexingContext, IndexingPosition,
-    PerFieldPostingsWriter, PostingsWriter,
+    serialize_postings, IndexingContext, IndexingPosition, PerFieldPostingsWriter, PostingsWriter,
 };
 use crate::schema::{FieldEntry, FieldType, FieldValue, Schema, Term, Value};
 use crate::store::{StoreReader, StoreWriter};
@@ -15,25 +14,6 @@ use crate::tokenizer::{
     BoxTokenStream, FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer,
 };
 use crate::{DocId, Document, Opstamp, SegmentComponent};
-
-/// Computes the initial size of the hash table.
-///
-/// Returns the recommended initial table size as a power of 2.
-///
-/// Note this is a very dumb way to compute log2, but it is easier to proofread that way.
-fn compute_initial_table_size(per_thread_memory_budget: usize) -> crate::Result<usize> {
-    let table_memory_upper_bound = per_thread_memory_budget / 3;
-    (10..20) // We cap it at 2^19 = 512K capacity.
-        .map(|power| 1 << power)
-        .take_while(|capacity| compute_table_size(*capacity) < table_memory_upper_bound)
-        .last()
-        .ok_or_else(|| {
-            crate::TantivyError::InvalidArgument(format!(
-                "per thread memory budget (={per_thread_memory_budget}) is too small. Raise the \
-                 memory budget or lower the number of threads."
-            ))
-        })
-}
 
 fn remap_doc_opstamps(
     opstamps: Vec<Opstamp>,
@@ -78,12 +58,11 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(
-        memory_budget_in_bytes: usize,
+        _memory_budget_in_bytes: usize,
         segment: Segment,
         schema: Schema,
     ) -> crate::Result<SegmentWriter> {
         let tokenizer_manager = segment.index().tokenizers().clone();
-        let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
         let per_field_text_analyzers = schema
@@ -106,7 +85,7 @@ impl SegmentWriter {
             .collect();
         Ok(SegmentWriter {
             max_doc: 0,
-            ctx: IndexingContext::new(table_size),
+            ctx: IndexingContext::new(),
             per_field_postings_writers,
             fieldnorms_writer: FieldNormsWriter::for_schema(&schema),
             segment_serializer,
@@ -149,6 +128,7 @@ impl SegmentWriter {
     pub fn mem_usage(&self) -> usize {
         self.ctx.mem_usage()
             + self.fieldnorms_writer.mem_usage()
+            + self.per_field_postings_writers.mem_usage()
             + self.fast_field_writers.mem_usage()
             + self.segment_serializer.mem_usage()
     }
@@ -188,7 +168,7 @@ impl SegmentWriter {
                             });
                         if let Some(unordered_term_id) = unordered_term_id_opt {
                             self.fast_field_writers
-                                .get_multivalue_writer_mut(field)
+                                .get_term_id_writer_mut(field)
                                 .expect("writer for facet missing")
                                 .add_val(unordered_term_id);
                         }
@@ -221,18 +201,22 @@ impl SegmentWriter {
                     }
 
                     let mut indexing_position = IndexingPosition::default();
+
                     for mut token_stream in token_streams {
-                        assert_eq!(term_buffer.as_slice().len(), 5);
+                        // assert_eq!(term_buffer.as_slice().len(), 5);
                         postings_writer.index_text(
                             doc_id,
                             &mut *token_stream,
                             term_buffer,
                             ctx,
                             &mut indexing_position,
+                            self.fast_field_writers.get_term_id_writer_mut(field),
                         );
                     }
-                    self.fieldnorms_writer
-                        .record(doc_id, field, indexing_position.num_tokens);
+                    if field_entry.has_fieldnorms() {
+                        self.fieldnorms_writer
+                            .record(doc_id, field, indexing_position.num_tokens);
+                    }
                 }
                 FieldType::U64(_) => {
                     for value in values {
@@ -244,7 +228,7 @@ impl SegmentWriter {
                 FieldType::Date(_) => {
                     for value in values {
                         let date_val = value.as_date().ok_or_else(make_schema_error)?;
-                        term_buffer.set_i64(date_val.timestamp());
+                        term_buffer.set_u64(date_val.to_u64());
                         postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
                     }
                 }
@@ -414,25 +398,15 @@ pub fn prepare_doc_for_store(doc: Document, schema: &Schema) -> Document {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-
-    use super::compute_initial_table_size;
     use crate::collector::Count;
     use crate::indexer::json_term_writer::JsonTermWriter;
     use crate::postings::TermInfo;
     use crate::query::PhraseQuery;
     use crate::schema::{IndexRecordOption, Schema, Type, STORED, STRING, TEXT};
+    use crate::time::format_description::well_known::Rfc3339;
+    use crate::time::OffsetDateTime;
     use crate::tokenizer::{PreTokenizedString, Token};
-    use crate::{DocAddress, DocSet, Document, Index, Postings, Term, TERMINATED};
-
-    #[test]
-    fn test_hashmap_size() {
-        assert_eq!(compute_initial_table_size(100_000).unwrap(), 1 << 11);
-        assert_eq!(compute_initial_table_size(1_000_000).unwrap(), 1 << 14);
-        assert_eq!(compute_initial_table_size(10_000_000).unwrap(), 1 << 17);
-        assert_eq!(compute_initial_table_size(1_000_000_000).unwrap(), 1 << 19);
-        assert_eq!(compute_initial_table_size(4_000_000_000).unwrap(), 1 << 19);
-    }
+    use crate::{DateTime, DocAddress, DocSet, Document, Index, Postings, Term, TERMINATED};
 
     #[test]
     fn test_prepare_for_store() {
@@ -523,11 +497,9 @@ mod tests {
         json_term_writer.pop_path_segment();
         json_term_writer.pop_path_segment();
         json_term_writer.push_path_segment("date");
-        json_term_writer.set_fast_value(
-            chrono::DateTime::parse_from_rfc3339("1985-04-12T23:20:50.52Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        );
+        json_term_writer.set_fast_value(DateTime::from_utc(
+            OffsetDateTime::parse("1985-04-12T23:20:50.52Z", &Rfc3339).unwrap(),
+        ));
         assert!(term_stream.advance());
         assert_eq!(term_stream.key(), json_term_writer.term().value_bytes());
 

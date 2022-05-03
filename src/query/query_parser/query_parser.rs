@@ -15,15 +15,17 @@ use crate::query::{
 use crate::schema::{
     Facet, FacetParseError, Field, FieldType, IndexRecordOption, Schema, Term, Type,
 };
+use crate::time::format_description::well_known::Rfc3339;
+use crate::time::{OffsetDateTime, UtcOffset};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::Score;
+use crate::{DateTime, Score};
 
 /// Possible error that may happen when parsing a query.
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum QueryParserError {
     /// Error in the query syntax
-    #[error("Syntax Error")]
-    SyntaxError,
+    #[error("Syntax Error: {0}")]
+    SyntaxError(String),
     /// This query is unsupported.
     #[error("Unsupported query: {0}")]
     UnsupportedQuery(String),
@@ -59,15 +61,20 @@ pub enum QueryParserError {
     FieldDoesNotHavePositionsIndexed(String),
     /// The tokenizer for the given field is unknown
     /// The two argument strings are the name of the field, the name of the tokenizer
-    #[error("The tokenizer '{0:?}' for the field '{1:?}' is unknown")]
-    UnknownTokenizer(String, String),
+    #[error("The tokenizer '{tokenizer:?}' for the field '{field:?}' is unknown")]
+    UnknownTokenizer {
+        /// The name of the tokenizer
+        tokenizer: String,
+        /// The field name
+        field: String,
+    },
     /// The query contains a range query with a phrase as one of the bounds.
     /// Only terms can be used as bounds.
     #[error("A range query cannot have a phrase as one of the bounds")]
     RangeMustNotHavePhrase,
     /// The format for the date field is not RFC 3339 compliant.
     #[error("The date field has an invalid format")]
-    DateFormatError(#[from] chrono::ParseError),
+    DateFormatError(#[from] time::error::Parse),
     /// The format for the facet field is invalid.
     #[error("The facet field is malformed: {0}")]
     FacetFormatError(#[from] FacetParseError),
@@ -266,8 +273,8 @@ impl QueryParser {
 
     /// Parse the user query into an AST.
     fn parse_query_to_logical_ast(&self, query: &str) -> Result<LogicalAst, QueryParserError> {
-        let user_input_ast =
-            tantivy_query_grammar::parse_query(query).map_err(|_| QueryParserError::SyntaxError)?;
+        let user_input_ast = tantivy_query_grammar::parse_query(query)
+            .map_err(|_| QueryParserError::SyntaxError(query.to_string()))?;
         self.compute_logical_ast(user_input_ast)
     }
 
@@ -326,11 +333,8 @@ impl QueryParser {
                 Ok(Term::from_field_f64(field, val))
             }
             FieldType::Date(_) => {
-                let dt = chrono::DateTime::parse_from_rfc3339(phrase)?;
-                Ok(Term::from_field_date(
-                    field,
-                    &dt.with_timezone(&chrono::Utc),
-                ))
+                let dt = OffsetDateTime::parse(phrase, &Rfc3339)?;
+                Ok(Term::from_field_date(field, DateTime::from_utc(dt)))
             }
             FieldType::Str(ref str_options) => {
                 let option = str_options.get_indexing_options().ok_or_else(|| {
@@ -340,11 +344,9 @@ impl QueryParser {
                 let text_analyzer =
                     self.tokenizer_manager
                         .get(option.tokenizer())
-                        .ok_or_else(|| {
-                            QueryParserError::UnknownTokenizer(
-                                field_entry.name().to_string(),
-                                option.tokenizer().to_string(),
-                            )
+                        .ok_or_else(|| QueryParserError::UnknownTokenizer {
+                            field: field_entry.name().to_string(),
+                            tokenizer: option.tokenizer().to_string(),
                         })?;
                 let mut terms: Vec<Term> = Vec::new();
                 let mut token_stream = text_analyzer.token_stream(phrase);
@@ -405,8 +407,8 @@ impl QueryParser {
                 Ok(vec![LogicalLiteral::Term(f64_term)])
             }
             FieldType::Date(_) => {
-                let dt = chrono::DateTime::parse_from_rfc3339(phrase)?;
-                let dt_term = Term::from_field_date(field, &dt.with_timezone(&chrono::Utc));
+                let dt = OffsetDateTime::parse(phrase, &Rfc3339)?;
+                let dt_term = Term::from_field_date(field, DateTime::from_utc(dt));
                 Ok(vec![LogicalLiteral::Term(dt_term)])
             }
             FieldType::Str(ref str_options) => {
@@ -417,11 +419,9 @@ impl QueryParser {
                 let text_analyzer =
                     self.tokenizer_manager
                         .get(option.tokenizer())
-                        .ok_or_else(|| {
-                            QueryParserError::UnknownTokenizer(
-                                field_name.to_string(),
-                                option.tokenizer().to_string(),
-                            )
+                        .ok_or_else(|| QueryParserError::UnknownTokenizer {
+                            field: field_name.to_string(),
+                            tokenizer: option.tokenizer().to_string(),
                         })?;
                 let index_record_option = option.index_option();
                 Ok(generate_literals_for_str(
@@ -442,11 +442,9 @@ impl QueryParser {
                 let text_analyzer =
                     self.tokenizer_manager
                         .get(option.tokenizer())
-                        .ok_or_else(|| {
-                            QueryParserError::UnknownTokenizer(
-                                field_name.to_string(),
-                                option.tokenizer().to_string(),
-                            )
+                        .ok_or_else(|| QueryParserError::UnknownTokenizer {
+                            field: field_name.to_string(),
+                            tokenizer: option.tokenizer().to_string(),
                         })?;
                 let index_record_option = option.index_option();
                 generate_literals_for_json_object(
@@ -549,7 +547,7 @@ impl QueryParser {
                     .map(|json_field| (json_field, full_path.as_str(), literal.phrase.as_str()))
                     .collect();
                 if triplets.is_empty() {
-                    return Err(QueryParserError::FieldDoesNotExist(field_name.to_string()));
+                    return Err(QueryParserError::FieldDoesNotExist(full_path.to_string()));
                 }
                 Ok(triplets)
             }
@@ -666,12 +664,12 @@ enum NumValue {
     U64(u64),
     I64(i64),
     F64(f64),
-    DateTime(crate::DateTime),
+    DateTime(OffsetDateTime),
 }
 
 fn infer_type_num(phrase: &str) -> Option<NumValue> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(phrase) {
-        let dt_utc = dt.with_timezone(&chrono::Utc);
+    if let Ok(dt) = OffsetDateTime::parse(phrase, &Rfc3339) {
+        let dt_utc = dt.to_offset(UtcOffset::UTC);
         return Some(NumValue::DateTime(dt_utc));
     }
     if let Ok(u64_val) = str::parse::<u64>(phrase) {
@@ -713,14 +711,14 @@ fn generate_literals_for_json_object(
                 json_term_writer.set_fast_value(f64_val);
             }
             NumValue::DateTime(dt_val) => {
-                json_term_writer.set_fast_value(dt_val);
+                json_term_writer.set_fast_value(DateTime::from_utc(dt_val));
             }
         }
         logical_literals.push(LogicalLiteral::Term(json_term_writer.term().clone()));
     }
     json_term_writer.close_path_and_set_type(Type::Str);
     drop(json_term_writer);
-    let term_num_bytes = term.as_slice().len();
+    let term_num_bytes = term.value_bytes().len();
     let mut token_stream = text_analyzer.token_stream(phrase);
     let mut terms: Vec<(usize, Term)> = Vec::new();
     token_stream.process(&mut |token| {
@@ -1040,6 +1038,7 @@ mod test {
 
     #[test]
     fn test_json_field_possibly_a_date() {
+        // Subseconds are discarded
         test_parse_query_to_logical_ast_helper(
             r#"json.date:"2019-10-12T07:20:50.52Z""#,
             r#"(Term(type=Json, field=14, path=date, vtype=Date, 2019-10-12T07:20:50Z) "[(0, Term(type=Json, field=14, path=date, vtype=Str, "2019")), (1, Term(type=Json, field=14, path=date, vtype=Str, "10")), (2, Term(type=Json, field=14, path=date, vtype=Str, "12t07")), (3, Term(type=Json, field=14, path=date, vtype=Str, "20")), (4, Term(type=Json, field=14, path=date, vtype=Str, "50")), (5, Term(type=Json, field=14, path=date, vtype=Str, "52z"))]")"#,
@@ -1221,9 +1220,11 @@ mod test {
     #[test]
     pub fn test_query_parser_field_does_not_exist() {
         let query_parser = make_query_parser();
-        assert_matches!(
-            query_parser.parse_query("boujou:\"18446744073709551615\""),
-            Err(QueryParserError::FieldDoesNotExist(_))
+        assert_eq!(
+            query_parser
+                .parse_query("boujou:\"18446744073709551615\"")
+                .unwrap_err(),
+            QueryParserError::FieldDoesNotExist("boujou".to_string())
         );
     }
 
@@ -1248,9 +1249,10 @@ mod test {
         let default_fields = vec![title];
         let tokenizer_manager = TokenizerManager::default();
         let query_parser = QueryParser::new(schema, default_fields, tokenizer_manager);
+
         assert_matches!(
             query_parser.parse_query("title:\"happy tax payer\""),
-            Err(QueryParserError::UnknownTokenizer(_, _))
+            Err(QueryParserError::UnknownTokenizer { .. })
         );
     }
 

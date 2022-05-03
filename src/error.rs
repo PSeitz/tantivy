@@ -97,6 +97,10 @@ pub enum TantivyError {
     /// Index incompatible with current version of Tantivy.
     #[error("{0:?}")]
     IncompatibleIndex(Incompatibility),
+    /// An internal error occurred. This is are internal states that should not be reached.
+    /// e.g. a datastructure is incorrectly inititalized.
+    #[error("Internal error: '{0}'")]
+    InternalError(String),
 }
 
 #[cfg(feature = "quickwit")]
@@ -149,9 +153,21 @@ impl<Guard> From<PoisonError<Guard>> for TantivyError {
     }
 }
 
-impl From<chrono::ParseError> for TantivyError {
-    fn from(err: chrono::ParseError) -> TantivyError {
-        TantivyError::InvalidArgument(err.to_string())
+impl From<time::error::Format> for TantivyError {
+    fn from(err: time::error::Format) -> TantivyError {
+        TantivyError::InvalidArgument(format!("Date formatting error: {err}"))
+    }
+}
+
+impl From<time::error::Parse> for TantivyError {
+    fn from(err: time::error::Parse) -> TantivyError {
+        TantivyError::InvalidArgument(format!("Date parsing error: {err}"))
+    }
+}
+
+impl From<time::error::ComponentRange> for TantivyError {
+    fn from(err: time::error::ComponentRange) -> TantivyError {
+        TantivyError::InvalidArgument(format!("Date range error: {err}"))
     }
 }
 

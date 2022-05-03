@@ -170,8 +170,8 @@ impl IndexMerger {
         index_settings: IndexSettings,
         segments: &[Segment],
     ) -> crate::Result<IndexMerger> {
-        let delete_bitsets = segments.iter().map(|_| None).collect_vec();
-        Self::open_with_custom_alive_set(schema, index_settings, segments, delete_bitsets)
+        let alive_bitset = segments.iter().map(|_| None).collect_vec();
+        Self::open_with_custom_alive_set(schema, index_settings, segments, alive_bitset)
     }
 
     // Create merge with a custom delete set.
@@ -180,7 +180,7 @@ impl IndexMerger {
     // corresponds to the segment index.
     //
     // If `None` is provided for custom alive set, the regular alive set will be used.
-    // If a delete_bitsets is provided, the union between the provided and regular
+    // If a alive_bitset is provided, the union between the provided and regular
     // alive set will be used.
     //
     // This can be used to merge but also apply an additional filter.
@@ -283,12 +283,12 @@ impl IndexMerger {
         for (field, field_entry) in self.schema.fields() {
             let field_type = field_entry.field_type();
             match field_type {
-                FieldType::Facet(_) => {
+                FieldType::Facet(_) | FieldType::Str(_) if field_type.is_fast() => {
                     let term_ordinal_mapping = term_ord_mappings.remove(&field).expect(
                         "Logic Error in Tantivy (Please report). Facet field should have required \
                          a`term_ordinal_mapping`.",
                     );
-                    self.write_hierarchical_facet_field(
+                    self.write_term_id_fast_field(
                         field,
                         &term_ordinal_mapping,
                         fast_field_serializer,
@@ -312,8 +312,8 @@ impl IndexMerger {
                         self.write_bytes_fast_field(field, fast_field_serializer, doc_id_mapping)?;
                     }
                 }
-                FieldType::Str(_) | FieldType::JsonObject(_) => {
-                    // We don't handle json / string fast field for the moment
+                _ => {
+                    // We don't handle json fast field for the moment
                     // They can be implemented using what is done
                     // for facets in the future
                 }
@@ -590,14 +590,14 @@ impl IndexMerger {
         )
     }
 
-    fn write_hierarchical_facet_field(
+    fn write_term_id_fast_field(
         &self,
         field: Field,
         term_ordinal_mappings: &TermOrdinalMapping,
         fast_field_serializer: &mut CompositeFastFieldSerializer,
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
-        debug_time!("write-hierarchical-facet-field");
+        debug_time!("write-term-id-fast-field");
 
         // Multifastfield consists of 2 fastfields.
         // The first serves as an index into the second one and is stricly increasing.
@@ -848,6 +848,9 @@ impl IndexMerger {
 
         let mut term_ord_mapping_opt = match field_type {
             FieldType::Facet(_) => Some(TermOrdinalMapping::new(max_term_ords)),
+            FieldType::Str(options) if options.is_fast() => {
+                Some(TermOrdinalMapping::new(max_term_ords))
+            }
             _ => None,
         };
 
@@ -1133,7 +1136,6 @@ impl IndexMerger {
 #[cfg(test)]
 mod tests {
     use byteorder::{BigEndian, ReadBytesExt};
-    use futures::executor::block_on;
     use schema::FAST;
 
     use crate::collector::tests::{
@@ -1147,9 +1149,10 @@ mod tests {
         Cardinality, Document, Facet, FacetOptions, IndexRecordOption, NumericOptions, Term,
         TextFieldIndexing, INDEXED, TEXT,
     };
+    use crate::time::OffsetDateTime;
     use crate::{
-        assert_nearly_equals, schema, DocAddress, DocSet, IndexSettings, IndexSortByField,
-        IndexWriter, Order, Searcher, SegmentId,
+        assert_nearly_equals, schema, DateTime, DocAddress, DocSet, IndexSettings,
+        IndexSortByField, IndexWriter, Order, Searcher, SegmentId,
     };
 
     #[test]
@@ -1157,9 +1160,7 @@ mod tests {
         let mut schema_builder = schema::Schema::builder();
         let text_fieldtype = schema::TextOptions::default()
             .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("default")
-                    .set_index_option(IndexRecordOption::WithFreqs),
+                TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
             )
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype);
@@ -1169,14 +1170,14 @@ mod tests {
         let bytes_score_field = schema_builder.add_bytes_field("score_bytes", FAST);
         let index = Index::create_in_ram(schema_builder.build());
         let reader = index.reader()?;
-        let curr_time = chrono::Utc::now();
+        let curr_time = OffsetDateTime::now_utc();
         {
             let mut index_writer = index.writer_for_tests()?;
             // writing the segment
             index_writer.add_document(doc!(
                 text_field => "af b",
                 score_field => 3u64,
-                date_field => curr_time,
+                date_field => DateTime::from_utc(curr_time),
                 bytes_score_field => 3u32.to_be_bytes().as_ref()
             ))?;
             index_writer.add_document(doc!(
@@ -1193,7 +1194,7 @@ mod tests {
             // writing the segment
             index_writer.add_document(doc!(
                 text_field => "af b",
-                date_field => curr_time,
+                date_field => DateTime::from_utc(curr_time),
                 score_field => 11u64,
                 bytes_score_field => 11u32.to_be_bytes().as_ref()
             ))?;
@@ -1209,7 +1210,7 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             let mut index_writer = index.writer_for_tests()?;
-            block_on(index_writer.merge(&segment_ids))?;
+            index_writer.merge(&segment_ids).wait()?;
             index_writer.wait_merging_threads()?;
         }
         {
@@ -1249,7 +1250,10 @@ mod tests {
                     ]
                 );
                 assert_eq!(
-                    get_doc_ids(vec![Term::from_field_date(date_field, &curr_time)])?,
+                    get_doc_ids(vec![Term::from_field_date(
+                        date_field,
+                        DateTime::from_utc(curr_time)
+                    )])?,
                     vec![DocAddress::new(0, 0), DocAddress::new(0, 3)]
                 );
             }
@@ -1458,7 +1462,7 @@ mod tests {
         {
             // merging the segments
             let segment_ids = index.searchable_segment_ids()?;
-            block_on(index_writer.merge(&segment_ids))?;
+            index_writer.merge(&segment_ids).wait()?;
             reader.reload()?;
             let searcher = reader.searcher();
             assert_eq!(searcher.segment_readers().len(), 1);
@@ -1551,7 +1555,7 @@ mod tests {
         {
             // Test merging a single segment in order to remove deletes.
             let segment_ids = index.searchable_segment_ids()?;
-            block_on(index_writer.merge(&segment_ids))?;
+            index_writer.merge(&segment_ids).wait()?;
             reader.reload()?;
 
             let searcher = reader.searcher();
@@ -1771,7 +1775,10 @@ mod tests {
                 .searchable_segment_ids()
                 .expect("Searchable segments failed.");
             let mut index_writer = index.writer_for_tests().unwrap();
-            block_on(index_writer.merge(&segment_ids)).expect("Merging failed");
+            index_writer
+                .merge(&segment_ids)
+                .wait()
+                .expect("Merging failed");
             index_writer.wait_merging_threads().unwrap();
             reader.reload().unwrap();
             test_searcher(
@@ -1826,7 +1833,7 @@ mod tests {
         let segment_ids = index
             .searchable_segment_ids()
             .expect("Searchable segments failed.");
-        block_on(index_writer.merge(&segment_ids))?;
+        index_writer.merge(&segment_ids).wait()?;
         reader.reload()?;
         // commit has not been called yet. The document should still be
         // there.
@@ -1853,7 +1860,7 @@ mod tests {
             index_writer.commit()?;
             index_writer.delete_term(Term::from_field_u64(int_field, 1));
             let segment_ids = index.searchable_segment_ids()?;
-            block_on(index_writer.merge(&segment_ids))?;
+            index_writer.merge(&segment_ids).wait()?;
 
             // assert delete has not been committed
             reader.reload()?;
@@ -1954,7 +1961,7 @@ mod tests {
         {
             let segment_ids = index.searchable_segment_ids()?;
             let mut index_writer = index.writer_for_tests()?;
-            block_on(index_writer.merge(&segment_ids))?;
+            index_writer.merge(&segment_ids).wait()?;
             index_writer.wait_merging_threads()?;
         }
         reader.reload()?;
@@ -2082,7 +2089,7 @@ mod tests {
             .iter()
             .map(|reader| reader.segment_id())
             .collect();
-        block_on(writer.merge(&segment_ids[..]))?;
+        writer.merge(&segment_ids[..]).wait()?;
 
         reader.reload()?;
         let searcher = reader.searcher();
