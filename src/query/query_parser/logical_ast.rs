@@ -1,14 +1,14 @@
 use std::fmt;
 use std::ops::Bound;
-use std::sync::Arc;
 
-use tantivy_fst::Regex;
+use ordered_float::OrderedFloat;
+use rustc_hash::FxHashSet;
 
 use crate::query::Occur;
 use crate::schema::{Field, Term};
 use crate::Score;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum LogicalLiteral {
     Term(Term),
     Phrase {
@@ -25,15 +25,16 @@ pub enum LogicalLiteral {
     },
     All,
     Regex {
-        pattern: Arc<Regex>,
+        pattern: String,
         field: Field,
     },
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum LogicalAst {
     Clause(Vec<(Occur, LogicalAst)>),
     Leaf(Box<LogicalLiteral>),
-    Boost(Box<LogicalAst>, Score),
+    Boost(Box<LogicalAst>, OrderedFloat<Score>),
 }
 
 impl LogicalAst {
@@ -41,7 +42,7 @@ impl LogicalAst {
         if (boost - 1.0).abs() < Score::EPSILON {
             self
         } else {
-            LogicalAst::Boost(Box::new(self), boost)
+            LogicalAst::Boost(Box::new(self), OrderedFloat(boost))
         }
     }
 
@@ -67,6 +68,10 @@ impl LogicalAst {
                         _ => new_clauses.push((occur, simplified_sub_ast)),
                     }
                 }
+
+                // Deduplicate identical child clauses
+                let mut seen: FxHashSet<(Occur, LogicalAst)> = FxHashSet::default();
+                new_clauses.retain(|clause| seen.insert(clause.clone()));
 
                 LogicalAst::Clause(new_clauses)
             }

@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::iter::once;
 
-use fnv::FnvHashSet;
 use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
@@ -1087,11 +1086,6 @@ fn rewrite_ast(mut input: UserInputAst) -> UserInputAst {
             new_clauses.push((occur, rewritten_clause));
         }
         *sub_clauses = new_clauses;
-
-        // remove duplicate child clauses
-        // e.g. (+a +b) OR (+c +d) OR (+a +b)  => (+a +b) OR (+c +d)
-        let mut seen = FnvHashSet::default();
-        sub_clauses.retain(|term| seen.insert(term.clone()));
 
         // Removes unnecessary children clauses in AST
         //

@@ -2,7 +2,6 @@ use std::net::{AddrParseError, IpAddr};
 use std::num::{ParseFloatError, ParseIntError};
 use std::ops::Bound;
 use std::str::{FromStr, ParseBoolError};
-use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -335,7 +334,7 @@ impl QueryParser {
     /// is not a valid query.
     pub fn parse_query(&self, query: &str) -> Result<Box<dyn Query>, QueryParserError> {
         let logical_ast = self.parse_query_to_logical_ast(query)?;
-        Ok(convert_to_query(&self.fuzzy, logical_ast))
+        convert_to_query(&self.fuzzy, logical_ast)
     }
 
     /// Parse a query leniently
@@ -348,7 +347,13 @@ impl QueryParser {
     /// In case it encountered such issues, they are reported as a Vec of errors.
     pub fn parse_query_lenient(&self, query: &str) -> (Box<dyn Query>, Vec<QueryParserError>) {
         let (logical_ast, errors) = self.parse_query_to_logical_ast_lenient(query);
-        (convert_to_query(&self.fuzzy, logical_ast), errors)
+        match convert_to_query(&self.fuzzy, logical_ast) {
+            Ok(q) => (q, errors),
+            Err(e) => (
+                Box::new(EmptyQuery),
+                errors.into_iter().chain(std::iter::once(e)).collect(),
+            ),
+        }
     }
 
     /// Build a query from an already parsed user input AST
@@ -364,7 +369,7 @@ impl QueryParser {
         if !err.is_empty() {
             return Err(err.swap_remove(0));
         }
-        Ok(convert_to_query(&self.fuzzy, logical_ast))
+        convert_to_query(&self.fuzzy, logical_ast)
     }
 
     /// Build leniently a query from an already parsed user input AST.
@@ -375,7 +380,13 @@ impl QueryParser {
         user_input_ast: UserInputAst,
     ) -> (Box<dyn Query>, Vec<QueryParserError>) {
         let (logical_ast, errors) = self.compute_logical_ast_lenient(user_input_ast);
-        (convert_to_query(&self.fuzzy, logical_ast), errors)
+        match convert_to_query(&self.fuzzy, logical_ast) {
+            Ok(q) => (q, errors),
+            Err(e) => (
+                Box::new(EmptyQuery),
+                errors.into_iter().chain(std::iter::once(e)).collect(),
+            ),
+        }
     }
 
     /// Parse the user query into an AST.
@@ -898,13 +909,17 @@ impl QueryParser {
                         )],
                     );
                 }
-                let pattern = try_tuple!(Regex::new(&pattern).map_err(|e| {
-                    QueryParserError::UnsupportedQuery(format!("Invalid regex: {e}"))
-                }));
-                let logical_ast = LogicalAst::Leaf(Box::new(LogicalLiteral::Regex {
-                    pattern: Arc::new(pattern),
-                    field,
-                }));
+                // Validate the pattern but do not store compiled regex in the AST
+                if let Err(err) = Regex::new(&pattern) {
+                    return (
+                        None,
+                        vec![QueryParserError::UnsupportedQuery(format!(
+                            "Invalid regex: {err}"
+                        ))],
+                    );
+                }
+                let logical_ast =
+                    LogicalAst::Leaf(Box::new(LogicalLiteral::Regex { pattern, field }));
                 (Some(logical_ast), Vec::new())
             }
         }
@@ -914,25 +929,25 @@ impl QueryParser {
 fn convert_literal_to_query(
     fuzzy: &FxHashMap<Field, Fuzzy>,
     logical_literal: LogicalLiteral,
-) -> Box<dyn Query> {
+) -> Result<Box<dyn Query>, QueryParserError> {
     match logical_literal {
         LogicalLiteral::Term(term) => {
             if let Some(fuzzy) = fuzzy.get(&term.field()) {
                 if fuzzy.prefix {
-                    Box::new(FuzzyTermQuery::new_prefix(
+                    Ok(Box::new(FuzzyTermQuery::new_prefix(
                         term,
                         fuzzy.distance,
                         fuzzy.transpose_cost_one,
-                    ))
+                    )))
                 } else {
-                    Box::new(FuzzyTermQuery::new(
+                    Ok(Box::new(FuzzyTermQuery::new(
                         term,
                         fuzzy.distance,
                         fuzzy.transpose_cost_one,
-                    ))
+                    )))
                 }
             } else {
-                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs))
+                Ok(Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)))
             }
         }
         LogicalLiteral::Phrase {
@@ -941,16 +956,19 @@ fn convert_literal_to_query(
             prefix,
         } => {
             if prefix {
-                Box::new(PhrasePrefixQuery::new_with_offset(terms))
+                Ok(Box::new(PhrasePrefixQuery::new_with_offset(terms)))
             } else {
-                Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop))
+                Ok(Box::new(PhraseQuery::new_with_offset_and_slop(terms, slop)))
             }
         }
-        LogicalLiteral::Range { lower, upper } => Box::new(RangeQuery::new(lower, upper)),
-        LogicalLiteral::Set { elements, .. } => Box::new(TermSetQuery::new(elements)),
-        LogicalLiteral::All => Box::new(AllQuery),
+        LogicalLiteral::Range { lower, upper } => Ok(Box::new(RangeQuery::new(lower, upper))),
+        LogicalLiteral::Set { elements, .. } => Ok(Box::new(TermSetQuery::new(elements))),
+        LogicalLiteral::All => Ok(Box::new(AllQuery)),
         LogicalLiteral::Regex { pattern, field } => {
-            Box::new(RegexQuery::from_regex(pattern, field))
+            // Compile again and forward any error instead of unwrap
+            let regex = Regex::new(&pattern)
+                .map_err(|e| QueryParserError::UnsupportedQuery(format!("Invalid regex: {e}")))?;
+            Ok(Box::new(RegexQuery::from_regex(regex, field)))
         }
     }
 }
@@ -1054,28 +1072,31 @@ fn generate_literals_for_json_object(
     Ok(logical_literals)
 }
 
-fn convert_to_query(fuzzy: &FxHashMap<Field, Fuzzy>, logical_ast: LogicalAst) -> Box<dyn Query> {
+fn convert_to_query(
+    fuzzy: &FxHashMap<Field, Fuzzy>,
+    logical_ast: LogicalAst,
+) -> Result<Box<dyn Query>, QueryParserError> {
     match trim_ast(logical_ast) {
         Some(LogicalAst::Clause(trimmed_clause)) => {
-            let occur_subqueries = trimmed_clause
+            let occur_subqueries: Vec<_> = trimmed_clause
                 .into_iter()
-                .map(|(occur, subquery)| (occur, convert_to_query(fuzzy, subquery)))
-                .collect::<Vec<_>>();
+                .map(|(occur, subquery)| convert_to_query(fuzzy, subquery).map(|q| (occur, q)))
+                .collect::<Result<_, _>>()?;
             assert!(
                 !occur_subqueries.is_empty(),
                 "Should not be empty after trimming"
             );
-            Box::new(BooleanQuery::new(occur_subqueries))
+            Ok(Box::new(BooleanQuery::new(occur_subqueries)))
         }
         Some(LogicalAst::Leaf(trimmed_logical_literal)) => {
             convert_literal_to_query(fuzzy, *trimmed_logical_literal)
         }
         Some(LogicalAst::Boost(ast, boost)) => {
-            let query = convert_to_query(fuzzy, *ast);
-            let boosted_query = BoostQuery::new(query, boost);
-            Box::new(boosted_query)
+            let query = convert_to_query(fuzzy, *ast)?;
+            let boosted_query = BoostQuery::new(query, boost.into_inner());
+            Ok(Box::new(boosted_query))
         }
-        None => Box::new(EmptyQuery),
+        None => Ok(Box::new(EmptyQuery)),
     }
 }
 
@@ -2062,12 +2083,7 @@ mod test {
 
     #[test]
     pub fn test_regex() {
-        let expected_regex = tantivy_fst::Regex::new(r".*b").unwrap();
-        test_parse_query_to_logical_ast_helper(
-            "title:/.*b/",
-            format!("Regex(Field(0), {:#?})", expected_regex).as_str(),
-            false,
-        );
+        test_parse_query_to_logical_ast_helper("title:/.*b/", "Regex(Field(0), \".*b\")", false);
 
         // Invalid field
         let err = parse_query_to_logical_ast("float:/.*b/", false).unwrap_err();
