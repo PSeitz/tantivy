@@ -408,7 +408,6 @@ pub(crate) fn build_segment_term_collector(
         let term_buckets = VecTermBuckets::new(num_terms_for_vec);
         let collector = SegmentTermCollector {
             term_buckets,
-            sub_aggs: FxHashMap::default(),
             accessor_idx,
         };
         Ok(Box::new(collector))
@@ -416,32 +415,44 @@ pub(crate) fn build_segment_term_collector(
         let term_buckets = HashMapTermBuckets::default();
         let collector = SegmentTermCollector {
             term_buckets,
-            sub_aggs: FxHashMap::default(),
             accessor_idx,
         };
         Ok(Box::new(collector))
     }
 }
 
-/// Abstraction over the storage used for term buckets (counts only).
+/// Abstraction over the storage used for term buckets and their sub-aggregations.
 pub trait TermBuckets: Clone + Debug {
     /// Estimate the memory consumption of this struct in bytes.
     fn get_memory_consumption(&self) -> usize;
     /// Add an occurrence of the given term id.
     fn add_term_id(&mut self, term_id: u64);
     /// Convert the buckets into a vector of (term_id, count) pairs.
-    fn into_vec(self) -> Vec<(u64, u32)>;
+    fn to_vec(&self) -> Vec<(u64, u32)>;
+    /// Get the sub-aggregations for the given term id or insert a new one.
+    fn get_or_insert_with<F>(
+        &mut self,
+        term_id: u64,
+        default: F,
+    ) -> &mut Box<dyn SegmentAggregationCollector>
+    where
+        F: FnOnce() -> Box<dyn SegmentAggregationCollector>;
+    /// Remove sub-aggregations for the given term id.
+    fn remove_sub_agg(&mut self, term_id: u64) -> Option<Box<dyn SegmentAggregationCollector>>;
+    /// Flush all stored sub-aggregations.
+    fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()>;
 }
 
 #[derive(Clone, Debug, Default)]
 struct HashMapTermBuckets {
     counts: FxHashMap<u64, u32>,
+    sub_aggs: FxHashMap<u64, Box<dyn SegmentAggregationCollector>>,
 }
 
 impl TermBuckets for HashMapTermBuckets {
     #[inline]
     fn get_memory_consumption(&self) -> usize {
-        self.counts.memory_consumption()
+        self.counts.memory_consumption() + self.sub_aggs.memory_consumption()
     }
 
     #[inline]
@@ -449,20 +460,45 @@ impl TermBuckets for HashMapTermBuckets {
         *self.counts.entry(term_id).or_default() += 1;
     }
 
-    fn into_vec(self) -> Vec<(u64, u32)> {
-        self.counts.into_iter().collect()
+    fn to_vec(&self) -> Vec<(u64, u32)> {
+        self.counts.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    #[inline]
+    fn get_or_insert_with<F>(
+        &mut self,
+        term_id: u64,
+        default: F,
+    ) -> &mut Box<dyn SegmentAggregationCollector>
+    where
+        F: FnOnce() -> Box<dyn SegmentAggregationCollector>,
+    {
+        self.sub_aggs.entry(term_id).or_insert_with(default)
+    }
+
+    fn remove_sub_agg(&mut self, term_id: u64) -> Option<Box<dyn SegmentAggregationCollector>> {
+        self.sub_aggs.remove(&term_id)
+    }
+
+    fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
+        for agg in self.sub_aggs.values_mut() {
+            agg.flush(agg_data)?;
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 struct VecTermBuckets {
     counts: Vec<u32>,
+    sub_aggs: Vec<Option<Box<dyn SegmentAggregationCollector>>>,
 }
 
 impl VecTermBuckets {
     fn new(num_terms: usize) -> Self {
         VecTermBuckets {
             counts: vec![0u32; num_terms],
+            sub_aggs: vec![None; num_terms],
         }
     }
 }
@@ -471,6 +507,8 @@ impl TermBuckets for VecTermBuckets {
     #[inline]
     fn get_memory_consumption(&self) -> usize {
         self.counts.capacity() * std::mem::size_of::<u32>()
+            + self.sub_aggs.capacity()
+                * std::mem::size_of::<Option<Box<dyn SegmentAggregationCollector>>>()
     }
 
     #[inline]
@@ -485,18 +523,66 @@ impl TermBuckets for VecTermBuckets {
         self.counts[idx] += 1;
     }
 
-    fn into_vec(self) -> Vec<(u64, u32)> {
+    fn to_vec(&self) -> Vec<(u64, u32)> {
         self.counts
-            .into_iter()
+            .iter()
             .enumerate()
             .filter_map(|(term_id, count)| {
-                if count == 0 {
+                if *count == 0 {
                     None
                 } else {
-                    Some((term_id as u64, count))
+                    Some((term_id as u64, *count))
                 }
             })
             .collect()
+    }
+
+    #[inline]
+    fn get_or_insert_with<F>(
+        &mut self,
+        term_id: u64,
+        default: F,
+    ) -> &mut Box<dyn SegmentAggregationCollector>
+    where
+        F: FnOnce() -> Box<dyn SegmentAggregationCollector>,
+    {
+        let idx = term_id as usize;
+        debug_assert!(
+            idx < self.sub_aggs.len(),
+            "term_id {} out of bounds for VecTermBuckets (len={})",
+            idx,
+            self.sub_aggs.len()
+        );
+        let entry = self
+            .sub_aggs
+            .get_mut(idx)
+            .unwrap_or_else(|| panic!("term_id {idx} out of bounds for VecTermBuckets"));
+        if entry.is_none() {
+            *entry = Some(default());
+        }
+        entry
+            .as_mut()
+            .unwrap_or_else(|| panic!("VecTermBuckets entry unexpectedly empty for term_id {idx}"))
+    }
+
+    fn remove_sub_agg(&mut self, term_id: u64) -> Option<Box<dyn SegmentAggregationCollector>> {
+        let idx = term_id as usize;
+        debug_assert!(
+            idx < self.sub_aggs.len(),
+            "term_id {} out of bounds for VecTermBuckets (len={})",
+            idx,
+            self.sub_aggs.len()
+        );
+        self.sub_aggs.get_mut(idx).and_then(|entry| entry.take())
+    }
+
+    fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
+        for maybe_agg in self.sub_aggs.iter_mut() {
+            if let Some(agg) = maybe_agg.as_mut() {
+                agg.flush(agg_data)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -506,8 +592,6 @@ impl TermBuckets for VecTermBuckets {
 pub struct SegmentTermCollector<B: TermBuckets> {
     /// The buckets containing the aggregation data.
     term_buckets: B,
-    /// Sub-aggregations per term id.
-    sub_aggs: FxHashMap<u64, Box<dyn SegmentAggregationCollector>>,
     accessor_idx: usize,
 }
 
@@ -583,9 +667,8 @@ where B: TermBuckets + 'static
                     }
                 }
                 let sub_aggregations = self
-                    .sub_aggs
-                    .entry(term_id)
-                    .or_insert_with(|| blueprint.clone());
+                    .term_buckets
+                    .get_or_insert_with(term_id, || blueprint.clone());
                 sub_aggregations.collect(doc, agg_data)?;
             }
         }
@@ -600,10 +683,7 @@ where B: TermBuckets + 'static
     }
 
     fn flush(&mut self, agg_data: &mut AggregationsSegmentCtx) -> crate::Result<()> {
-        for sub_aggregations in &mut self.sub_aggs.values_mut() {
-            sub_aggregations.as_mut().flush(agg_data)?;
-        }
-        Ok(())
+        self.term_buckets.flush(agg_data)
     }
 }
 
@@ -611,8 +691,7 @@ impl<B: TermBuckets> SegmentTermCollector<B> {
     fn get_memory_consumption(&self) -> usize {
         let self_mem = std::mem::size_of::<Self>();
         let term_buckets_mem = self.term_buckets.get_memory_consumption();
-        let sub_aggs_mem = self.sub_aggs.memory_consumption();
-        self_mem + term_buckets_mem + sub_aggs_mem
+        self_mem + term_buckets_mem
     }
 
     #[inline]
@@ -621,7 +700,7 @@ impl<B: TermBuckets> SegmentTermCollector<B> {
         agg_data: &AggregationsSegmentCtx,
     ) -> crate::Result<IntermediateBucketResult> {
         let term_req = agg_data.get_term_req_data(self.accessor_idx);
-        let mut entries: Vec<(u64, u32)> = self.term_buckets.into_vec();
+        let mut entries: Vec<(u64, u32)> = self.term_buckets.to_vec();
 
         let order_by_sub_aggregation =
             matches!(term_req.req.order.target, OrderTarget::SubAggregation(_));
@@ -664,8 +743,8 @@ impl<B: TermBuckets> SegmentTermCollector<B> {
             |id, doc_count| -> crate::Result<IntermediateTermBucketEntry> {
                 let intermediate_entry = if term_req.sub_aggregation_blueprint.as_ref().is_some() {
                     let mut sub_aggregation_res = IntermediateAggregationResults::default();
-                    self.sub_aggs
-                        .remove(&id)
+                    self.term_buckets
+                        .remove_sub_agg(id)
                         .unwrap_or_else(|| {
                             panic!("Internal Error: could not find subaggregation for id {id}")
                         })
