@@ -135,35 +135,8 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> 
 impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOtherDocSet> {
     #[inline]
     fn advance(&mut self) -> DocId {
-        let (left, right) = (&mut self.left, &mut self.right);
-        let mut candidate = left.advance();
-
-        'outer: loop {
-            // In the first part we look for a document in the intersection
-            // of the two rarest `DocSet` in the intersection.
-
-            loop {
-                let right_doc = right.seek(candidate);
-                candidate = left.seek(right_doc);
-                if candidate == right_doc {
-                    break;
-                }
-            }
-
-            debug_assert_eq!(left.doc(), right.doc());
-            // test the remaining scorers;
-            for docset in self.others.iter_mut() {
-                let seek_doc = docset.seek(candidate);
-                if seek_doc > candidate {
-                    candidate = left.seek(seek_doc);
-                    continue 'outer;
-                }
-            }
-            debug_assert_eq!(candidate, self.left.doc());
-            debug_assert_eq!(candidate, self.right.doc());
-            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
-            return candidate;
-        }
+        let candidate = self.left.advance();
+        self.seek_to_convergence(candidate)
     }
 
     #[inline]
