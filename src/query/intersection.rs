@@ -101,6 +101,37 @@ impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
     }
 }
 
+impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> {
+    /// Seek all docsets to converge on the same document starting from candidate.
+    /// Returns the converged document ID.
+    #[inline]
+    fn seek_to_convergence(&mut self, mut candidate: DocId) -> DocId {
+        'outer: loop {
+            let left_doc = self.left.seek(candidate);
+            if left_doc > candidate {
+                candidate = left_doc;
+                continue 'outer;
+            }
+            let right_doc = self.right.seek(candidate);
+            if right_doc > candidate {
+                candidate = right_doc;
+                continue 'outer;
+            }
+            for docset in self.others.iter_mut() {
+                let seek_doc = docset.seek(candidate);
+                if seek_doc > candidate {
+                    candidate = seek_doc;
+                    continue 'outer;
+                }
+            }
+            debug_assert_eq!(self.left.doc(), candidate);
+            debug_assert_eq!(self.right.doc(), candidate);
+            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
+            return candidate;
+        }
+    }
+}
+
 impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOtherDocSet> {
     #[inline]
     fn advance(&mut self) -> DocId {
@@ -143,36 +174,14 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
             docset.seek(target);
         }
 
-        // Inline go_to_first_doc logic to avoid Vec allocation
         let mut candidate = self.left.doc().max(self.right.doc());
         for docset in &self.others {
             candidate = candidate.max(docset.doc());
         }
 
-        'outer: loop {
-            let left_doc = self.left.seek(candidate);
-            if left_doc > candidate {
-                candidate = left_doc;
-                continue 'outer;
-            }
-            let right_doc = self.right.seek(candidate);
-            if right_doc > candidate {
-                candidate = right_doc;
-                continue 'outer;
-            }
-            for docset in self.others.iter_mut() {
-                let seek_doc = docset.seek(candidate);
-                if seek_doc > candidate {
-                    candidate = seek_doc;
-                    continue 'outer;
-                }
-            }
-            debug_assert_eq!(self.left.doc(), candidate);
-            debug_assert_eq!(self.right.doc(), candidate);
-            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
-            debug_assert!(candidate >= target);
-            return candidate;
-        }
+        let result = self.seek_to_convergence(candidate);
+        debug_assert!(result >= target);
+        result
     }
 
     #[inline]
