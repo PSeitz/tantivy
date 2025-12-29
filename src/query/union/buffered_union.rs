@@ -259,6 +259,7 @@ where
     TScoreCombiner: ScoreCombiner,
     TScorer: Scorer,
 {
+    #[inline]
     fn score(&mut self) -> Score {
         self.score
     }

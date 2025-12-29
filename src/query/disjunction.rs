@@ -163,6 +163,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
 impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> Scorer
     for Disjunction<TScorer, TScoreCombiner>
 {
+    #[inline]
     fn score(&mut self) -> Score {
         self.current_score
     }

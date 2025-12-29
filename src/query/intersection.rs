@@ -102,6 +102,7 @@ impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
 }
 
 impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOtherDocSet> {
+    #[inline]
     fn advance(&mut self) -> DocId {
         let (left, right) = (&mut self.left, &mut self.right);
         let mut candidate = left.advance();
@@ -134,22 +135,52 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
         }
     }
 
+    #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
         self.left.seek(target);
-        let mut docsets: Vec<&mut dyn DocSet> = vec![&mut self.left, &mut self.right];
+        self.right.seek(target);
         for docset in &mut self.others {
-            docsets.push(docset);
+            docset.seek(target);
         }
-        let doc = go_to_first_doc(&mut docsets[..]);
-        debug_assert!(docsets.iter().all(|docset| docset.doc() == doc));
-        debug_assert!(doc >= target);
-        doc
+
+        // Inline go_to_first_doc logic to avoid Vec allocation
+        let mut candidate = self.left.doc().max(self.right.doc());
+        for docset in &self.others {
+            candidate = candidate.max(docset.doc());
+        }
+
+        'outer: loop {
+            let left_doc = self.left.seek(candidate);
+            if left_doc > candidate {
+                candidate = left_doc;
+                continue 'outer;
+            }
+            let right_doc = self.right.seek(candidate);
+            if right_doc > candidate {
+                candidate = right_doc;
+                continue 'outer;
+            }
+            for docset in self.others.iter_mut() {
+                let seek_doc = docset.seek(candidate);
+                if seek_doc > candidate {
+                    candidate = seek_doc;
+                    continue 'outer;
+                }
+            }
+            debug_assert_eq!(self.left.doc(), candidate);
+            debug_assert_eq!(self.right.doc(), candidate);
+            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
+            debug_assert!(candidate >= target);
+            return candidate;
+        }
     }
 
+    #[inline]
     fn doc(&self) -> DocId {
         self.left.doc()
     }
 
+    #[inline]
     fn size_hint(&self) -> u32 {
         estimate_intersection(
             [self.left.size_hint(), self.right.size_hint()]
@@ -159,6 +190,7 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
         )
     }
 
+    #[inline]
     fn cost(&self) -> u64 {
         // What's the best way to compute the cost of an intersection?
         // For now we take the cost of the docset driver, which is the first docset.
@@ -172,6 +204,7 @@ where
     TScorer: Scorer,
     TOtherScorer: Scorer,
 {
+    #[inline]
     fn score(&mut self) -> Score {
         self.left.score()
             + self.right.score()
