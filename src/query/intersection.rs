@@ -73,6 +73,37 @@ fn go_to_first_doc<TDocSet: DocSet>(docsets: &mut [TDocSet]) -> DocId {
     }
 }
 
+// Specialized version that avoids Vec allocation by taking components separately
+fn go_to_first_doc_specialized<TDocSet: DocSet, TOtherDocSet: DocSet>(
+    left: &mut TDocSet,
+    right: &mut TDocSet,
+    others: &mut [TOtherDocSet],
+) -> DocId {
+    let mut candidate = left.doc().max(right.doc());
+    for docset in others.iter() {
+        candidate = candidate.max(docset.doc());
+    }
+
+    'outer: loop {
+        if left.seek(candidate) > candidate {
+            candidate = left.doc();
+            continue 'outer;
+        }
+        if right.seek(candidate) > candidate {
+            candidate = right.doc();
+            continue 'outer;
+        }
+        for docset in others.iter_mut() {
+            let seek_doc = docset.seek(candidate);
+            if seek_doc > candidate {
+                candidate = docset.doc();
+                continue 'outer;
+            }
+        }
+        return candidate;
+    }
+}
+
 impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
     /// num_docs is the number of documents in the segment.
     pub(crate) fn new(mut docsets: Vec<TDocSet>, num_docs: u32) -> Intersection<TDocSet, TDocSet> {
@@ -136,44 +167,14 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
-        // Seek all docsets to the target first
         self.left.seek(target);
         self.right.seek(target);
         for docset in &mut self.others {
             docset.seek(target);
         }
-
-        // Find the first common document without allocating a Vec
-        // This is an inline version of go_to_first_doc that avoids heap allocation
-        let mut candidate = self.left.doc().max(self.right.doc());
-        for docset in &self.others {
-            candidate = candidate.max(docset.doc());
-        }
-
-        'outer: loop {
-            // Seek all docsets to candidate
-            if self.left.seek(candidate) > candidate {
-                candidate = self.left.doc();
-                continue 'outer;
-            }
-            if self.right.seek(candidate) > candidate {
-                candidate = self.right.doc();
-                continue 'outer;
-            }
-            for docset in &mut self.others {
-                let seek_doc = docset.seek(candidate);
-                if seek_doc > candidate {
-                    candidate = docset.doc();
-                    continue 'outer;
-                }
-            }
-            // All docsets are now positioned at candidate
-            debug_assert_eq!(candidate, self.left.doc());
-            debug_assert_eq!(candidate, self.right.doc());
-            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
-            debug_assert!(candidate >= target);
-            return candidate;
-        }
+        let doc = go_to_first_doc_specialized(&mut self.left, &mut self.right, &mut self.others);
+        debug_assert!(doc >= target);
+        doc
     }
 
     #[inline]
