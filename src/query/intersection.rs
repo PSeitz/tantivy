@@ -102,6 +102,7 @@ impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
 }
 
 impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOtherDocSet> {
+    #[inline]
     fn advance(&mut self) -> DocId {
         let (left, right) = (&mut self.left, &mut self.right);
         let mut candidate = left.advance();
@@ -135,17 +136,47 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
+        // Seek all docsets to the target first
         self.left.seek(target);
-        let mut docsets: Vec<&mut dyn DocSet> = vec![&mut self.left, &mut self.right];
+        self.right.seek(target);
         for docset in &mut self.others {
-            docsets.push(docset);
+            docset.seek(target);
         }
-        let doc = go_to_first_doc(&mut docsets[..]);
-        debug_assert!(docsets.iter().all(|docset| docset.doc() == doc));
-        debug_assert!(doc >= target);
-        doc
+
+        // Find the first common document without allocating a Vec
+        // This is an inline version of go_to_first_doc that avoids heap allocation
+        let mut candidate = self.left.doc().max(self.right.doc());
+        for docset in &self.others {
+            candidate = candidate.max(docset.doc());
+        }
+
+        'outer: loop {
+            // Seek all docsets to candidate
+            if self.left.seek(candidate) > candidate {
+                candidate = self.left.doc();
+                continue 'outer;
+            }
+            if self.right.seek(candidate) > candidate {
+                candidate = self.right.doc();
+                continue 'outer;
+            }
+            for docset in &mut self.others {
+                let seek_doc = docset.seek(candidate);
+                if seek_doc > candidate {
+                    candidate = docset.doc();
+                    continue 'outer;
+                }
+            }
+            // All docsets are now positioned at candidate
+            debug_assert_eq!(candidate, self.left.doc());
+            debug_assert_eq!(candidate, self.right.doc());
+            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
+            debug_assert!(candidate >= target);
+            return candidate;
+        }
     }
 
+    #[inline]
     fn doc(&self) -> DocId {
         self.left.doc()
     }
@@ -172,6 +203,7 @@ where
     TScorer: Scorer,
     TOtherScorer: Scorer,
 {
+    #[inline]
     fn score(&mut self) -> Score {
         self.left.score()
             + self.right.score()
