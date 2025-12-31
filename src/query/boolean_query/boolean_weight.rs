@@ -319,38 +319,41 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 SpecializedScorer::Other(boxed_scorer)
             }
             (ShouldScorersCombinationMethod::Optional(should_scorer), must_scorers) => {
-                // Optional SHOULD: contributes to scoring but not required for matching.
-                match effective_must_scorer(
-                    must_scorers,
-                    must_special_scorer_counts.num_all_scorers,
-                    reader.max_doc(),
-                    num_docs,
-                ) {
-                    None => {
-                        // No MUST constraint: promote SHOULD to required.
-                        // Must preserve any removed AllScorers from SHOULD via union.
-                        effective_should_scorer_for_union(
-                            should_scorer,
-                            should_special_scorer_counts.num_all_scorers,
-                            reader.max_doc(),
-                            num_docs,
-                            &score_combiner_fn,
-                            self.scoring_enabled,
-                        )
-                    }
-                    Some(must_scorer) => {
-                        // Has MUST constraint: SHOULD only affects scoring.
-                        if self.scoring_enabled {
-                            SpecializedScorer::Other(Box::new(RequiredOptionalScorer::<
-                                _,
-                                _,
-                                TScoreCombiner,
-                            >::new(
-                                must_scorer,
-                                into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
-                            )))
-                        } else {
-                            SpecializedScorer::Other(must_scorer)
+                if must_scorers.is_empty() && must_special_scorer_counts.num_all_scorers == 0
+                    && should_special_scorer_counts.num_all_scorers == 0 {
+                    // Fast path: Optional SHOULD promoted to required when no MUST clauses
+                    // and no removed AllScorers.
+                    should_scorer
+                } else {
+                    match effective_must_scorer(
+                        must_scorers,
+                        must_special_scorer_counts.num_all_scorers,
+                        reader.max_doc(),
+                        num_docs,
+                    ) {
+                        None => {
+                            effective_should_scorer_for_union(
+                                should_scorer,
+                                should_special_scorer_counts.num_all_scorers,
+                                reader.max_doc(),
+                                num_docs,
+                                &score_combiner_fn,
+                                self.scoring_enabled,
+                            )
+                        }
+                        Some(must_scorer) => {
+                            if self.scoring_enabled {
+                                SpecializedScorer::Other(Box::new(RequiredOptionalScorer::<
+                                    _,
+                                    _,
+                                    TScoreCombiner,
+                                >::new(
+                                    must_scorer,
+                                    into_box_scorer(should_scorer, &score_combiner_fn, num_docs),
+                                )))
+                            } else {
+                                SpecializedScorer::Other(must_scorer)
+                            }
                         }
                     }
                 }
