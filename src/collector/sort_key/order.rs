@@ -24,6 +24,17 @@ impl<T: PartialOrd> Comparator<T> for NaturalComparator {
     }
 }
 
+/// Optimized comparator for Score (f32) values using total_cmp to avoid unwrap overhead.
+#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+pub struct ScoreComparator;
+
+impl Comparator<Score> for ScoreComparator {
+    #[inline(always)]
+    fn compare(&self, lhs: &Score, rhs: &Score) -> Ordering {
+        lhs.total_cmp(rhs)
+    }
+}
+
 /// Sorts document in reverse order.
 ///
 /// If the sort key is None, it will considered as the lowest value, and will therefore appear

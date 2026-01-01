@@ -1,4 +1,4 @@
-use crate::collector::sort_key::NaturalComparator;
+use crate::collector::sort_key::ScoreComparator;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::{DocAddress, DocId, Score};
 
@@ -11,7 +11,7 @@ impl SortKeyComputer for SortBySimilarityScore {
 
     type Child = SortBySimilarityScore;
 
-    type Comparator = NaturalComparator;
+    type Comparator = ScoreComparator;
 
     fn requires_scoring(&self) -> bool {
         true
