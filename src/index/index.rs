@@ -3,17 +3,19 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::available_parallelism;
 
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
-use super::{FieldMetadata, IndexSettings};
+use super::{FieldMetadata, IndexSettings, TantivySegmentReader};
 use crate::core::{Executor, META_FILEPATH};
 use crate::directory::error::OpenReadError;
 #[cfg(feature = "mmap")]
 use crate::directory::MmapDirectory;
 use crate::directory::{Directory, ManagedDirectory, RamDirectory, INDEX_WRITER_LOCK};
 use crate::error::{DataCorruption, TantivyError};
+use crate::index::codec_configuration::CodecConfiguration;
 use crate::index::{IndexMeta, SegmentId, SegmentMeta, SegmentMetaInventory};
 use crate::indexer::index_writer::{
     IndexWriterOptions, MAX_NUM_THREAD, MEMORY_BUDGET_NUM_BYTES_MIN,
@@ -24,7 +26,6 @@ use crate::reader::{IndexReader, IndexReaderBuilder};
 use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema};
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::SegmentReader;
 
 fn load_metas(
     directory: &dyn Directory,
@@ -59,6 +60,7 @@ fn save_new_metas(
     schema: Schema,
     index_settings: IndexSettings,
     directory: &dyn Directory,
+    codec: CodecConfiguration,
 ) -> crate::Result<()> {
     save_metas(
         &IndexMeta {
@@ -67,6 +69,7 @@ fn save_new_metas(
             schema,
             opstamp: 0u64,
             payload: None,
+            codec,
         },
         directory,
     )?;
@@ -107,11 +110,13 @@ pub struct IndexBuilder {
     tokenizer_manager: TokenizerManager,
     fast_field_tokenizer_manager: TokenizerManager,
 }
+
 impl Default for IndexBuilder {
     fn default() -> Self {
         IndexBuilder::new()
     }
 }
+
 impl IndexBuilder {
     /// Creates a new `IndexBuilder`
     pub fn new() -> Self {
@@ -244,18 +249,31 @@ impl IndexBuilder {
     /// Creates a new index given an implementation of the trait `Directory`.
     ///
     /// If a directory previously existed, it will be erased.
-    fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+    pub fn create<T: Into<Box<dyn Directory>>>(self, dir: T) -> crate::Result<Index> {
+        self.create_avoid_monomorphization(dir.into())
+    }
+
+    fn create_avoid_monomorphization(self, dir: Box<dyn Directory>) -> crate::Result<Index> {
         self.validate()?;
-        let dir = dir.into();
         let directory = ManagedDirectory::wrap(dir)?;
+        let codec = CodecConfiguration::default();
         save_new_metas(
             self.get_expect_schema()?,
             self.index_settings.clone(),
             &directory,
+            codec,
         )?;
-        let mut metas = IndexMeta::with_schema(self.get_expect_schema()?);
+        let schema = self.get_expect_schema()?;
+        let mut metas = IndexMeta {
+            index_settings: IndexSettings::default(),
+            segments: vec![],
+            schema,
+            opstamp: 0u64,
+            payload: None,
+            codec: CodecConfiguration::default(),
+        };
         metas.index_settings = self.index_settings;
-        let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default());
+        let mut index = Index::open_from_metas(directory, &metas, SegmentMetaInventory::default())?;
         index.set_tokenizers(self.tokenizer_manager);
         index.set_fast_field_tokenizers(self.fast_field_tokenizer_manager);
         Ok(index)
@@ -279,41 +297,6 @@ impl Index {
     pub fn builder() -> IndexBuilder {
         IndexBuilder::new()
     }
-    /// Examines the directory to see if it contains an index.
-    ///
-    /// Effectively, it only checks for the presence of the `meta.json` file.
-    pub fn exists(dir: &dyn Directory) -> Result<bool, OpenReadError> {
-        dir.exists(&META_FILEPATH)
-    }
-
-    /// Accessor to the search executor.
-    ///
-    /// This pool is used by default when calling `searcher.search(...)`
-    /// to perform search on the individual segments.
-    ///
-    /// By default the executor is single thread, and simply runs in the calling thread.
-    pub fn search_executor(&self) -> &Executor {
-        &self.executor
-    }
-
-    /// Replace the default single thread search executor pool
-    /// by a thread pool with a given number of threads.
-    pub fn set_multithread_executor(&mut self, num_threads: usize) -> crate::Result<()> {
-        self.executor = Executor::multi_thread(num_threads, "tantivy-search-")?;
-        Ok(())
-    }
-
-    /// Custom thread pool by a outer thread pool.
-    pub fn set_executor(&mut self, executor: Executor) {
-        self.executor = executor;
-    }
-
-    /// Replace the default single thread search executor pool
-    /// by a thread pool with as many threads as there are CPUs on the system.
-    pub fn set_default_multithread_executor(&mut self) -> crate::Result<()> {
-        let default_num_threads = available_parallelism()?.get();
-        self.set_multithread_executor(default_num_threads)
-    }
 
     /// Creates a new index using the [`RamDirectory`].
     ///
@@ -322,6 +305,13 @@ impl Index {
     /// for instances like unit test or temporary in memory index.
     pub fn create_in_ram(schema: Schema) -> Index {
         IndexBuilder::new().schema(schema).create_in_ram().unwrap()
+    }
+
+    /// Examines the directory to see if it contains an index.
+    ///
+    /// Effectively, it only checks for the presence of the `meta.json` file.
+    pub fn exists(directory: &dyn Directory) -> Result<bool, OpenReadError> {
+        directory.exists(&META_FILEPATH)
     }
 
     /// Creates a new index in a given filepath.
@@ -370,10 +360,72 @@ impl Index {
         schema: Schema,
         settings: IndexSettings,
     ) -> crate::Result<Index> {
-        let dir: Box<dyn Directory> = dir.into();
+        Self::create_to_avoid_monomorphization(dir.into(), schema, settings)
+    }
+
+    fn create_to_avoid_monomorphization(
+        dir: Box<dyn Directory>,
+        schema: Schema,
+        settings: IndexSettings,
+    ) -> crate::Result<Index> {
         let mut builder = IndexBuilder::new().schema(schema);
         builder = builder.settings(settings);
         builder.create(dir)
+    }
+
+    /// Opens a new directory from an index path.
+    #[cfg(feature = "mmap")]
+    pub fn open_in_dir<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
+        Self::open_in_dir_to_avoid_monomorphization(directory_path.as_ref())
+    }
+
+    #[cfg(feature = "mmap")]
+    #[inline(never)]
+    fn open_in_dir_to_avoid_monomorphization(directory_path: &Path) -> crate::Result<Index> {
+        let mmap_directory = MmapDirectory::open(directory_path)?;
+        Index::open(mmap_directory)
+    }
+
+    /// Open the index using the provided directory
+    pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
+        Self::open_avoid_monomorphization(directory.into())
+    }
+
+    #[inline(never)]
+    fn open_avoid_monomorphization(directory: Box<dyn Directory>) -> crate::Result<Index> {
+        let directory = ManagedDirectory::wrap(directory)?;
+        let inventory = SegmentMetaInventory::default();
+        let metas = load_metas(&directory, &inventory)?;
+        Index::open_from_metas(directory, &metas, inventory)
+    }
+
+    /// Accessor to the search executor.
+    ///
+    /// This pool is used by default when calling `searcher.search(...)`
+    /// to perform search on the individual segments.
+    ///
+    /// By default the executor is single thread, and simply runs in the calling thread.
+    pub fn search_executor(&self) -> &Executor {
+        &self.executor
+    }
+
+    /// Replace the default single thread search executor pool
+    /// by a thread pool with a given number of threads.
+    pub fn set_multithread_executor(&mut self, num_threads: usize) -> crate::Result<()> {
+        self.executor = Executor::multi_thread(num_threads, "tantivy-search-")?;
+        Ok(())
+    }
+
+    /// Custom thread pool by a outer thread pool.
+    pub fn set_executor(&mut self, executor: Executor) {
+        self.executor = executor;
+    }
+
+    /// Replace the default single thread search executor pool
+    /// by a thread pool with as many threads as there are CPUs on the system.
+    pub fn set_default_multithread_executor(&mut self) -> crate::Result<()> {
+        let default_num_threads = available_parallelism()?.get();
+        self.set_multithread_executor(default_num_threads)
     }
 
     /// Creates a new index given a directory and an [`IndexMeta`].
@@ -381,9 +433,9 @@ impl Index {
         directory: ManagedDirectory,
         metas: &IndexMeta,
         inventory: SegmentMetaInventory,
-    ) -> Index {
+    ) -> crate::Result<Index> {
         let schema = metas.schema.clone();
-        Index {
+        Ok(Index {
             settings: metas.index_settings.clone(),
             directory,
             schema,
@@ -391,7 +443,7 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
-        }
+        })
     }
 
     /// Setter for the tokenizer manager.
@@ -459,13 +511,6 @@ impl Index {
         IndexReaderBuilder::new(self.clone())
     }
 
-    /// Opens a new directory from an index path.
-    #[cfg(feature = "mmap")]
-    pub fn open_in_dir<P: AsRef<Path>>(directory_path: P) -> crate::Result<Index> {
-        let mmap_directory = MmapDirectory::open(directory_path)?;
-        Index::open(mmap_directory)
-    }
-
     /// Returns the list of the segment metas tracked by the index.
     ///
     /// Such segments can of course be part of the index,
@@ -492,7 +537,16 @@ impl Index {
         let segments = self.searchable_segments()?;
         let fields_metadata: Vec<Vec<FieldMetadata>> = segments
             .into_iter()
-            .map(|segment| SegmentReader::open(&segment)?.fields_metadata())
+            .map(|segment| {
+                let reader = TantivySegmentReader::open_with_custom_alive_set_from_directory(
+                    segment.index().directory(),
+                    segment.meta(),
+                    segment.schema(),
+                    None,
+                )?;
+                let reader: Arc<dyn crate::index::SegmentReader> = Arc::new(reader);
+                reader.fields_metadata()
+            })
             .collect::<Result<_, _>>()?;
         Ok(merge_field_meta_data(fields_metadata))
     }
@@ -504,16 +558,6 @@ impl Index {
     /// whether the segment is recorded as part of the index or not.
     pub fn new_segment_meta(&self, segment_id: SegmentId, max_doc: u32) -> SegmentMeta {
         self.inventory.new_segment_meta(segment_id, max_doc)
-    }
-
-    /// Open the index using the provided directory
-    pub fn open<T: Into<Box<dyn Directory>>>(directory: T) -> crate::Result<Index> {
-        let directory = directory.into();
-        let directory = ManagedDirectory::wrap(directory)?;
-        let inventory = SegmentMetaInventory::default();
-        let metas = load_metas(&directory, &inventory)?;
-        let index = Index::open_from_metas(directory, &metas, inventory);
-        Ok(index)
     }
 
     /// Reads the index meta file from the directory.
@@ -708,7 +752,7 @@ impl Index {
 }
 
 impl fmt::Debug for Index {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Index({:?})", self.directory)
     }
 }

@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use crate::index::CodecConfiguration;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
@@ -11,7 +12,7 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment_writer: SegmentWriter,
     segment: Segment,
     opstamp: Opstamp,
-    _phantom: PhantomData<D>,
+    _doc: PhantomData<D>,
 }
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
@@ -22,7 +23,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             segment_writer,
             segment,
             opstamp: 0,
-            _phantom: PhantomData,
+            _doc: PhantomData,
         })
     }
 
@@ -40,7 +41,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn finalize(self) -> crate::Result<Index> {
         let max_doc = self.segment_writer.max_doc();
         self.segment_writer.finalize()?;
-        let segment: Segment = self.segment.with_max_doc(max_doc);
+        let segment = self.segment.with_max_doc(max_doc);
         let index = segment.index();
         let index_meta = IndexMeta {
             index_settings: index.settings().clone(),
@@ -48,6 +49,7 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             schema: index.schema(),
             opstamp: 0,
             payload: None,
+            codec: CodecConfiguration::default(),
         };
         save_metas(&index_meta, index.directory())?;
         index.directory().sync_directory()?;
