@@ -467,7 +467,20 @@ impl QueryParser {
             }
             FieldType::Date(_) => {
                 let dt = OffsetDateTime::parse(phrase, &Rfc3339)?;
-                Ok(Term::from_field_date(field, DateTime::from_utc(dt)))
+                let datetime = DateTime::from_utc(dt);
+                // When the range query will be executed against the inverted
+                // index, the indexed terms are truncated to the index
+                // precision (seconds). Truncate the boundary as well so that
+                // sub-second components don't inflate the bound past the
+                // truncated terms and exclude matching documents. When a
+                // fast-field path is used, the values are compared at full
+                // precision, so the boundary is kept un-truncated.
+                let term = if field_supports_ff_range_queries {
+                    Term::from_field_date(field, datetime)
+                } else {
+                    Term::from_field_date_for_search(field, datetime)
+                };
+                Ok(term)
             }
             FieldType::Str(ref str_options) => {
                 let option = str_options.get_indexing_options().ok_or_else(|| {
