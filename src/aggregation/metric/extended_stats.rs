@@ -308,10 +308,18 @@ impl IntermediateExtendedStats {
     #[inline]
     fn collect(&mut self, value: f64) {
         self.intermediate_stats.collect(value);
-        // kahan algorithm for sum_of_squares_elastic
+        // kahan algorithm for sum_of_squares_elastic.
+        // The compensation term `(t - sum) - y` becomes NaN when intermediate
+        // values are non-finite (e.g. value*value = +INF, then INF - INF = NaN),
+        // which would then poison subsequent additions. Fall back to a plain add
+        // in that case.
         let y = value * value - self.delta_sum_for_squares_elastic;
         let t = self.sum_of_squares_elastic + y;
-        self.delta_sum_for_squares_elastic = (t - self.sum_of_squares_elastic) - y;
+        if t.is_finite() {
+            self.delta_sum_for_squares_elastic = (t - self.sum_of_squares_elastic) - y;
+        } else {
+            self.delta_sum_for_squares_elastic = 0.0;
+        }
         self.sum_of_squares_elastic = t;
         self.update_variance(value);
     }
