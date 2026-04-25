@@ -472,6 +472,11 @@ fn extend_validate_ranges(
     buckets: &[RangeAggregationRange],
     field_type: &ColumnType,
 ) -> crate::Result<Vec<InternalRangeAggregationRange>> {
+    if buckets.is_empty() {
+        return Err(TantivyError::InvalidArgument(
+            "Range aggregation requires at least one range".to_string(),
+        ));
+    }
     let mut converted_buckets = buckets
         .iter()
         .map(|range| to_u64_range(range, field_type))
