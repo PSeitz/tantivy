@@ -1312,21 +1312,25 @@ mod tests {
         let collector = create_collector(&index, aggregations)?;
         let result = searcher.search(&AllQuery, &collector)?;
 
-        // Verify the structure exists and has expected doc_count
+        // Verify the structure exists and has expected doc_count.
+        // Both brand buckets have `doc_count == 1`. With `_count: desc` (the default
+        // term-agg ordering), ties are now broken by `_key: asc` (matching
+        // Elasticsearch), so `apple` precedes `samsung`. Previously this assertion
+        // happened to pass because of incidental FxHashMap iteration order.
         let expected = json!({
             "electronics": {
                 "doc_count": 2,
                 "brands": {
                     "buckets": [
                         {
-                            "key": "samsung",
-                            "doc_count": 1,
-                            "avg_price": { "value": 799.0 }
-                        },
-                        {
                             "key": "apple",
                             "doc_count": 1,
                             "avg_price": { "value": 999.0 }
+                        },
+                        {
+                            "key": "samsung",
+                            "doc_count": 1,
+                            "avg_price": { "value": 799.0 }
                         }
                     ],
                     "sum_other_doc_count": 0,

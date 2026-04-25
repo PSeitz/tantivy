@@ -756,10 +756,31 @@ impl IntermediateTermBucketResult {
                 });
             }
             OrderTarget::Count => {
+                // Tie-break by `_key: asc` so the result is deterministic and matches
+                // Elasticsearch semantics. Without an explicit tie-breaker, buckets
+                // with equal `doc_count` were returned in FxHashMap iteration order,
+                // which varies across runs/builds.
                 if req.order.order == Order::Desc {
-                    buckets.sort_unstable_by_key(|bucket| std::cmp::Reverse(bucket.doc_count()));
+                    buckets.sort_by(|left, right| {
+                        right
+                            .doc_count()
+                            .cmp(&left.doc_count())
+                            .then_with(|| {
+                                left.key.partial_cmp(&right.key).expect(
+                                    "expected type string, which is always sortable",
+                                )
+                            })
+                    });
                 } else {
-                    buckets.sort_unstable_by_key(|bucket| bucket.doc_count());
+                    buckets.sort_by(|left, right| {
+                        left.doc_count()
+                            .cmp(&right.doc_count())
+                            .then_with(|| {
+                                left.key.partial_cmp(&right.key).expect(
+                                    "expected type string, which is always sortable",
+                                )
+                            })
+                    });
                 }
             }
             OrderTarget::SubAggregation(name) => {
