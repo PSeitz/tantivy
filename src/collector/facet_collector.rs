@@ -234,25 +234,31 @@ impl FacetCollector {
     }
 }
 
+// Sentinel compressed id reserved for facet terms that are not children
+// of any tracked facet. These contribute neither counts nor harvest entries.
+const IGNORED_FACET_ID: usize = usize::MAX;
+
 fn compress_mapping(mapping: &[(u64, usize)]) -> (Vec<usize>, Vec<(u64, usize)>) {
     // facet_ord -> collapse facet_id
     let mut compressed_collapse_mapping: Vec<usize> = Vec::with_capacity(mapping.len());
     // collapse facet_id -> facet_ord
     let mut unique_facet_ords: Vec<(u64, usize)> = Vec::new();
-    if mapping.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-    compressed_collapse_mapping.push(0);
-    unique_facet_ords.push(mapping[0]);
-    let mut last_facet_ord = mapping[0];
-    let mut last_facet_id = 0;
-    for &facet_ord in &mapping[1..] {
-        if facet_ord != last_facet_ord {
-            last_facet_id += 1;
-            last_facet_ord = facet_ord;
-            unique_facet_ords.push(facet_ord);
+    let mut last_unique: Option<(u64, usize)> = None;
+    for &facet_ord in mapping {
+        // (u64::MAX, _) is the sentinel set by compute_collapse_mapping for
+        // facet terms that are not children of any tracked facet. They must
+        // not allocate a slot in unique_facet_ords — otherwise harvest would
+        // call ord_to_term(u64::MAX, ..) and surface a phantom facet whose
+        // label is read from stale buffer bytes (issue #2494).
+        if facet_ord.0 == u64::MAX {
+            compressed_collapse_mapping.push(IGNORED_FACET_ID);
+            continue;
         }
-        compressed_collapse_mapping.push(last_facet_id);
+        if last_unique != Some(facet_ord) {
+            unique_facet_ords.push(facet_ord);
+            last_unique = Some(facet_ord);
+        }
+        compressed_collapse_mapping.push(unique_facet_ords.len() - 1);
     }
     (compressed_collapse_mapping, unique_facet_ords)
 }
@@ -371,7 +377,9 @@ impl SegmentCollector for FacetSegmentCollector {
         let mut previous_collapsed_ord: usize = usize::MAX;
         for facet_ord in self.reader.facet_ords(doc) {
             let collapsed_ord = self.compressed_collapse_mapping[facet_ord as usize];
-            self.counts[collapsed_ord] += u64::from(collapsed_ord != previous_collapsed_ord);
+            if collapsed_ord != IGNORED_FACET_ID && collapsed_ord != previous_collapsed_ord {
+                self.counts[collapsed_ord] += 1;
+            }
             previous_collapsed_ord = collapsed_ord;
         }
     }
