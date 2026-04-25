@@ -111,6 +111,7 @@ impl<T: Tokenizer> Tokenizer for SplitCompoundWordsFilter<T> {
             tail: self.inner.token_stream(text),
             cuts: &mut self.cuts,
             parts: &mut self.parts,
+            position_offset: 0,
         }
     }
 }
@@ -120,6 +121,12 @@ pub struct SplitCompoundWordsTokenStream<'a, T> {
     tail: T,
     cuts: &'a mut Vec<usize>,
     parts: &'a mut Vec<Token>,
+    /// Number of extra positions consumed by previously-emitted splits.
+    /// Each compound word that is split into N parts contributes (N - 1)
+    /// to this offset, so that subsequent tokens from `tail` (and the
+    /// parts of subsequent splits) appear at the correct, monotonically
+    /// increasing position.
+    position_offset: usize,
 }
 
 impl<T: TokenStream> SplitCompoundWordsTokenStream<'_, T> {
@@ -127,6 +134,8 @@ impl<T: TokenStream> SplitCompoundWordsTokenStream<'_, T> {
     // can fully be split into consecutive matches against `self.dict`.
     fn split(&mut self) {
         let token = self.tail.token();
+        let base_position = token.position.wrapping_add(self.position_offset);
+        let base_offset_from = token.offset_from;
         let mut text = token.text.as_str();
 
         self.cuts.clear();
@@ -142,17 +151,42 @@ impl<T: TokenStream> SplitCompoundWordsTokenStream<'_, T> {
         }
 
         if pos == token.text.len() {
+            let num_parts = self.cuts.len();
             // Fill `self.parts` in reverse order,
             // so that `self.parts.pop()` yields
             // the tokens in their original order.
-            for pos in self.cuts.iter().rev() {
-                let (head, tail) = text.split_at(*pos);
+            // The cuts encode the start byte of each part within `text`;
+            // we walk them right-to-left, splitting `text` into (head, tail)
+            // pairs so that each part receives its correct slice as well as
+            // its correct position and byte offsets.
+            let mut next_byte_end = text.len();
+            for (rev_idx, cut) in self.cuts.iter().rev().enumerate() {
+                let part_idx = num_parts - 1 - rev_idx; // 0-based index in document order
+                let (head, tail) = text.split_at(*cut);
 
                 text = head;
                 self.parts.push(Token {
+                    offset_from: base_offset_from + *cut,
+                    offset_to: base_offset_from + next_byte_end,
+                    position: base_position.wrapping_add(part_idx),
+                    position_length: 1,
                     text: tail.to_owned(),
-                    ..*token
                 });
+                next_byte_end = *cut;
+            }
+
+            // Account for the (num_parts - 1) extra positions injected by this
+            // split so that subsequent tokens line up correctly.
+            if num_parts > 0 {
+                self.position_offset = self.position_offset.wrapping_add(num_parts - 1);
+            }
+        } else {
+            // No split: still apply the running position offset to the
+            // tail token so its position remains consistent with previously
+            // split tokens.
+            if self.position_offset != 0 {
+                let tok = self.tail.token_mut();
+                tok.position = tok.position.wrapping_add(self.position_offset);
             }
         }
     }
