@@ -421,6 +421,10 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             let &(occur, ref weight) = &self.weights[0];
             if occur == Occur::MustNot {
                 Ok(Box::new(EmptyScorer))
+            } else if occur == Occur::Should && self.minimum_number_should_match > 1 {
+                // A single SHOULD clause cannot satisfy a minimum_number_should_match
+                // strictly greater than one.
+                Ok(Box::new(EmptyScorer))
             } else {
                 weight.scorer(reader, boost)
             }
