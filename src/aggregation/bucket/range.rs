@@ -961,4 +961,72 @@ mod tests {
         assert_eq!(search(u64::MAX - 1), 2); // Since the end range is never included,
                                              // the max value
     }
+
+    #[test]
+    fn test_range_aggregation_nan_values_treated_as_missing() -> crate::Result<()> {
+        // NaN values should be treated as missing in a range aggregation, consistent
+        // with the NaN handling in stats / extended_stats / cardinality / percentiles
+        // and with Elasticsearch's behavior. NaN has no meaningful ordering.
+        //
+        // Without the skip, NaN bit patterns get mapped to a u64 value above
+        // f64_to_u64(infinity) (`f64_to_u64` for positive NaN is 0xfff8...), so
+        // they fall into the auto-generated open-ended top bucket
+        // (`[last_to, u64::MAX)`) and are counted there — observably wrong via
+        // the public AggregationCollector API.
+        use crate::query::AllQuery;
+        use crate::schema::{Schema, FAST};
+        use crate::{Index, IndexWriter};
+
+        let mut schema_builder = Schema::builder();
+        let score_field_f64 = schema_builder.add_f64_field("score", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(crate::doc!(score_field_f64 => 5.0f64))?;
+            index_writer.add_document(crate::doc!(score_field_f64 => 15.0f64))?;
+            index_writer.add_document(crate::doc!(score_field_f64 => f64::NAN))?;
+            index_writer.add_document(crate::doc!(score_field_f64 => f64::NAN))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(serde_json::json!({
+            "range": {
+                "range": {
+                    "field": "score",
+                    "ranges": [
+                        { "from": 0.0, "to": 10.0 },
+                        { "from": 10.0, "to": 20.0 }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let collector = crate::aggregation::AggregationCollector::from_aggs(
+            agg_req,
+            Default::default(),
+        );
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let agg_res: crate::aggregation::agg_result::AggregationResults =
+            searcher.search(&AllQuery, &collector).unwrap();
+        let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+
+        // Expected: NaN docs are skipped — they are not in the top "20-*" bucket.
+        // Only the two real values 5.0 and 15.0 are counted.
+        assert_eq!(
+            res["range"]["buckets"],
+            serde_json::json!([
+                { "key": "*-0",   "doc_count": 0,                   "to":   0.0 },
+                { "key": "0-10",  "doc_count": 1, "from":   0.0,    "to":  10.0 },
+                { "key": "10-20", "doc_count": 1, "from":  10.0,    "to":  20.0 },
+                { "key": "20-*",  "doc_count": 0, "from":  20.0 }
+            ]),
+            "got {res}"
+        );
+
+        Ok(())
+    }
 }
