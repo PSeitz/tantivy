@@ -3029,4 +3029,74 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Segment-level `OrderTarget::Count` cutoff must tie-break on key ascending.
+    ///
+    /// When a terms aggregation is nested under another bucket aggregation, it is
+    /// not "top level" and the segment-level collector uses `HashMapTermBuckets`
+    /// (an `FxHashMap`-backed bucket map). When `segment_size` cuts off ties on
+    /// `doc_count`, the kept N is whatever `FxHashMap` iteration produces — not
+    /// the lexicographically smallest N. That violates Elasticsearch semantics
+    /// and is non-deterministic between FxHash variants.
+    ///
+    /// Reproduce by nesting a terms agg inside a range agg and giving five
+    /// single-letter keys with `doc_count = 1` each, with `segment_size = 2` and
+    /// `size = 10`. The two surviving buckets must be the alphabetically smallest
+    /// keys (`"a"`, `"b"`).
+    #[test]
+    fn terms_agg_segment_count_tie_break_uses_key_ascending() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let term_field = schema_builder.add_text_field("term_field", STRING | FAST);
+        let score_field = schema_builder.add_u64_field(
+            "score",
+            crate::schema::NumericOptions::default().set_fast(),
+        );
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut writer: IndexWriter = index.writer_with_num_threads(1, 20_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for term in ["a", "b", "c", "d", "e"] {
+                writer.add_document(doc!(
+                    term_field => term,
+                    score_field => 5u64,
+                ))?;
+            }
+            writer.commit()?;
+        }
+
+        // Wrap the terms agg in a range agg so the terms node is not
+        // `is_top_level`, forcing the `HashMapTermBuckets` storage.
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "scores": {
+                "range": {
+                    "field": "score",
+                    "ranges": [ { "from": 0, "to": 100 } ]
+                },
+                "aggs": {
+                    "terms_inside": {
+                        "terms": {
+                            "field": "term_field",
+                            "order": { "_count": "desc" },
+                            "size": 2,
+                            "segment_size": 2
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        let buckets = &res["scores"]["buckets"][0]["terms_inside"]["buckets"];
+        // Only segment_size=2 buckets survive the segment cutoff. With ties on
+        // doc_count, ES tie-breaks on key ascending => ["a", "b"].
+        assert_eq!(buckets.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(buckets[0]["key"], "a");
+        assert_eq!(buckets[0]["doc_count"], 1);
+        assert_eq!(buckets[1]["key"], "b");
+        assert_eq!(buckets[1]["doc_count"], 1);
+
+        Ok(())
+    }
 }
