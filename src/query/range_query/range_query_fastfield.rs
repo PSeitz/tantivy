@@ -128,7 +128,21 @@ impl Weight for FastFieldRangeWeight {
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
                     )
                 }
-                Type::Bool | Type::Facet | Type::Bytes | Type::Json | Type::IpAddr => {
+                Type::Bool => {
+                    let fast_field_reader = reader.fast_fields();
+                    let Some((column, _col_type)) = fast_field_reader
+                        .u64_lenient_for_type(Some(&[ColumnType::Bool]), &field_name)?
+                    else {
+                        return Ok(Box::new(EmptyScorer));
+                    };
+                    let bounds = bounds.map_bound(|term| term.as_bool().unwrap().to_u64());
+                    search_on_u64_ff(
+                        column,
+                        boost,
+                        BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
+                    )
+                }
+                Type::Facet | Type::Bytes | Type::Json | Type::IpAddr => {
                     Err(crate::TantivyError::InvalidArgument(format!(
                         "unsupported value bytes type in json term value_bytes {:?}",
                         term_value.typ()
