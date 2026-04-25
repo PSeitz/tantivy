@@ -347,7 +347,7 @@ impl MoreLikeThis {
             let idf = idf(doc_freq, num_docs);
             let score = (*term_frequency as f32) * idf;
             if let Some(limit) = self.max_query_terms {
-                if score_terms.len() > limit {
+                if score_terms.len() >= limit {
                     // update the least significant term
                     let least_significant_term_score = score_terms.peek().unwrap().0.score;
                     if least_significant_term_score < score {
