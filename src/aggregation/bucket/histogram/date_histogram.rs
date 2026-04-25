@@ -235,7 +235,9 @@ pub(crate) fn parse_into_milliseconds(input: &str) -> Result<i64, AggregationErr
         _ => return Err(DateHistogramParseError::UnitNotRecognized(unit.to_string()).into()),
     };
 
-    let val = number * unit_in_ms;
+    let val = number
+        .checked_mul(unit_in_ms)
+        .ok_or_else(|| DateHistogramParseError::OutOfBounds(input.to_string()))?;
     // The field type is in nanoseconds precision, so validate the value to fit the range
     val.checked_mul(1_000_000)
         .ok_or_else(|| DateHistogramParseError::OutOfBounds(input.to_string()))?;
