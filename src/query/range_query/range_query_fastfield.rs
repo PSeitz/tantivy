@@ -207,11 +207,13 @@ impl Weight for FastFieldRangeWeight {
                     val.to_u64()
                 } else if let Some(val) = value.as_f64() {
                     val.to_u64()
+                } else if let Some(val) = value.as_bool() {
+                    val.to_u64()
                 } else if let Some(val) = value.as_date() {
                     val.to_u64()
                 } else {
                     return Err(TantivyError::InvalidArgument(format!(
-                        "Expected term with u64, i64, f64 or date, but got {term:?}"
+                        "Expected term with u64, i64, f64, bool or date, but got {term:?}"
                     )));
                 };
                 Ok(val)
@@ -223,6 +225,7 @@ impl Weight for FastFieldRangeWeight {
                     ColumnType::U64,
                     ColumnType::I64,
                     ColumnType::F64,
+                    ColumnType::Bool,
                     ColumnType::DateTime,
                 ]),
                 &field_name,
