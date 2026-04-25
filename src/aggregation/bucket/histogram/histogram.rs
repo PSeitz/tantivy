@@ -169,9 +169,12 @@ impl HistogramAggregation {
     }
 
     fn validate(&self) -> crate::Result<()> {
-        if self.interval <= 0.0f64 {
+        // Note: `!(self.interval > 0.0)` is `true` for NaN as well as for
+        // negative/zero values, so this rejects NaN intervals which would
+        // otherwise slip through (`NaN <= 0.0` is `false`).
+        if !self.interval.is_finite() || self.interval <= 0.0f64 {
             return Err(TantivyError::InvalidArgument(
-                "interval must be a positive value".to_string(),
+                "interval must be a positive, finite value".to_string(),
             ));
         }
 
