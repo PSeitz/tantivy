@@ -189,7 +189,7 @@ impl MoreLikeThis {
                     FacetTokenizer::default()
                         .token_stream(fake_str)
                         .process(&mut |token| {
-                            if self.is_noise_word(token.text.clone()) {
+                            if !self.is_noise_word(token.text.clone()) {
                                 let term = Term::from_field_text(field, &token.text);
                                 *term_frequencies.entry(term).or_insert(0) += 1;
                             }
