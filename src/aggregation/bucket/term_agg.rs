@@ -3029,4 +3029,31 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn terms_aggregation_huge_size_does_not_overflow() -> crate::Result<()> {
+        // Regression test: with `size: u32::MAX` (or even modestly large values),
+        // computing the default `segment_size = size * 10` used to overflow,
+        // panicking under debug-assertions / overflow-checks (which the test
+        // profile enables). Using `saturating_mul` keeps the request valid and
+        // returns a normal response.
+        let segment_and_terms = vec![vec!["terma"], vec!["termb"]];
+        let index = get_test_index_from_terms(false, &segment_and_terms)?;
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "size": u32::MAX,
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+        // Both terms should be present.
+        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 1);
+        assert_eq!(res["my_texts"]["buckets"][1]["doc_count"], 1);
+        Ok(())
+    }
 }
