@@ -219,6 +219,18 @@ impl PercentilesCollector {
         Self { sketch }
     }
     fn collect(&mut self, val: f64) {
+        // DDSketch performs no NaN / infinity check in `add`. NaN comparisons
+        // against the bucket bounds all evaluate false, so the value would
+        // land in the zero bucket and taint the running sum. Infinities map
+        // to bin index `i32::MAX` (because `INF.ln() = INF` and `INF as i32`
+        // saturates), which then overflows the bin-range arithmetic in the
+        // sketch store the next time a finite value is added (panicking with
+        // "attempt to add with overflow"). Skip non-finite inputs entirely;
+        // they cannot be represented in the sketch and treating them as
+        // missing matches Elasticsearch behaviour.
+        if !val.is_finite() {
+            return;
+        }
         self.sketch.add(val);
     }
 
