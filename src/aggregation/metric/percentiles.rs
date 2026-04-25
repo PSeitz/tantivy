@@ -631,6 +631,54 @@ mod tests {
     }
 
     #[test]
+    fn test_percentiles_with_inf_values() -> crate::Result<()> {
+        // Indexing +/-INF together with a finite value into a percentiles
+        // aggregation panicked inside DDSketch. `Config::key(v)` computes
+        // `(v.ln() / gamma_ln).floor() as i32`, which yields `i32::MAX` for
+        // `+INF` (and the same after the negation in the negative-store
+        // branch for `-INF`). Subsequently adding a finite value tries to
+        // extend the bin range from 0 .. i32::MAX, overflows the
+        // `desired_length = max - min + 1` computation in `Store`, and ends
+        // up indexing past `bin_limit`, producing an "index out of bounds"
+        // panic surfaced through the public AggregationCollector API.
+        let mut schema_builder = Schema::builder();
+        let score_field_f64 = schema_builder.add_f64_field("score", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.add_document(doc!(score_field_f64 => 1.0f64))?;
+            index_writer.add_document(doc!(score_field_f64 => f64::INFINITY))?;
+            index_writer.add_document(doc!(score_field_f64 => f64::NEG_INFINITY))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "percentiles": {
+                "percentiles": {
+                    "field": "score",
+                }
+            }
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        // Should not panic. Infinite values are skipped (they cannot be
+        // represented in DDSketch), so percentiles are computed over the
+        // remaining finite values only.
+        let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+
+        let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+        let val = res["percentiles"]["values"]["50.0"].as_f64().unwrap();
+        assert!((0.99..=1.01).contains(&val), "got {val}");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_percentiles_missing() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("texts", FAST);
