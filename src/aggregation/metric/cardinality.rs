@@ -850,6 +850,43 @@ mod tests {
         }
     }
 
+    /// Multiple NaN bit patterns inserted into an f64 fast field are stored as distinct
+    /// u64 values (because `f64_to_u64` simply re-encodes the bits). Cardinality should
+    /// treat all NaNs as a single value (or as missing), matching Elasticsearch and the
+    /// behavior of other metric aggregations on this codebase.
+    #[test]
+    fn cardinality_aggregation_f64_nan_treated_as_one() {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_f64_field("f", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut writer = index.writer_for_tests().unwrap();
+            // Three different NaN bit patterns: all are still NaN.
+            writer
+                .add_document(doc!(field => f64::from_bits(0x7ff8_0000_0000_0001)))
+                .unwrap();
+            writer
+                .add_document(doc!(field => f64::from_bits(0x7ff8_0000_0000_0002)))
+                .unwrap();
+            writer
+                .add_document(doc!(field => f64::from_bits(0x7ff8_0000_0000_0003)))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "card": {
+                "cardinality": {"field": "f"}
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index).unwrap();
+        // NaN values should be treated as missing/equivalent. Cardinality must not
+        // count NaN as a unique value, so an all-NaN dataset must yield 0.
+        assert_eq!(res["card"]["value"], 0.0);
+    }
+
     #[test]
     fn cardinality_collector_salt_differentiates_types() {
         use super::CardinalityCollector;
