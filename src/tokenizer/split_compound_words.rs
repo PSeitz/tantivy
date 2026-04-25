@@ -279,4 +279,79 @@ mod tests {
             assert_eq!(stream.next(), None);
         }
     }
+
+    #[test]
+    fn split_compound_words_assigns_distinct_positions_to_parts() {
+        // The parts produced by splitting a compound word should each receive
+        // a distinct position (relative to the parent token) so that downstream
+        // consumers (e.g. PhraseQuery) treat them as adjacent rather than as
+        // sitting on top of each other.
+        let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(SplitCompoundWords::from_dictionary(["foo", "bar"]).unwrap())
+            .build();
+
+        let mut stream = tokenizer.token_stream("foobar");
+        let first = stream.next().unwrap().clone();
+        assert_eq!(first.text, "foo");
+        let second = stream.next().unwrap().clone();
+        assert_eq!(second.text, "bar");
+        assert_eq!(stream.next(), None);
+        // The two parts of the compound word must have *different* positions,
+        // otherwise a phrase query for "foo bar" cannot match the indexed
+        // "foobar" form (both would share position 0).
+        assert_ne!(
+            first.position, second.position,
+            "split parts share the same position (both = {})",
+            first.position
+        );
+        assert!(
+            first.position < second.position,
+            "second part position should be greater than first (got {} vs {})",
+            first.position,
+            second.position
+        );
+    }
+
+    #[test]
+    fn phrase_query_matches_split_compound_word() -> crate::Result<()> {
+        // Through the public API: a phrase query over the constituent parts
+        // of a compound word should match documents whose text contains the
+        // compound. With the bug the split parts share a single position,
+        // so PhraseQuery (which requires position(t_i) + 1 == position(t_{i+1}))
+        // returns zero hits.
+        use crate::collector::Count;
+        use crate::query::PhraseQuery;
+        use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
+        use crate::{Index, IndexWriter, TantivyDocument, Term};
+
+        let mut schema_builder = Schema::builder();
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("compound")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let text_field = schema_builder.add_text_field("text", text_options);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(SplitCompoundWords::from_dictionary(["foo", "bar"]).unwrap())
+            .build();
+        index.tokenizers().register("compound", analyzer);
+
+        let mut writer: IndexWriter<TantivyDocument> = index.writer_for_tests()?;
+        writer.add_document(doc!(text_field => "foobar"))?;
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let phrase = PhraseQuery::new(vec![
+            Term::from_field_text(text_field, "foo"),
+            Term::from_field_text(text_field, "bar"),
+        ]);
+        let count = searcher.search(&phrase, &Count)?;
+        assert_eq!(count, 1, "phrase 'foo bar' should match indexed 'foobar'");
+        Ok(())
+    }
 }
