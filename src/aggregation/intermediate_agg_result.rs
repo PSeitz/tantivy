@@ -552,7 +552,15 @@ impl IntermediateBucketResult {
                     let mut bucket_map =
                         FxHashMap::with_capacity_and_hasher(buckets.len(), Default::default());
                     for bucket in buckets {
-                        bucket_map.insert(bucket.key.to_string(), bucket);
+                        // For date histograms the formatted RFC3339 date string
+                        // (`key_as_string`) is used as the map key, matching the
+                        // Elasticsearch behavior. For numeric histograms the
+                        // numeric key's string representation is used.
+                        let map_key = bucket
+                            .key_as_string
+                            .clone()
+                            .unwrap_or_else(|| bucket.key.to_string());
+                        bucket_map.insert(map_key, bucket);
                     }
                     BucketEntries::HashMap(bucket_map)
                 } else {
