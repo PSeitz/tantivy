@@ -148,12 +148,14 @@ impl Weight for FastFieldRangeWeight {
             else {
                 return Ok(Box::new(EmptyScorer));
             };
-            let value_range = bound_range_inclusive_ip(
+            let Some(value_range) = bound_range_inclusive_ip(
                 &bounds.lower_bound,
                 &bounds.upper_bound,
                 ip_addr_column.min_value(),
                 ip_addr_column.max_value(),
-            );
+            ) else {
+                return Ok(Box::new(EmptyScorer));
+            };
             let docset = RangeDocSet::new(value_range, ip_addr_column);
             Ok(Box::new(ConstScorer::new(docset, boost)))
         } else if field_type.is_str() {
@@ -458,24 +460,27 @@ pub(crate) fn maps_to_u64_fastfield(typ: Type) -> bool {
     }
 }
 
+// Returns `None` if the requested range is empty after converting `Excluded` bounds to
+// `Included` ones — either because `Excluded(::0)` upper or `Excluded(ipv6_max)` lower
+// would overflow the underlying `u128`.
 fn bound_range_inclusive_ip(
     lower_bound: &Bound<Ipv6Addr>,
     upper_bound: &Bound<Ipv6Addr>,
     min_value: Ipv6Addr,
     max_value: Ipv6Addr,
-) -> RangeInclusive<Ipv6Addr> {
+) -> Option<RangeInclusive<Ipv6Addr>> {
     let start_value = match lower_bound {
         Bound::Included(ip_addr) => *ip_addr,
-        Bound::Excluded(ip_addr) => Ipv6Addr::from(ip_addr.to_u128() + 1),
+        Bound::Excluded(ip_addr) => Ipv6Addr::from(ip_addr.to_u128().checked_add(1)?),
         Bound::Unbounded => min_value,
     };
 
     let end_value = match upper_bound {
         Bound::Included(ip_addr) => *ip_addr,
-        Bound::Excluded(ip_addr) => Ipv6Addr::from(ip_addr.to_u128() - 1),
+        Bound::Excluded(ip_addr) => Ipv6Addr::from(ip_addr.to_u128().checked_sub(1)?),
         Bound::Unbounded => max_value,
     };
-    start_value..=end_value
+    Some(start_value..=end_value)
 }
 
 // Returns None, if the range cannot be converted to a inclusive range (which equals to a empty
