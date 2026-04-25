@@ -1420,4 +1420,47 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn histogram_test_nan_interval_is_rejected() -> crate::Result<()> {
+        use crate::aggregation::agg_req::{Aggregation, AggregationVariants};
+        let values = vec![1.0, 2.0, 3.0];
+        let index = get_test_index_from_values(false, &values)?;
+
+        // Construct a histogram aggregation with interval = NaN via the
+        // public Rust API. NaN slips past the `interval <= 0.0` validation
+        // (NaN comparisons are always false), so the request is silently
+        // accepted and produces nonsense output.
+        let mut aggs: Aggregations = Default::default();
+        aggs.insert(
+            "myhisto".to_string(),
+            Aggregation {
+                agg: AggregationVariants::Histogram(HistogramAggregation {
+                    field: "score_f64".to_string(),
+                    interval: f64::NAN,
+                    offset: None,
+                    min_doc_count: None,
+                    hard_bounds: None,
+                    extended_bounds: None,
+                    keyed: false,
+                    is_normalized_to_ns: false,
+                }),
+                sub_aggregation: Default::default(),
+            },
+        );
+
+        let result = exec_request(aggs, &index);
+        // Expectation: NaN must be rejected with a clean InvalidArgument error,
+        // not accepted (which yields garbage / NaN bucket keys).
+        assert!(
+            result.is_err(),
+            "histogram with interval=NaN should be rejected, got: {result:?}"
+        );
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("interval"),
+            "expected error mentioning 'interval', got: {err_str}"
+        );
+        Ok(())
+    }
 }
