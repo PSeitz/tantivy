@@ -2121,4 +2121,51 @@ mod test {
             "Unsupported query: Regex queries are not allowed."
         );
     }
+
+    /// Regression test: a range query against an indexed-only date field must
+    /// truncate the boundary to the index precision (seconds), just like a
+    /// term query does. Otherwise, sub-second components on the lower bound
+    /// inflate it beyond the truncated terms in the inverted index, causing
+    /// matching documents to be missed.
+    #[test]
+    fn test_range_query_date_bound_is_truncated_to_index_precision() -> crate::Result<()> {
+        use crate::collector::Count;
+        use crate::schema::{Schema, INDEXED};
+        use crate::time::format_description::well_known::Rfc3339;
+        use crate::time::OffsetDateTime;
+        use crate::DateTime;
+
+        let mut schema_builder = Schema::builder();
+        let date_field = schema_builder.add_date_field("date", INDEXED);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        let mut writer = index.writer_for_tests()?;
+        // Indexed precision is seconds. The actual time is 2010-01-01T00:00:00.500Z,
+        // but the inverted index will store the term truncated to .000Z.
+        let dt = DateTime::from_utc(
+            OffsetDateTime::parse("2010-01-01T00:00:00.500Z", &Rfc3339).unwrap(),
+        );
+        writer.add_document(doc!(date_field => dt))?;
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let query_parser = QueryParser::for_index(&index, vec![date_field]);
+
+        // Range whose lower bound has sub-second precision (.123Z) and contains
+        // the document's actual time (.500Z). The document must match.
+        let query = query_parser.parse_query(
+            "date:[2010-01-01T00:00:00.123Z TO 2010-01-01T00:00:01.000Z]",
+        )?;
+        let count = searcher.search(&query, &Count)?;
+        assert_eq!(
+            count, 1,
+            "expected the document at 2010-01-01T00:00:00.500Z to match the \
+             range [..00.123Z TO ..01.000Z]"
+        );
+
+        Ok(())
+    }
 }
