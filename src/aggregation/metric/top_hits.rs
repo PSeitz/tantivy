@@ -511,7 +511,8 @@ impl TopHitsTopNComputer {
         // Truncating from end would be more efficient, but we need to truncate from the front
         // because `into_sorted_vec` gives us a descending order because of the inverted
         // `Ord` semantics of the heap elements.
-        hits.drain(..self.req.from.unwrap_or(0));
+        let from = self.req.from.unwrap_or(0).min(hits.len());
+        hits.drain(..from);
         TopHitsMetricResult { hits }
     }
 }
