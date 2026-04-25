@@ -980,10 +980,24 @@ where
                 // to check).
             }
             OrderTarget::Count => {
+                // Tie-break by `term_id` ascending. For all supported column types
+                // the term ordinal matches the key's natural order (lexicographic
+                // for strings via the term dictionary, numeric for u64/i64/f64,
+                // sorted for ip addresses), so a `term_id: asc` tie-break is
+                // equivalent to `_key: asc` and matches Elasticsearch semantics.
+                //
+                // Without this tie-break the segment-level cutoff at
+                // `segment_size` is driven by `FxHashMap` iteration order when
+                // the underlying storage is `HashMapTermBuckets` (i.e. nested
+                // terms aggregations) — different keys are kept depending on
+                // FxHash variant and the chosen N is not the alphabetically
+                // smallest N.
                 if term_req.req.order.order == Order::Desc {
-                    entries.sort_unstable_by_key(|bucket| std::cmp::Reverse(bucket.1.count));
+                    entries.sort_unstable_by_key(|bucket| {
+                        (std::cmp::Reverse(bucket.1.count), bucket.0)
+                    });
                 } else {
-                    entries.sort_unstable_by_key(|bucket| bucket.1.count);
+                    entries.sort_unstable_by_key(|bucket| (bucket.1.count, bucket.0));
                 }
             }
         }
