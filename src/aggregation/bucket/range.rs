@@ -446,6 +446,14 @@ fn to_u64_range(
     range: &RangeAggregationRange,
     field_type: &ColumnType,
 ) -> crate::Result<InternalRangeAggregationRange> {
+    if let (Some(from), Some(to)) = (range.from, range.to) {
+        if from > to {
+            return Err(TantivyError::InvalidArgument(format!(
+                "Invalid range bucket: `from` ({from}) must be <= `to` ({to})"
+            )));
+        }
+    }
+
     let start = if let Some(from) = range.from {
         f64_to_fastfield_u64(from, field_type)
             .ok_or_else(|| TantivyError::InvalidArgument("invalid field type".to_string()))?
