@@ -1768,6 +1768,62 @@ mod tests {
     }
 
     #[test]
+    fn terms_aggregation_test_order_sub_agg_tie_break() -> crate::Result<()> {
+        // Many terms share the same `avg_score` (the value 1.0); when ordering
+        // by a sub-aggregation we expect ties to break deterministically by key
+        // (ascending), instead of returning hash-iteration order from
+        // FxHashMap.
+        let segment_and_terms = vec![
+            vec![(1.0, "alpha".to_string())],
+            vec![(1.0, "bravo".to_string())],
+            vec![(1.0, "charlie".to_string())],
+            vec![(1.0, "delta".to_string())],
+            vec![(1.0, "echo".to_string())],
+            vec![(1.0, "foxtrot".to_string())],
+            vec![(1.0, "golf".to_string())],
+            vec![(1.0, "hotel".to_string())],
+        ];
+        let index = get_test_index_from_values_and_terms(true, &segment_and_terms)?;
+
+        let sub_agg: Aggregations = serde_json::from_value(json!({
+            "avg_score": {
+                "avg": {
+                    "field": "score",
+                }
+            }
+        }))
+        .unwrap();
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "avg_score": "desc"
+                    }
+                },
+                "aggs": sub_agg,
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+
+        // All buckets share avg_score == 1.0 — ties must be broken
+        // deterministically (alphabetical by key).
+        assert_eq!(res["my_texts"]["buckets"][0]["key"], "alpha");
+        assert_eq!(res["my_texts"]["buckets"][1]["key"], "bravo");
+        assert_eq!(res["my_texts"]["buckets"][2]["key"], "charlie");
+        assert_eq!(res["my_texts"]["buckets"][3]["key"], "delta");
+        assert_eq!(res["my_texts"]["buckets"][4]["key"], "echo");
+        assert_eq!(res["my_texts"]["buckets"][5]["key"], "foxtrot");
+        assert_eq!(res["my_texts"]["buckets"][6]["key"], "golf");
+        assert_eq!(res["my_texts"]["buckets"][7]["key"], "hotel");
+
+        Ok(())
+    }
+
+    #[test]
     fn terms_aggregation_test_order_key_single_segment() -> crate::Result<()> {
         terms_aggregation_test_order_key_merge_segment(true)
     }
