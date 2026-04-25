@@ -557,6 +557,47 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_inf_plus_finite_sum() -> crate::Result<()> {
+        // Mathematically +INF + 1.0 == +INF, but Kahan compensation produces NaN
+        // when the running sum is +/-INF (the (t - sum) - y term becomes NaN,
+        // poisoning the next iteration).
+        let mut schema_builder = Schema::builder();
+        let score = schema_builder.add_f64_field("score", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(score => f64::INFINITY))?;
+            index_writer.add_document(doc!(score => 1.0f64))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_stats": {
+                "stats": {
+                    "field": "score",
+                },
+            }
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+        let searcher = index.reader()?.searcher();
+        let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+        use crate::aggregation::agg_result::{AggregationResult, MetricResult};
+        let sum = match agg_res.0.get("my_stats").unwrap() {
+            AggregationResult::MetricResult(MetricResult::Stats(s)) => s.sum,
+            other => panic!("expected stats result, got {other:?}"),
+        };
+        assert!(
+            !sum.is_nan(),
+            "expected sum to not be NaN; got {sum} (INF + 1.0 should be INF)"
+        );
+        assert!(sum.is_infinite() && sum > 0.0, "expected +INF, got {sum}");
+        Ok(())
+    }
+
+    #[test]
     fn test_stats_json() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let json = schema_builder.add_json_field("json", FAST);
