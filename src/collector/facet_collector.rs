@@ -731,6 +731,74 @@ mod tests {
         facet_collector.add_facet(Facet::from("/countryeurope"));
     }
 
+    // Reproduces issue #2494: phantom facets appear in the result when
+    // some facets in the segment dictionary are not children of any
+    // tracked facet. The `(u64::MAX, _)` sentinel used to mark
+    // "not tracked" leaks into `unique_facet_ords`, then `harvest`
+    // calls `ord_to_term(u64::MAX, ..)`, which leaves stale bytes in
+    // the buffer and produces a bogus facet string.
+    #[test]
+    fn test_facet_collector_no_phantom_facet() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let category =
+            schema_builder.add_facet_field("category", FacetOptions::default());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer
+            .add_document(doc!(category => Facet::from("/science-fiction/space")))?;
+        index_writer
+            .add_document(doc!(category => Facet::from("/science-fiction/alien-invasion")))?;
+        index_writer.add_document(
+            doc!(category => Facet::from("/science-fiction/space-colonization")),
+        )?;
+        index_writer
+            .add_document(doc!(category => Facet::from("/fantasy/epic-fantasy")))?;
+        index_writer
+            .add_document(doc!(category => Facet::from("/fantasy/epic-fantasy/martin")))?;
+        index_writer
+            .add_document(doc!(category => Facet::from("/fantasy/epic-fantasy/tolkien")))?;
+        index_writer
+            .add_document(doc!(category => Facet::from("/science-fiction/cyberpunk")))?;
+        index_writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        let mut facet_collector = FacetCollector::for_field("category");
+        facet_collector.add_facet("/fantasy/epic-fantasy");
+
+        let facet_term =
+            Term::from_facet(category, &Facet::from("/fantasy/epic-fantasy"));
+        let query = TermQuery::new(facet_term, IndexRecordOption::Basic);
+        let facet_counts = searcher.search(&query, &facet_collector)?;
+
+        let counts: Vec<(String, u64)> = facet_counts
+            .get("/fantasy/epic-fantasy")
+            .map(|(facet, count)| (facet.to_string(), count))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("/fantasy/epic-fantasy/martin".to_string(), 1),
+                ("/fantasy/epic-fantasy/tolkien".to_string(), 1),
+            ]
+        );
+
+        // Iterating over the full result set must not surface any
+        // facet outside the requested subtree.
+        let all_counts: Vec<(String, u64)> = facet_counts
+            .get("/")
+            .map(|(facet, count)| (facet.to_string(), count))
+            .collect();
+        for (facet_str, _) in &all_counts {
+            assert!(
+                facet_str.starts_with("/fantasy/epic-fantasy"),
+                "unexpected phantom facet in result: {facet_str:?} (full result: {all_counts:?})"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_facet_collector_topk() {
         let mut schema_builder = Schema::builder();
