@@ -1080,6 +1080,54 @@ mod tests {
         assert_eq!(count(query), 1);
     }
 
+    #[test]
+    fn json_range_fractional_lower_bound_on_int_column() {
+        // Regression test: a fractional `f64` lower bound queried against a JSON i64
+        // column should not include integer values strictly less than the fractional
+        // bound. e.g. `field >= 999.5` on an i64 column must EXCLUDE the value 999.
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", TEXT | STORED | FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
+            // Force the column to be i64 (negative value present).
+            let doc = json!({ "id_i64": -1 });
+            index_writer.add_document(doc!(json_field => doc)).unwrap();
+            let doc = json!({ "id_i64": 999 });
+            index_writer.add_document(doc!(json_field => doc)).unwrap();
+            let doc = json!({ "id_i64": 1000 });
+            index_writer.add_document(doc!(json_field => doc)).unwrap();
+            index_writer.commit().unwrap();
+        }
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let count = |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
+
+        // Lower bound `Included(999.5)`: integer values >= 999.5, i.e. >= 1000.
+        // Only the `1000` document should match. The `999` document must NOT match.
+        assert_eq!(
+            count(RangeQuery::new(
+                Bound::Included(get_json_term(json_field, "id_i64", 999.5_f64)),
+                Bound::Included(get_json_term(json_field, "id_i64", 2000.0_f64)),
+            )),
+            1,
+            "Included(999.5) lower bound on i64 column must exclude the value 999"
+        );
+
+        // Excluded(999.5) is equivalent to Included(999.5) for integer columns;
+        // both must exclude the value 999.
+        assert_eq!(
+            count(RangeQuery::new(
+                Bound::Excluded(get_json_term(json_field, "id_i64", 999.5_f64)),
+                Bound::Included(get_json_term(json_field, "id_i64", 2000.0_f64)),
+            )),
+            1,
+            "Excluded(999.5) lower bound on i64 column must exclude the value 999"
+        );
+    }
+
     #[derive(Clone, Debug)]
     pub struct Doc {
         pub id_name: String,
