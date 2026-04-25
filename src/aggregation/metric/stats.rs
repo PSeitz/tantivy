@@ -162,6 +162,13 @@ impl IntermediateStats {
 
     #[inline]
     pub(in crate::aggregation::metric) fn collect(&mut self, value: f64) {
+        // Skip NaN values entirely. NaN does not have a meaningful ordering, so
+        // f64::min / f64::max would silently keep the seed sentinels (f64::MAX /
+        // f64::MIN) — exposing those as the reported min/max. We treat NaN as
+        // "missing" (consistent with how Elasticsearch handles NaN in stats).
+        if value.is_nan() {
+            return;
+        }
         self.count += 1;
 
         // kahan algorithm for sum

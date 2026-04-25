@@ -307,6 +307,10 @@ impl IntermediateExtendedStats {
 
     #[inline]
     fn collect(&mut self, value: f64) {
+        // Skip NaN values entirely (consistent with `IntermediateStats::collect`).
+        if value.is_nan() {
+            return;
+        }
         self.intermediate_stats.collect(value);
         // kahan algorithm for sum_of_squares_elastic
         let y = value * value - self.delta_sum_for_squares_elastic;
