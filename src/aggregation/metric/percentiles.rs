@@ -219,6 +219,14 @@ impl PercentilesCollector {
         Self { sketch }
     }
     fn collect(&mut self, val: f64) {
+        // Skip NaN values entirely. DDSketch's `add` performs no NaN check, so
+        // NaN comparisons against bucket bounds all evaluate false and the value
+        // lands in the zero bucket while also tainting the running sum. That
+        // surfaces 0.0 as every percentile via the public API. Treat NaN as
+        // missing (matching how stats / extended_stats now handle it).
+        if val.is_nan() {
+            return;
+        }
         self.sketch.add(val);
     }
 
