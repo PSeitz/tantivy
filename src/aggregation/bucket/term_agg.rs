@@ -1121,17 +1121,32 @@ where
             }
         } else {
             for (val, doc_count) in entries {
-                let intermediate_entry = into_intermediate_bucket_entry(
-                    doc_count,
-                    reborrow_opt_collector(&mut sub_agg_collector),
-                    agg_data,
-                )?;
                 if term_req.column_type == ColumnType::U64 {
+                    let intermediate_entry = into_intermediate_bucket_entry(
+                        doc_count,
+                        reborrow_opt_collector(&mut sub_agg_collector),
+                        agg_data,
+                    )?;
                     dict.insert(IntermediateKey::U64(val), intermediate_entry);
                 } else if term_req.column_type == ColumnType::I64 {
+                    let intermediate_entry = into_intermediate_bucket_entry(
+                        doc_count,
+                        reborrow_opt_collector(&mut sub_agg_collector),
+                        agg_data,
+                    )?;
                     dict.insert(IntermediateKey::I64(i64::from_u64(val)), intermediate_entry);
                 } else {
                     let val = f64::from_u64(val);
+                    // NaN is treated as a missing value (Elasticsearch semantics):
+                    // skip it instead of producing a bucket with a null key.
+                    if val.is_nan() {
+                        continue;
+                    }
+                    let intermediate_entry = into_intermediate_bucket_entry(
+                        doc_count,
+                        reborrow_opt_collector(&mut sub_agg_collector),
+                        agg_data,
+                    )?;
                     let val: NumericalValue = val.into();
 
                     match val.normalize() {
