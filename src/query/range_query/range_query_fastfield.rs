@@ -391,7 +391,11 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
             if lower_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(lower_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.trunc()).to_u64()))
+                // For a fractional lower bound (Included or Excluded), the smallest
+                // integer that satisfies the inequality is `ceil(lower_bound)`.
+                // `trunc` would round toward zero and produce the wrong integer for
+                // positive fractional bounds (e.g. 0.5 -> 0 instead of 1).
+                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.ceil()).to_u64()))
             }
         },
         |&upper_bound| {
@@ -405,7 +409,11 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
             if upper_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(upper_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.trunc()).to_u64()))
+                // For a fractional upper bound (Included or Excluded), the largest
+                // integer that satisfies the inequality is `floor(upper_bound)`.
+                // `trunc` would round toward zero and produce the wrong integer for
+                // negative fractional bounds (e.g. -0.5 -> 0 instead of -1).
+                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.floor()).to_u64()))
             }
         },
     )
