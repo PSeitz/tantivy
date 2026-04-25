@@ -1080,6 +1080,75 @@ mod tests {
         assert_eq!(count(query), 1);
     }
 
+    /// Regression test: positive fractional lower bounds and negative fractional
+    /// upper bounds were truncated toward zero (using `trunc()`) when projecting
+    /// an f64 query bound onto an integer fast field column.
+    ///
+    /// The correct behavior is to use `ceil()` for the lower bound and `floor()`
+    /// for the upper bound — i.e. expand the bound to the closest integer that
+    /// strictly preserves the f64 inequality.
+    ///
+    /// Previously a query of `id_i64 >= 0.5` would (incorrectly) match a document
+    /// whose `id_i64` was 0, because the bound got truncated to `Included(0)`
+    /// instead of `Included(1)`.
+    #[test]
+    fn json_range_f64_fractional_bound_on_int_column() {
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", TEXT | STORED | FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 50_000_000).unwrap();
+            // i64 column with values 0 and 5. Both are integers; the column type
+            // will be inferred as i64 (signed because we feed at least one i64).
+            let doc = json!({
+                "id_i64": 0_i64,
+            });
+            index_writer.add_document(doc!(json_field => doc)).unwrap();
+            let doc = json!({
+                "id_i64": 5_i64,
+            });
+            index_writer.add_document(doc!(json_field => doc)).unwrap();
+            // Add a negative value so the column is unambiguously stored as i64.
+            let doc = json!({
+                "id_i64": -5_i64,
+            });
+            index_writer.add_document(doc!(json_field => doc)).unwrap();
+            index_writer.commit().unwrap();
+        }
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let count = |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
+
+        // f64 lower bound 0.5 (positive fractional) on an i64 column.
+        // The integer values >= 0.5 are 1, 2, 3, ... so only `5` should match
+        // among our docs (0 and -5 must NOT match).
+        // Buggy code truncates 0.5 -> 0 and matches doc with id_i64 = 0 too.
+        assert_eq!(
+            count(RangeQuery::new(
+                Bound::Included(get_json_term(json_field, "id_i64", 0.5_f64)),
+                Bound::Unbounded,
+            )),
+            1,
+            "lower bound 0.5 must not include the document with id_i64 = 0"
+        );
+
+        // f64 upper bound -0.5 (negative fractional) on an i64 column.
+        // The integer values <= -0.5 are -1, -2, ... so only `-5` should match
+        // among our docs (0 and 5 must NOT match).
+        // Buggy code truncates -0.5 -> 0 and matches doc with id_i64 = 0 too.
+        assert_eq!(
+            count(RangeQuery::new(
+                Bound::Unbounded,
+                Bound::Included(get_json_term(json_field, "id_i64", -0.5_f64)),
+            )),
+            1,
+            "upper bound -0.5 must not include the document with id_i64 = 0"
+        );
+    }
+
     #[derive(Clone, Debug)]
     pub struct Doc {
         pub id_name: String,
