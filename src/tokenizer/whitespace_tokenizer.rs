@@ -87,4 +87,59 @@ mod tests {
         token_stream.process(&mut add_token);
         tokens
     }
+
+    #[test]
+    fn test_whitespace_tokenizer_splits_on_unicode_whitespace() {
+        // Inputs that contain Unicode whitespace characters (NBSP and an em space).
+        // The `WhitespaceTokenizer` is documented to "tokenize the text by splitting on
+        // whitespaces", so callers naturally expect Unicode whitespace to be treated
+        // the same as ASCII whitespace. Indexing text with a non-breaking space and then
+        // searching for the post-whitespace word should match.
+        let tokens = token_stream_helper("hello\u{00A0}world");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[1].text, "world");
+
+        // Em space (U+2003) should also act as a separator.
+        let tokens = token_stream_helper("foo\u{2003}bar");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].text, "foo");
+        assert_eq!(tokens[1].text, "bar");
+    }
+
+    #[test]
+    fn test_whitespace_tokenizer_search_finds_term_split_by_nbsp() -> crate::Result<()> {
+        use crate::collector::Count;
+        use crate::query::TermQuery;
+        use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
+        use crate::{Index, IndexWriter, Term};
+
+        let mut schema_builder = Schema::builder();
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("whitespace")
+                .set_index_option(IndexRecordOption::Basic),
+        );
+        let body = schema_builder.add_text_field("body", text_options);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            // The two words are separated by a NO-BREAK SPACE (U+00A0).
+            index_writer.add_document(doc!(body => "hello\u{00A0}world"))?;
+            index_writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // The whitespace tokenizer is documented to split on whitespaces. NBSP is whitespace,
+        // so `world` should match the only document.
+        let term_query = TermQuery::new(
+            Term::from_field_text(body, "world"),
+            IndexRecordOption::Basic,
+        );
+        let count = searcher.search(&term_query, &Count)?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
 }
