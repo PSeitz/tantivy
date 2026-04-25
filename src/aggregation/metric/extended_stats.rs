@@ -1153,4 +1153,24 @@ mod tests {
         let avg = extended_stats.avg.unwrap();
         assert_eq!(5.166666666666667, avg);
     }
+
+    #[test]
+    fn extended_stats_sum_of_squares_with_inf_then_finite() {
+        // The Kahan compensation in `IntermediateExtendedStats::collect` for
+        // `sum_of_squares_elastic` produces NaN as soon as a non-finite value
+        // is collected: with `value = +INF`, `value*value = +INF`, then
+        // `(t - sum_of_squares_elastic) - y = (+INF - 0.0) - +INF = NaN`,
+        // which then poisons every subsequent addition.
+        // Expected: `sum_of_squares` should be `+INF` (math: +INF + 1.0 = +INF),
+        // not NaN.
+        let mut s = IntermediateExtendedStats::default();
+        s.collect(f64::INFINITY);
+        s.collect(1.0);
+        let extended_stats = s.finalize();
+        let sum_of_squares = extended_stats.sum_of_squares.unwrap();
+        assert!(
+            sum_of_squares.is_infinite() && sum_of_squares > 0.0,
+            "sum_of_squares should be +INF, got {sum_of_squares}"
+        );
+    }
 }
