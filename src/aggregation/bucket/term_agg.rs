@@ -315,7 +315,10 @@ impl TermsAggregationInternal {
     pub(crate) fn from_req(req: &TermsAggregation) -> Self {
         let size = req.size.unwrap_or(10);
 
-        let mut segment_size = req.segment_size.unwrap_or(size * 10);
+        // Use saturating_mul to avoid overflow when the user supplies a very
+        // large `size` (e.g. u32::MAX). The default segment_size of `10 *
+        // size` is just a heuristic, so saturating at u32::MAX is fine.
+        let mut segment_size = req.segment_size.unwrap_or(size.saturating_mul(10));
 
         let order = req.order.clone().unwrap_or_default();
         segment_size = segment_size.max(size);
