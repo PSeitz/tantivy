@@ -391,7 +391,11 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
             if lower_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(lower_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.trunc()).to_u64()))
+                // Round UP so that integer values strictly less than the
+                // fractional lower bound are excluded.
+                // e.g. `field >= 2.5` (or `field > 2.5`) on an integer column
+                // must match `field >= 3`, not `field >= 2`.
+                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.ceil()).to_u64()))
             }
         },
         |&upper_bound| {
@@ -405,7 +409,12 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
             if upper_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(upper_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.trunc()).to_u64()))
+                // Round DOWN so that integer values strictly greater than the
+                // fractional upper bound are excluded.
+                // e.g. `field <= 2.5` (or `field < 2.5`) on an integer column
+                // must match `field <= 2`, not `field <= 3` (relevant for
+                // negative bounds where `trunc` differs from `floor`).
+                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.floor()).to_u64()))
             }
         },
     )
