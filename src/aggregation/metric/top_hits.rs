@@ -168,7 +168,7 @@ impl<'de> Deserialize<'de> for KeyOrder {
 fn globbed_string_to_regex(glob: &str) -> Result<Regex, crate::TantivyError> {
     // Replace `*` glob with `.*` regex
     let sanitized = format!("^{}$", regex::escape(glob).replace(r"\*", ".*"));
-    Regex::new(&sanitized.replace('*', ".*")).map_err(|e| {
+    Regex::new(&sanitized).map_err(|e| {
         crate::TantivyError::SchemaError(format!("Invalid regex '{glob}' in docvalue_fields: {e}"))
     })
 }
