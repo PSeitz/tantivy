@@ -124,10 +124,17 @@ impl IntermediateStats {
     pub fn merge_fruits(&mut self, other: IntermediateStats) {
         self.count += other.count;
 
-        // kahan algorithm for sum
+        // kahan algorithm for sum.
+        // The compensation term `(t - sum) - y` becomes NaN when intermediate values
+        // are non-finite (e.g. +/-INF, where INF - INF = NaN), which would then
+        // poison subsequent additions. Fall back to a plain add in that case.
         let y = other.sum - (self.delta + other.delta);
         let t = self.sum + y;
-        self.delta = (t - self.sum) - y;
+        if t.is_finite() {
+            self.delta = (t - self.sum) - y;
+        } else {
+            self.delta = 0.0;
+        }
         self.sum = t;
 
         self.min = self.min.min(other.min);
@@ -164,10 +171,17 @@ impl IntermediateStats {
     pub(in crate::aggregation::metric) fn collect(&mut self, value: f64) {
         self.count += 1;
 
-        // kahan algorithm for sum
+        // kahan algorithm for sum.
+        // The compensation term `(t - sum) - y` becomes NaN when intermediate
+        // values are non-finite (e.g. +/-INF, where INF - INF = NaN), which would
+        // then poison subsequent additions. Fall back to a plain add in that case.
         let y = value - self.delta;
         let t = self.sum + y;
-        self.delta = (t - self.sum) - y;
+        if t.is_finite() {
+            self.delta = (t - self.sum) - y;
+        } else {
+            self.delta = 0.0;
+        }
         self.sum = t;
 
         self.min = self.min.min(value);
