@@ -103,8 +103,12 @@ impl Default for IntermediateStats {
             count: 0,
             sum: 0.0,
             delta: 0.0,
-            min: f64::MAX,
-            max: f64::MIN,
+            // Seed with +/-INF so a real +/-INF observation is preserved.
+            // f64::MAX < f64::INFINITY, so seeding `min` with f64::MAX would cause
+            // f64::min(f64::MAX, f64::INFINITY) to return f64::MAX, leaking the
+            // sentinel as the reported min. Symmetric for `max` with f64::MIN.
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
         }
     }
 }
