@@ -337,9 +337,11 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
         let offset = req.offset;
         let get_bucket_pos = |val| get_bucket_pos_f64(val, interval, offset) as i64;
 
+        // Deduplicate (doc_id, value) pairs so a doc with the same value indexed multiple
+        // times in the same bucket doesn't inflate `doc_count` (mirrors term agg #2854).
         agg_data
             .column_block_accessor
-            .fetch_block(docs, &req.accessor);
+            .fetch_block_with_missing_unique_per_doc(docs, &req.accessor, None);
         for (doc, val) in agg_data
             .column_block_accessor
             .iter_docid_vals(docs, &req.accessor)

@@ -283,9 +283,11 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentRangeCollector<B> {
     ) -> crate::Result<()> {
         let req = agg_data.take_range_req_data(self.accessor_idx);
 
+        // Deduplicate (doc_id, value) pairs so a doc with the same value indexed multiple
+        // times in the same bucket doesn't inflate `doc_count` (mirrors term agg #2854).
         agg_data
             .column_block_accessor
-            .fetch_block(docs, &req.accessor);
+            .fetch_block_with_missing_unique_per_doc(docs, &req.accessor, None);
 
         let buckets = &mut self.parent_buckets[parent_bucket_id as usize];
 
