@@ -2798,6 +2798,43 @@ mod tests {
     }
 
     #[test]
+    fn terms_aggregation_ip_addr_key_order_asc() -> crate::Result<()> {
+        // When the user requests `_key: asc` order on an IpAddr term aggregation,
+        // the buckets must be sorted by numeric IP value, not by lexicographic string order.
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_ip_addr_field("ip_field", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+            writer.add_document(
+                doc!(field=>IpAddr::from_str("10.0.0.1").unwrap().into_ipv6_addr()),
+            )?;
+            writer.add_document(
+                doc!(field=>IpAddr::from_str("9.0.0.1").unwrap().into_ipv6_addr()),
+            )?;
+            writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "ips": {
+                "terms": {
+                    "field": "ip_field",
+                    "order": { "_key": "asc" }
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request_with_query(agg_req, &index, None)?;
+        // Numerically, 9.0.0.1 < 10.0.0.1, so it must be first when ordering ascending.
+        assert_eq!(res["ips"]["buckets"][0]["key"], "9.0.0.1");
+        assert_eq!(res["ips"]["buckets"][1]["key"], "10.0.0.1");
+
+        Ok(())
+    }
+
+    #[test]
     fn terms_aggs_hosts_and_tags_merge_on_mixed_order_request() -> crate::Result<()> {
         // This test ensures that merging of aggregation results works correctly
         // even if the order of the aggregation requests is different and
