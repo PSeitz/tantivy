@@ -411,6 +411,25 @@ mod tests {
     }
 
     #[test]
+    fn test_single_should_clause_with_unsatisfiable_minimum_should_match() -> crate::Result<()> {
+        // A BooleanQuery with a single SHOULD clause and minimum_number_should_match
+        // greater than the number of clauses cannot ever match. The fast path that
+        // unwraps a single-clause BooleanQuery must respect this constraint.
+        let index = create_test_index()?;
+        let searcher = index.reader()?.searcher();
+        let text = index.schema().get_field("text").unwrap();
+        let term_a = TermQuery::new(Term::from_field_text(text, "a"), IndexRecordOption::Basic);
+
+        let query = BooleanQuery::with_minimum_required_clauses(
+            vec![(crate::query::Occur::Should, Box::new(term_a) as Box<dyn Query>)],
+            2,
+        );
+        let count = searcher.search(&query, &Count)?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
     pub fn test_json_array_pitfall_bag_of_terms() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let json_field = schema_builder.add_json_field("json", TEXT);
