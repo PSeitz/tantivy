@@ -163,6 +163,7 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
                 sub_agg: &mut self.sub_agg,
                 bucket_id_provider: &mut self.bucket_id_provider,
                 sub_level_values: SmallVec::new(),
+                seen_keys: SmallVec::new(),
             };
             visitor.visit(0, true)?;
         }
@@ -488,6 +489,11 @@ struct CompositeKeyVisitor<'a> {
     sub_agg: &'a mut Option<BufferedSubAggs<HighCardSubAggBuffer>>,
     bucket_id_provider: &'a mut BucketIdProvider,
     sub_level_values: SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
+    /// Keys already emitted for the current doc, to avoid double-counting when a single
+    /// doc has multiple values that map to the same composite key (e.g. the same raw
+    /// value indexed multiple times, or distinct values that fall into the same
+    /// histogram bucket).
+    seen_keys: SmallVec<[SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>; 4]>,
 }
 
 impl CompositeKeyVisitor<'_> {
@@ -500,6 +506,17 @@ impl CompositeKeyVisitor<'_> {
     fn visit(&mut self, source_idx: usize, is_on_after_key: bool) -> crate::Result<()> {
         if source_idx == self.composite_agg_data.req.sources.len() {
             if !is_on_after_key {
+                // Skip if we already emitted this exact composite key for the current doc
+                // (e.g. the same value indexed multiple times in a multi-valued source, or
+                // distinct values that fall into the same histogram bucket).
+                if self
+                    .seen_keys
+                    .iter()
+                    .any(|k| k.as_slice() == self.sub_level_values.as_slice())
+                {
+                    return Ok(());
+                }
+                self.seen_keys.push(self.sub_level_values.clone());
                 collect_bucket_with_limit(
                     self.doc_id,
                     self.composite_agg_data.req.size as usize,

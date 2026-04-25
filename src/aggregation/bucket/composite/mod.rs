@@ -1517,9 +1517,9 @@ mod tests {
                 {"key": {"text_terms": "banana"}, "doc_count": 1},
                 {"key": {"text_terms": "cherry"}, "doc_count": 1},
                 {"key": {"text_terms": "date"}, "doc_count": 1},
-                // this is not the doc count but the term occurrence count
-                // https://github.com/quickwit-oss/tantivy/issues/2721
-                {"key": {"text_terms": "elderberry"}, "doc_count": 2}
+                // The third doc indexes "elderberry" twice, but composite agg now
+                // deduplicates per (doc, key) so it counts once. (was issue #2721)
+                {"key": {"text_terms": "elderberry"}, "doc_count": 1}
             ]),
         );
 
