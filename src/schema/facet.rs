@@ -338,6 +338,27 @@ mod tests {
     }
 
     #[test]
+    fn test_backslash_in_step_round_trip() {
+        // A path step containing a literal backslash should round-trip through
+        // Display + from_text (this is the codec used by serde).
+        let original = Facet::from_path(["foo\\bar"]);
+        assert_eq!(original.to_path(), vec!["foo\\bar"]);
+        let displayed = original.to_path_string();
+        let reparsed = Facet::from_text(&displayed).unwrap();
+        assert_eq!(reparsed, original);
+        assert_eq!(reparsed.to_path(), vec!["foo\\bar"]);
+    }
+
+    #[test]
+    fn test_backslash_in_step_serde_round_trip() {
+        // serde Serialize/Deserialize must round-trip a backslash in a step.
+        let original = Facet::from_path(["foo\\bar"]);
+        let json = serde_json::to_string(&original).unwrap();
+        let back: Facet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
     fn deserialize_from_invalid_string() {
         let error = serde_json::from_str::<Facet>(r#""foo/bar""#).unwrap_err();
         assert_eq!(
