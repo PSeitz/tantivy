@@ -252,6 +252,50 @@ mod tests {
     }
 
     #[test]
+    fn test_more_like_this_max_query_terms_respected() -> crate::Result<()> {
+        use crate::query::more_like_this::MoreLikeThis;
+        use crate::query::BooleanQuery;
+        use crate::DocAddress;
+        let mut schema_builder = Schema::builder();
+        let body = schema_builder.add_text_field("body", TEXT | STORED);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        // The "source" document contains many distinct terms.
+        index_writer.add_document(doc!(
+            body => "alpha bravo charlie delta echo foxtrot golf hotel india juliet"
+        ))?;
+        // Add at least one other document so all terms have doc_freq >= 1.
+        index_writer.add_document(doc!(
+            body => "alpha bravo charlie delta echo foxtrot golf hotel india juliet"
+        ))?;
+        index_writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let max_query_terms = 3;
+        let mlt = MoreLikeThis {
+            min_doc_frequency: Some(1),
+            max_doc_frequency: None,
+            min_term_frequency: Some(1),
+            max_query_terms: Some(max_query_terms),
+            min_word_length: None,
+            max_word_length: None,
+            boost_factor: Some(1.0),
+            stop_words: vec![],
+        };
+        let boolean_query: BooleanQuery =
+            mlt.query_with_document(&searcher, DocAddress::new(0, 0))?;
+        assert!(
+            boolean_query.clauses().len() <= max_query_terms,
+            "BooleanQuery should have at most {} clauses, got {}",
+            max_query_terms,
+            boolean_query.clauses().len()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_more_like_this_query() -> crate::Result<()> {
         let index = create_test_index()?;
         let reader = index.reader()?;
