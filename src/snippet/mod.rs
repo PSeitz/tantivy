@@ -103,7 +103,12 @@ impl FragmentCandidate {
     fn try_add_token(&mut self, token: &Token, terms: &BTreeMap<String, Score>) {
         self.stop_offset = token.offset_to;
 
-        if let Some(&score) = terms.get(&token.text.to_lowercase()) {
+        // Do not lowercase the token text here: the query terms in `terms` were
+        // produced by the same tokenizer pipeline as the one that emitted this
+        // token, so they are already in the same canonical form (whatever the
+        // pipeline's filters do). Forcing a lowercase here breaks highlighting
+        // when the field uses a case-sensitive tokenizer (such as `whitespace`).
+        if let Some(&score) = terms.get(token.text.as_str()) {
             self.score += score;
             self.highlighted.push(token.offset_from..token.offset_to);
         }
@@ -485,8 +490,16 @@ mod tests {
     use crate::query::QueryParser;
     use crate::schema::{Schema, TEXT};
     use crate::snippet::SnippetGenerator;
-    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer};
+    use crate::tokenizer::{LowerCaser, NgramTokenizer, SimpleTokenizer, TextAnalyzer};
     use crate::Index;
+
+    /// Build a tokenizer that splits on punctuation and whitespace then lowercases. This
+    /// matches the canonical form used by tantivy's default text analyzer pipeline.
+    fn lowercased_simple_tokenizer() -> TextAnalyzer {
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .build()
+    }
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
 Mozilla which describes it as a "safe, concurrent, practical language", supporting functional and
@@ -508,12 +521,7 @@ Survey in 2016, 2017, and 2018."#;
             String::from("rust") => 1.0,
             String::from("language") => 0.9
         };
-        let fragments = search_fragments(
-            &mut From::from(SimpleTokenizer::default()),
-            TEST_TEXT,
-            &terms,
-            100,
-        );
+        let fragments = search_fragments(&mut lowercased_simple_tokenizer(), TEST_TEXT, &terms, 100);
         assert_eq!(fragments.len(), 7);
         {
             let first = &fragments[0];
@@ -540,12 +548,8 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("rust") =>1.0,
                 String::from("language") => 0.9
             };
-            let fragments = search_fragments(
-                &mut From::from(SimpleTokenizer::default()),
-                TEST_TEXT,
-                &terms,
-                20,
-            );
+            let fragments =
+                search_fragments(&mut lowercased_simple_tokenizer(), TEST_TEXT, &terms, 20);
             {
                 let first = &fragments[0];
                 assert_eq!(first.score, 1.0);
@@ -559,12 +563,8 @@ Survey in 2016, 2017, and 2018."#;
                 String::from("rust") =>0.9,
                 String::from("language") => 1.0
             };
-            let fragments = search_fragments(
-                &mut From::from(SimpleTokenizer::default()),
-                TEST_TEXT,
-                &terms,
-                20,
-            );
+            let fragments =
+                search_fragments(&mut lowercased_simple_tokenizer(), TEST_TEXT, &terms, 20);
             // assert_eq!(fragments.len(), 7);
             {
                 let first = &fragments[0];
@@ -804,12 +804,7 @@ Survey in 2016, 2017, and 2018."#;
     #[test]
     fn test_snippet_generator_custom_highlighted_elements() {
         let terms = btreemap! { String::from("rust") => 1.0, String::from("language") => 0.9 };
-        let fragments = search_fragments(
-            &mut From::from(SimpleTokenizer::default()),
-            TEST_TEXT,
-            &terms,
-            100,
-        );
+        let fragments = search_fragments(&mut lowercased_simple_tokenizer(), TEST_TEXT, &terms, 100);
         let mut snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
         assert_eq!(
             snippet.to_html(),
