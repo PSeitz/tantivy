@@ -391,7 +391,9 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
             if lower_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(lower_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.trunc()).to_u64()))
+                // Smallest integer >= the requested lower bound. `trunc` would round
+                // toward zero and let e.g. `>= 5.5` match the integer 5.
+                TransformBound::NewBound(Bound::Included(T::from_f64(lower_bound.ceil()).to_u64()))
             }
         },
         |&upper_bound| {
@@ -405,7 +407,9 @@ fn transform_from_f64_bounds<T: IntType + MonotonicallyMappableToU64>(
             if upper_bound.fract() == 0.0 {
                 TransformBound::Existing(T::from_f64(upper_bound).to_u64())
             } else {
-                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.trunc()).to_u64()))
+                // Largest integer <= the requested upper bound. `trunc` would round
+                // toward zero and let e.g. `<= -5.5` match the integer -5.
+                TransformBound::NewBound(Bound::Included(T::from_f64(upper_bound.floor()).to_u64()))
             }
         },
     )
