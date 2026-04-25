@@ -369,3 +369,79 @@ impl MoreLikeThis {
         Ok(score_terms_vec)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MoreLikeThis;
+    use crate::schema::{Facet, FacetOptions, OwnedValue, Schema};
+    use crate::{Index, IndexWriter};
+
+    /// `MoreLikeThis::add_term_frequencies` should include facet tokens
+    /// that are NOT noise words. With the default `MoreLikeThis` config the
+    /// `is_noise_word` predicate always returns `false` for non-empty
+    /// tokens, so all facet tokens should make it into the resulting query.
+    #[test]
+    fn test_more_like_this_facet_field_extracts_terms() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let facet_field =
+            schema_builder.add_facet_field("facet", FacetOptions::default());
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        {
+            let mut writer: IndexWriter = index.writer_for_tests()?;
+            // Add several documents with the same facet so that the term
+            // frequency / doc frequency thresholds are easy to satisfy.
+            for _ in 0..5 {
+                writer.add_document(doc!(
+                    facet_field => Facet::from("/electronics/computers"),
+                ))?;
+            }
+            writer.commit()?;
+        }
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // Configure a permissive MoreLikeThis. The facet path
+        // `/electronics/computers` produces tokens for the encoded prefixes
+        // "", "electronics" and "electronics\0computers" via FacetTokenizer.
+        let mlt = MoreLikeThis {
+            min_doc_frequency: Some(1),
+            max_doc_frequency: None,
+            min_term_frequency: Some(1),
+            max_query_terms: Some(10),
+            min_word_length: None,
+            max_word_length: None,
+            boost_factor: Some(1.0),
+            stop_words: vec![],
+        };
+
+        let facet_value = OwnedValue::Facet(Facet::from("/electronics/computers"));
+        let doc_fields: &[(_, Vec<&OwnedValue>)] = &[(facet_field, vec![&facet_value])];
+        let bool_query = mlt.query_with_document_fields(&searcher, doc_fields)?;
+
+        // Walk the resulting BooleanQuery and gather every term that ends up
+        // in a clause.
+        let mut terms_text: Vec<String> = Vec::new();
+        for (_occur, sub_query) in bool_query.clauses() {
+            sub_query.query_terms(&mut |term, _| {
+                if let Some(s) = term.value().as_str() {
+                    terms_text.push(s.to_owned());
+                }
+            });
+        }
+
+        // The buggy facet branch only retains tokens for which `is_noise_word`
+        // returns true. With the default `MoreLikeThis` configuration the
+        // only token meeting that predicate is the empty one (produced by
+        // `FacetTokenizer` for the root facet), so the only term that
+        // survives is the empty string. The non-empty facet path tokens
+        // ("electronics", "electronics\0computers") are dropped.
+        assert!(
+            terms_text.iter().any(|t| !t.is_empty()),
+            "Expected MoreLikeThis to extract at least one non-empty term \
+             from the facet field, but got terms: {terms_text:?}"
+        );
+        Ok(())
+    }
+}
