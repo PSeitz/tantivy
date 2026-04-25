@@ -3029,4 +3029,50 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn terms_aggregation_f64_nan_values_are_skipped() -> crate::Result<()> {
+        use crate::schema::NumericOptions;
+        let mut schema_builder = Schema::builder();
+        let score_field =
+            schema_builder.add_f64_field("score_f64", NumericOptions::default().set_fast());
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer: IndexWriter =
+                index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            index_writer.add_document(doc!(score_field => 1.0f64))?;
+            index_writer.add_document(doc!(score_field => 1.0f64))?;
+            index_writer.add_document(doc!(score_field => 2.0f64))?;
+            index_writer.add_document(doc!(score_field => f64::NAN))?;
+            index_writer.add_document(doc!(score_field => f64::NAN))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(serde_json::json!({
+            "my_scores": {
+                "terms": {
+                    "field": "score_f64",
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+
+        // Per Elasticsearch semantics, NaN values are missing and should be
+        // skipped, not become a bucket key.
+        let buckets = res["my_scores"]["buckets"].as_array().unwrap();
+        for bucket in buckets {
+            let key = bucket["key"].as_f64().unwrap_or(0.0);
+            assert!(
+                !key.is_nan(),
+                "NaN should not appear as a terms bucket key; got bucket {bucket:?}"
+            );
+        }
+        // We expect exactly two buckets: 1.0 (count 2) and 2.0 (count 1).
+        assert_eq!(buckets.len(), 2, "buckets: {buckets:?}");
+
+        Ok(())
+    }
 }
