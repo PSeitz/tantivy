@@ -676,6 +676,54 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_aggregation_nan_values() -> crate::Result<()> {
+        // When the indexed values are all NaN, the min/max should not be reported as the
+        // sentinel values (f64::MAX / f64::MIN) used to seed the running min/max. NaN values
+        // should be skipped (they are conceptually "missing" / undefined).
+        let mut schema_builder = Schema::builder();
+        let score_field_f64 = schema_builder.add_f64_field("score", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(score_field_f64 => f64::NAN))?;
+            index_writer.add_document(doc!(score_field_f64 => f64::NAN))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "stats": {
+                "stats": {
+                    "field": "score"
+                }
+            }
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+        let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+
+        // NaN values should be skipped: count is 0, min/max/avg are null.
+        assert_eq!(
+            res["stats"],
+            json!({
+                "avg": Value::Null,
+                "count": 0,
+                "max": Value::Null,
+                "min": Value::Null,
+                "sum": 0.0,
+            }),
+            "got {res}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_stats_json_missing_sub_agg() -> crate::Result<()> {
         // This test verifies the `collect` method (in contrast to `collect_block`), which is
         // called when the sub-aggregations are flushed.
