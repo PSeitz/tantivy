@@ -676,6 +676,61 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregation_stats_inf_sentinel_leak() -> crate::Result<()> {
+        // Single doc with +INF: the min seed is f64::MAX, and f64::MAX < f64::INFINITY,
+        // so f64::min(MAX, INF) = MAX, exposing the seed sentinel as the reported min.
+        // Symmetric for a single doc with -INF: max seed is f64::MIN > f64::NEG_INFINITY,
+        // so f64::max(MIN, NEG_INF) = MIN, exposing the seed sentinel as the reported max.
+        use crate::aggregation::agg_result::{AggregationResult, MetricResult};
+        use crate::aggregation::metric::Stats;
+
+        fn run_stats(value: f64) -> Stats {
+            let mut schema_builder = Schema::builder();
+            let score_field = schema_builder.add_f64_field("score", FAST);
+            let schema = schema_builder.build();
+            let index = Index::create_in_ram(schema);
+            {
+                let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+                index_writer
+                    .add_document(doc!(score_field => value))
+                    .unwrap();
+                index_writer.commit().unwrap();
+            }
+
+            let agg_req: Aggregations = serde_json::from_value(json!({
+                "stats": { "stats": { "field": "score" } }
+            }))
+            .unwrap();
+            let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+            let reader = index.reader().unwrap();
+            let searcher = reader.searcher();
+            let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+            match agg_res.0.get("stats").unwrap() {
+                AggregationResult::MetricResult(MetricResult::Stats(s)) => s.clone(),
+                _ => panic!("unexpected agg result"),
+            }
+        }
+
+        // +INF: min should be +INF, not f64::MAX (~1.79e308).
+        let stats_pos = run_stats(f64::INFINITY);
+        let pos_min = stats_pos.min.unwrap();
+        assert!(
+            pos_min.is_infinite() && pos_min > 0.0,
+            "expected +INF for min when only +INF doc is present, got {pos_min}"
+        );
+
+        // -INF: max should be -INF, not f64::MIN (~-1.79e308).
+        let stats_neg = run_stats(f64::NEG_INFINITY);
+        let neg_max = stats_neg.max.unwrap();
+        assert!(
+            neg_max.is_infinite() && neg_max < 0.0,
+            "expected -INF for max when only -INF doc is present, got {neg_max}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_stats_json_missing_sub_agg() -> crate::Result<()> {
         // This test verifies the `collect` method (in contrast to `collect_block`), which is
         // called when the sub-aggregations are flushed.
