@@ -289,10 +289,21 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentRangeCollector<B> {
 
         let buckets = &mut self.parent_buckets[parent_bucket_id as usize];
 
+        // Whether to filter out NaN values. NaN has no meaningful ordering, so the
+        // monotonic f64 -> u64 mapping places it above `f64_to_u64(f64::INFINITY)`
+        // but still below `u64::MAX`, which would put NaN values into the
+        // open-ended top bucket. Treat NaN as missing instead (consistent with
+        // stats / extended_stats / cardinality / percentiles, and with
+        // Elasticsearch).
+        let skip_nan = self.column_type == ColumnType::F64;
+
         for (doc, val) in agg_data
             .column_block_accessor
             .iter_docid_vals(docs, &req.accessor)
         {
+            if skip_nan && f64::from_u64(val).is_nan() {
+                continue;
+            }
             let bucket_pos = get_bucket_pos(val, buckets);
             let bucket = &mut buckets[bucket_pos];
             bucket.bucket.doc_count += 1;
