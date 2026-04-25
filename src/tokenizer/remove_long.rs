@@ -102,6 +102,23 @@ mod tests {
         assert_token(&tokens[1], 2, "happy", 15, 20);
     }
 
+    /// `RemoveLongFilter::limit(N)` is documented to remove tokens that are
+    /// *longer than* `N` bytes. A token of length exactly `N` bytes must be
+    /// kept.
+    #[test]
+    fn test_remove_long_keeps_token_of_exactly_limit_length() {
+        let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(RemoveLongFilter::limit(5))
+            .build();
+        let mut token_stream = analyzer.token_stream("hello world toolong");
+        let mut tokens: Vec<Token> = Vec::new();
+        let mut add_token = |token: &Token| tokens.push(token.clone());
+        token_stream.process(&mut add_token);
+        // "hello" (5 bytes) and "world" (5 bytes) must be kept; "toolong" (7 bytes) filtered.
+        let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(texts, vec!["hello", "world"]);
+    }
+
     fn token_stream_helper(text: &str) -> Vec<Token> {
         let mut a = TextAnalyzer::builder(SimpleTokenizer::default())
             .filter(RemoveLongFilter::limit(6))
