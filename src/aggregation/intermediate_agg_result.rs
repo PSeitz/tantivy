@@ -720,10 +720,32 @@ impl IntermediateTermBucketResult {
         limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<BucketResult> {
         let req = TermsAggregationInternal::from_req(req);
-        let mut buckets: Vec<BucketEntry> = self
+        let mut intermediate_entries: Vec<(IntermediateKey, IntermediateTermBucketEntry)> = self
             .entries
             .into_iter()
             .filter(|bucket| bucket.1.doc_count as u64 >= req.min_doc_count)
+            .collect();
+
+        // For ordering by `_key` we sort using the typed IntermediateKey rather than the
+        // string-coerced final Key. This matters for IpAddr-typed term aggregations where
+        // the public Key representation is a string and lexicographic order differs from
+        // the natural numeric IP order.
+        if let OrderTarget::Key = req.order.target {
+            intermediate_entries.sort_by(|left, right| {
+                let ord = left
+                    .0
+                    .partial_cmp(&right.0)
+                    .expect("intermediate key types are totally ordered");
+                if req.order.order == Order::Asc {
+                    ord
+                } else {
+                    ord.reverse()
+                }
+            });
+        }
+
+        let mut buckets: Vec<BucketEntry> = intermediate_entries
+            .into_iter()
             .map(|(key, entry)| {
                 let key_as_string = match key {
                     IntermediateKey::Bool(key) => {
@@ -746,14 +768,7 @@ impl IntermediateTermBucketResult {
         let order = req.order.order;
         match req.order.target {
             OrderTarget::Key => {
-                buckets.sort_by(|left, right| {
-                    if req.order.order == Order::Asc {
-                        left.key.partial_cmp(&right.key)
-                    } else {
-                        right.key.partial_cmp(&left.key)
-                    }
-                    .expect("expected type string, which is always sortable")
-                });
+                // Already sorted above using the typed IntermediateKey.
             }
             OrderTarget::Count => {
                 if req.order.order == Order::Desc {
