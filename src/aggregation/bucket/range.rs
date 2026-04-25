@@ -606,6 +606,30 @@ mod tests {
     }
 
     #[test]
+    fn range_agg_empty_ranges_returns_error() -> crate::Result<()> {
+        let index = get_test_index_with_num_docs(false, 100)?;
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "range": {
+                "range": {
+                    "field": "fraction_f64",
+                    "ranges": []
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request_with_query(agg_req, &index, None);
+        assert!(
+            res.is_err(),
+            "Expected an error for empty ranges, got: {:?}",
+            res
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn range_fraction_test() -> crate::Result<()> {
         let index = get_test_index_with_num_docs(false, 100)?;
 
