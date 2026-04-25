@@ -961,4 +961,54 @@ mod tests {
         assert_eq!(search(u64::MAX - 1), 2); // Since the end range is never included,
                                              // the max value
     }
+
+    #[test]
+    fn range_agg_from_greater_than_to_must_be_consistent() {
+        // RangeAggregation with `from > to` is malformed input.
+        //
+        // Currently it is silently accepted; the auto-generated boundary
+        // buckets `*-from` and `to-*` are produced from the inverted bounds
+        // and end up internally unsorted. Documents are then assigned via
+        // `binary_search_by_key` over an unsorted slice, which silently
+        // miscounts large parts of the corpus.
+        //
+        // Repro: 100 docs with values 0.0..99.0 and a single user bucket
+        // 50.0..20.0. We expect either an InvalidArgument error, or
+        // self-consistent buckets where the auto-generated `to-*` bucket
+        // (i.e. all values `>= to`) actually contains every such document.
+        let index = get_test_index_with_num_docs(false, 100).unwrap();
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "range": {
+                "range": {
+                    "field": "score_f64",
+                    "ranges": [
+                        {"from": 50.0, "to": 20.0}
+                    ]
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request_with_query(agg_req, &index, None);
+        match res {
+            Err(_) => {
+                // OK: rejected as expected.
+            }
+            Ok(value) => {
+                let buckets = value["range"]["buckets"].as_array().unwrap();
+                // 80 docs have value >= 20 (i.e. 20.0..=99.0).
+                let bucket_20_star = buckets
+                    .iter()
+                    .find(|b| b["key"] == "20-*")
+                    .expect("expected an auto-generated `20-*` bucket");
+                let count = bucket_20_star["doc_count"].as_u64().unwrap();
+                assert_eq!(
+                    count, 80,
+                    "`20-*` bucket should contain all 80 docs with value >= 20, \
+                     got {count}; full buckets: {buckets:?}",
+                );
+            }
+        }
+    }
 }
