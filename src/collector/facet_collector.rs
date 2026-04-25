@@ -878,6 +878,29 @@ mod tests {
         );
         Ok(())
     }
+
+    // Regression test: with `add_facet("/")` (root), siblings sharing a single-character
+    // top-level segment (e.g. `/a/x` and `/a/y`) should collapse to a single bucket
+    // for `/a`, with both counts summed. The bug instead loses one of the counts.
+    #[test]
+    fn test_facet_collector_root_single_char_top_segment() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let facet_field = schema_builder.add_facet_field("facet", FacetOptions::default());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(doc!(facet_field => Facet::from("/a/x")))?;
+        index_writer.add_document(doc!(facet_field => Facet::from("/a/y")))?;
+        index_writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        let mut facet_collector = FacetCollector::for_field("facet");
+        facet_collector.add_facet("/");
+        let counts: FacetCounts = searcher.search(&AllQuery, &facet_collector)?;
+        let facets: Vec<(&Facet, u64)> = counts.get("/").collect();
+        assert_eq!(facets, vec![(&Facet::from("/a"), 2)]);
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "unstable"))]
