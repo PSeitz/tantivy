@@ -334,6 +334,53 @@ mod tests {
     use crate::{assert_nearly_equals, Index};
 
     #[test]
+    fn test_aggregation_percentiles_nan_only() -> crate::Result<()> {
+        // All values are NaN. NaN is not a meaningful number, so the aggregation should
+        // treat NaN as missing (consistent with Elasticsearch and with stats/extended_stats).
+        // Otherwise DDSketch's NaN handling silently routes NaN into the zero bucket and
+        // surfaces 0.0 as every percentile, which is plain wrong.
+        let mut schema_builder = Schema::builder();
+        let score = schema_builder
+            .add_f64_field("score", crate::schema::NumericOptions::default().set_fast());
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer: crate::IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(score => f64::NAN))?;
+            index_writer.add_document(doc!(score => f64::NAN))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "percentiles": {
+                "percentiles": {
+                    "field": "score",
+                }
+            },
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let agg_res: AggregationResults = searcher.search(&AllQuery, &collector).unwrap();
+
+        let res: Value = serde_json::from_str(&serde_json::to_string(&agg_res)?)?;
+        // With all-NaN input, no real value exists, so percentiles should be Null
+        // (matching the empty-index case).
+        for percent in ["1.0", "5.0", "25.0", "50.0", "75.0", "95.0", "99.0"] {
+            assert_eq!(
+                res["percentiles"]["values"][percent],
+                Value::Null,
+                "percentile {percent} should be null for all-NaN input, got {:?}",
+                res["percentiles"]["values"][percent]
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_aggregation_percentiles_empty_index() -> crate::Result<()> {
         // test index without segments
         let values = vec![];
