@@ -95,6 +95,10 @@ pub fn u64_to_i64(val: u64) -> i64 {
 /// The reverse mapping is [`u64_to_f64()`].
 #[inline]
 pub fn f64_to_u64(val: f64) -> u64 {
+    // IEEE-754 considers `-0.0 == 0.0`, but their bit patterns differ. Without this
+    // normalization the mapping disagrees with `f64::PartialEq` and queries comparing
+    // against `0.0` miss docs indexed with `-0.0`.
+    let val = if val == 0.0 { 0.0 } else { val };
     let bits = val.to_bits();
     if val.is_sign_positive() {
         bits ^ HIGHEST_BIT

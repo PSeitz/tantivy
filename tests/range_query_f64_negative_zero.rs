@@ -65,7 +65,7 @@ fn range_query_geq_zero_matches_negative_zero() -> tantivy::Result<()> {
 
 #[test]
 fn sort_by_f64_treats_zero_and_negative_zero_as_equal() -> tantivy::Result<()> {
-    let (index, field) = build_index()?;
+    let (index, _field) = build_index()?;
     let searcher = index.reader()?.searcher();
     let collector = TopDocs::with_limit(2).order_by_fast_field::<f64>("v", Order::Asc);
     let docs: Vec<(Option<f64>, _)> = searcher.search(&AllQuery, &collector)?;
