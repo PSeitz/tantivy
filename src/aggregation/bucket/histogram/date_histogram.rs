@@ -647,6 +647,43 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn histogram_test_date_keyed_uses_key_as_string() {
+        // Regression test: when `keyed: true` is set on a `date_histogram`, the bucket
+        // key in the returned map must be the formatted date string (`key_as_string`),
+        // not the numeric millisecond timestamp. This matches the Elasticsearch behavior.
+        let docs = vec![
+            vec![r#"{ "date": "2015-01-01T12:10:30Z", "text": "aaa" }"#],
+            vec![r#"{ "date": "2015-01-02T00:00:00Z", "text": "bbb" }"#],
+        ];
+        let index = get_test_index_from_docs(false, &docs).unwrap();
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "sales_over_time": {
+                "date_histogram": {
+                    "field": "date",
+                    "fixed_interval": "1d",
+                    "keyed": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index).unwrap();
+        let buckets = res["sales_over_time"]["buckets"].as_object().unwrap();
+        // The map keys should be the RFC3339 formatted dates, not the raw millis.
+        assert!(
+            buckets.contains_key("2015-01-01T00:00:00Z"),
+            "expected RFC3339 date key, got map: {:?}",
+            buckets.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            buckets.contains_key("2015-01-02T00:00:00Z"),
+            "expected RFC3339 date key, got map: {:?}",
+            buckets.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn histogram_test_invalid_req() {
         let docs = vec![];
 
