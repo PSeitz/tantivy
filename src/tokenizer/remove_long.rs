@@ -33,7 +33,7 @@ impl RemoveLongFilter {
 
 impl<T> RemoveLongFilterStream<T> {
     fn predicate(&self, token: &Token) -> bool {
-        token.text.len() < self.token_length_limit
+        token.text.len() <= self.token_length_limit
     }
 }
 
