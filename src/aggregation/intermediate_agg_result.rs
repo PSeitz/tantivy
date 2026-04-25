@@ -775,9 +775,19 @@ impl IntermediateTermBucketResult {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
-                buckets_with_val.sort_by(|(_, val1), (_, val2)| match &order {
-                    Order::Desc => val2.total_cmp(val1),
-                    Order::Asc => val1.total_cmp(val2),
+                buckets_with_val.sort_by(|(b1, val1), (b2, val2)| {
+                    let primary = match &order {
+                        Order::Desc => val2.total_cmp(val1),
+                        Order::Asc => val1.total_cmp(val2),
+                    };
+                    // Tie-break on key (ascending) so the bucket order is
+                    // deterministic and does not depend on FxHashMap
+                    // iteration order.
+                    primary.then_with(|| {
+                        b1.key
+                            .partial_cmp(&b2.key)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                 });
                 buckets = buckets_with_val
                     .into_iter()
