@@ -163,3 +163,34 @@ impl Query for PhrasePrefixQuery {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::PhrasePrefixQuery;
+    use crate::query::Query;
+    use crate::schema::{Field, Term};
+
+    #[test]
+    fn test_phrase_prefix_query_terms_includes_prefix() {
+        let field = Field::from_field_id(0);
+        let phrase_query = PhrasePrefixQuery::new(vec![
+            Term::from_field_text(field, "alpha"),
+            Term::from_field_text(field, "be"),
+        ]);
+        let mut collected_terms: Vec<Term> = Vec::new();
+        phrase_query.query_terms(&mut |term, _| {
+            collected_terms.push(term.clone());
+        });
+        // The query has two terms: "alpha" (a regular phrase term) and
+        // "be" (the prefix term). `query_terms` is documented to "extract
+        // all of the terms associated with the query", so both must be
+        // visited.
+        assert_eq!(
+            collected_terms,
+            vec![
+                Term::from_field_text(field, "alpha"),
+                Term::from_field_text(field, "be"),
+            ]
+        );
+    }
+}
