@@ -750,6 +750,50 @@ mod tests {
     }
 
     #[test]
+    fn test_date_fastfield_truncate_pre_epoch_floor() -> crate::Result<()> {
+        // Bug: DateTime::truncate uses integer division, which truncates towards
+        // zero in Rust. For pre-epoch dates with sub-precision components, this
+        // moves the timestamp *forward* in time instead of *back* (the documented
+        // "rounded down to its bucket" semantics). E.g. 1969-12-31T23:59:59.500Z
+        // (-500_000_000 ns) truncated to seconds becomes the epoch (0 ns) instead
+        // of 1969-12-31T23:59:59.000Z (-1_000_000_000 ns).
+        let mut schema_builder = Schema::builder();
+        let date_field = schema_builder.add_date_field(
+            "date",
+            DateOptions::default()
+                .set_fast()
+                .set_precision(DateTimePrecision::Seconds),
+        );
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        // 0.5 seconds before the unix epoch.
+        let half_second_before_epoch = DateTime::from_timestamp_nanos(-500_000_000);
+        index_writer.add_document(doc!(date_field => half_second_before_epoch))?;
+        index_writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let date_fast_field = segment_reader
+            .fast_fields()
+            .column_opt::<DateTime>("date")?
+            .unwrap()
+            .first_or_default_col(DateTime::default());
+
+        // Truncating "down" to second precision should yield 1969-12-31T23:59:59Z,
+        // i.e. -1_000_000_000 ns. The current implementation incorrectly returns
+        // the epoch (0 ns), having "rounded up" toward zero.
+        let actual = date_fast_field.get_val(0).into_timestamp_nanos();
+        assert_eq!(
+            actual, -1_000_000_000,
+            "expected pre-epoch sub-second date to round DOWN to -1s, got {actual} ns",
+        );
+        Ok(())
+    }
+
+    #[test]
     pub fn test_fastfield_bool_small() {
         let path = Path::new("test_bool");
         let directory: RamDirectory = RamDirectory::create();
