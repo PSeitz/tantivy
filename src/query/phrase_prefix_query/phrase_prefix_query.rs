@@ -161,6 +161,10 @@ impl Query for PhrasePrefixQuery {
         for (_, term) in &self.phrase_terms {
             visitor(term, true);
         }
+        // The prefix term is also a term associated with the query.
+        // Without this, callers like SnippetGenerator and MoreLikeThis
+        // never see the prefix.
+        visitor(&self.prefix.1, true);
     }
 }
 
