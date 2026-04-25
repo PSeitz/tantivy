@@ -1618,6 +1618,55 @@ mod tests {
         assert_eq!(res["my_texts"]["buckets"][0]["avg_score"]["value"], 5.0);
     }
 
+    /// When multiple buckets share the same `doc_count`, ordering by `_count` must produce
+    /// a stable, deterministic result. Elasticsearch tie-breaks on `_key: asc`. Tantivy
+    /// previously used `sort_unstable_by_key(|b| Reverse(b.doc_count()))`, which leaves
+    /// ties in FxHashMap iteration order — non-deterministic across runs/builds.
+    #[test]
+    fn terms_aggregation_count_order_tie_breaks_by_key() -> crate::Result<()> {
+        let segment_and_terms = vec![vec![
+            (1.0, "delta".to_string()),
+            (1.0, "alpha".to_string()),
+            (1.0, "echo".to_string()),
+            (1.0, "bravo".to_string()),
+            (1.0, "charlie".to_string()),
+            (1.0, "foxtrot".to_string()),
+            (1.0, "golf".to_string()),
+            (1.0, "hotel".to_string()),
+            (1.0, "india".to_string()),
+            (1.0, "juliet".to_string()),
+        ]];
+        let index = get_test_index_from_values_and_terms(true, &segment_and_terms)?;
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": { "_count": "desc" },
+                    "size": 10,
+                }
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request(agg_req, &index)?;
+
+        // All ten buckets have doc_count == 1. With `_count: desc`, ties must be
+        // broken by `_key: asc` (ES semantics), giving alphabetical order.
+        let expected_keys = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet",
+        ];
+        let actual_keys: Vec<String> = res["my_texts"]["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["key"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(actual_keys, expected_keys);
+        Ok(())
+    }
+
     #[test]
     fn terms_aggregation_test_order_sub_agg_single_segment() -> crate::Result<()> {
         terms_aggregation_test_order_sub_agg_merge_segment(true)
