@@ -212,7 +212,11 @@ impl Display for Facet {
 
 fn escape_slashes(s: &str) -> Cow<'_, str> {
     static SLASH_PTN: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\\/]").unwrap());
-    SLASH_PTN.replace_all(s, "\\/")
+    // Both `/` and `\` are special in the textual representation:
+    // `/` is the segment separator, and `\` is the escape character.
+    // Each must be escaped with a leading `\` so that the textual form
+    // round-trips through `Facet::from_text`.
+    SLASH_PTN.replace_all(s, r"\$0")
 }
 
 impl Serialize for Facet {
