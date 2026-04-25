@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::io;
 
 use columnar::column_values::CompactSpaceU64Accessor;
-use columnar::{Column, ColumnType, Dictionary, StrColumn};
+use columnar::{Column, ColumnType, Dictionary, MonotonicallyMappableToU64, StrColumn};
 use datasketches::hll::{Coupon, HllSketch, HllType, HllUnion};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -422,6 +422,17 @@ impl SegmentAggregationCollector for SegmentCardinalityCollector {
                 })?;
             for val in col_block_accessor.iter_vals() {
                 let val: u128 = compact_space_accessor.compact_to_u128(val as u32);
+                bucket.cardinality.insert(val);
+            }
+        } else if self.column_type == ColumnType::F64 {
+            // NaN has many bit patterns that all round-trip through `f64_to_u64`
+            // as distinct u64 values. Treat NaN as missing (matching the stats /
+            // extended_stats aggregations and Elasticsearch's behavior) so the
+            // sketch does not count multiple NaNs as distinct.
+            for val in col_block_accessor.iter_vals() {
+                if f64::from_u64(val).is_nan() {
+                    continue;
+                }
                 bucket.cardinality.insert(val);
             }
         } else {
