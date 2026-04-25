@@ -143,15 +143,25 @@ impl DateTime {
     }
 
     /// Truncates the microseconds value to the corresponding precision.
+    ///
+    /// Rounding is towards negative infinity (i.e. floor), so that a value
+    /// always falls into a contiguous bucket of `precision` width regardless
+    /// of its sign. Plain integer division would truncate toward zero, which
+    /// produces an off-by-one bucket for pre-epoch values with a sub-precision
+    /// component.
     pub fn truncate(self, precision: DateTimePrecision) -> Self {
-        let truncated_timestamp_micros = match precision {
-            DateTimePrecision::Seconds => (self.timestamp_nanos / 1_000_000_000) * 1_000_000_000,
-            DateTimePrecision::Milliseconds => (self.timestamp_nanos / 1_000_000) * 1_000_000,
-            DateTimePrecision::Microseconds => (self.timestamp_nanos / 1_000) * 1_000,
+        let truncated_timestamp_nanos = match precision {
+            DateTimePrecision::Seconds => {
+                self.timestamp_nanos.div_euclid(1_000_000_000) * 1_000_000_000
+            }
+            DateTimePrecision::Milliseconds => {
+                self.timestamp_nanos.div_euclid(1_000_000) * 1_000_000
+            }
+            DateTimePrecision::Microseconds => self.timestamp_nanos.div_euclid(1_000) * 1_000,
             DateTimePrecision::Nanoseconds => self.timestamp_nanos,
         };
         Self {
-            timestamp_nanos: truncated_timestamp_micros,
+            timestamp_nanos: truncated_timestamp_nanos,
         }
     }
 }
