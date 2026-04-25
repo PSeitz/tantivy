@@ -904,4 +904,43 @@ Survey in 2016, 2017, and 2018."#;
         let result = collapse_overlapped_ranges(&ranges);
         assert_eq!(result, vec![0..0, 1..1, 2..2, 3..3]);
     }
+
+    /// Reproduces the bug where `try_add_token` lowercases the token text before
+    /// looking it up in the terms map. For case-sensitive tokenizers (like `whitespace`),
+    /// the query term is stored with its original case, so the lowercased token never
+    /// matches and nothing is highlighted.
+    #[test]
+    fn test_snippet_generator_case_sensitive_tokenizer() -> crate::Result<()> {
+        use crate::query::TermQuery;
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        use crate::Term;
+
+        let mut schema_builder = Schema::builder();
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("whitespace")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let text_field = schema_builder.add_text_field("text", text_options);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.add_document(doc!(text_field => "Hello World"))?;
+            index_writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+
+        // The query targets the case-sensitive term "Hello".
+        let term = Term::from_field_text(text_field, "Hello");
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+
+        let snippet_generator = SnippetGenerator::create(&searcher, &query, text_field)?;
+        let snippet = snippet_generator.snippet("Hello World");
+
+        // The snippet should highlight "Hello" (it was matched by the query and the
+        // tokenizer is case-sensitive).
+        assert_eq!(snippet.to_html(), "<b>Hello</b> World");
+        Ok(())
+    }
 }
