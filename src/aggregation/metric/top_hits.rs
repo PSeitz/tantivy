@@ -602,12 +602,47 @@ impl SegmentAggregationCollector for TopHitsSegmentCollector {
         let req_data = agg_data.get_top_hits_req_data(self.accessor_idx);
         let req = &req_data.req;
         let accessors = &req_data.accessors;
+        let sort_keys = req.sort.as_slice();
         for &doc_id in docs {
-            // TODO: this is terrible, a new vec is allocated for every doc
-            // We can fetch blocks instead
-            // We don't need to store the order for every value
-            let sorts: Vec<DocValueAndOrder> = req
-                .sort
+            // Pre-check the threshold element-by-element to avoid allocating a Vec
+            // when the doc would be rejected. The TopNComputer's push() does the
+            // same threshold check after we hand it the Vec, but by then we've
+            // already paid the allocation. With many docs in a terms-bucketed
+            // top_hits, the vast majority are rejected by the threshold once the
+            // buffer is full, so this short-circuits the hot path.
+            //
+            // The threshold check below mirrors the logic in `TopNComputer::push`:
+            // a doc is kept iff `comparator.compare(sort_key, threshold) ==
+            // Greater`. With `ReverseComparator`, that is equivalent to
+            // `sort_key.cmp(&threshold) == Less` under the natural Ord on
+            // `Vec<DocValueAndOrder>` (lexicographic, element-wise).
+            if let Some(threshold) = top_n.threshold.as_ref() {
+                debug_assert_eq!(threshold.len(), sort_keys.len());
+                let mut decision = std::cmp::Ordering::Equal;
+                for (idx, KeyOrder { order, .. }) in sort_keys.iter().enumerate() {
+                    let value = accessors
+                        .get(idx)
+                        .expect("could not find field in accessors")
+                        .0
+                        .values_for_doc(doc_id)
+                        .next();
+                    let cand = DocValueAndOrder {
+                        value,
+                        order: *order,
+                    };
+                    let ord = cand.cmp(&threshold[idx]);
+                    if ord != std::cmp::Ordering::Equal {
+                        decision = ord;
+                        break;
+                    }
+                }
+                // Skip if cand >= threshold (i.e., not strictly less).
+                if decision != std::cmp::Ordering::Less {
+                    continue;
+                }
+            }
+            // Doc passes the threshold (or buffer not yet full): now build the Vec.
+            let sorts: Vec<DocValueAndOrder> = sort_keys
                 .iter()
                 .enumerate()
                 .map(|(idx, KeyOrder { order, .. })| {
