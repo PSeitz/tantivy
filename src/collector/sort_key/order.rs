@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use columnar::MonotonicallyMappableToU64;
 use serde::{Deserialize, Serialize};
 
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::schema::{OwnedValue, Schema};
 use crate::{DocId, Order, Score};
 
@@ -506,6 +506,29 @@ where
         right: &Self::SegmentSortKey,
     ) -> Ordering {
         self.comparator.compare(left, right)
+    }
+
+    /// Forward the batched path to the inner computer so that fast-field
+    /// readers can batch their reads.
+    #[inline]
+    fn compute_sort_key_and_collect_block<C: crate::collector::sort_key::Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        self.segment_sort_key_computer
+            .compute_sort_key_and_collect_block(docs, top_n_computer);
+    }
+
+    /// Forward the batched key-loading path to the inner computer.
+    #[inline]
+    fn segment_sort_keys_block(
+        &mut self,
+        docs: &[DocId],
+        output: &mut [std::mem::MaybeUninit<Self::SegmentSortKey>],
+    ) {
+        self.segment_sort_key_computer
+            .segment_sort_keys_block(docs, output);
     }
 
     fn convert_segment_sort_key(&self, sort_key: Self::SegmentSortKey) -> Self::SortKey {

@@ -45,6 +45,41 @@ pub trait SegmentSortKeyComputer: 'static {
         top_n_computer.push(sort_key, doc);
     }
 
+    /// Computes the sort keys for a block of documents and pushes them to the TopN Computer.
+    ///
+    /// Implementations may override this to batch fast-field reads for better performance.
+    /// The default implementation simply loops `compute_sort_key_and_collect`.
+    /// This is only called when scoring is not required (no score available).
+    #[inline]
+    fn compute_sort_key_and_collect_block<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        for &doc in docs {
+            self.compute_sort_key_and_collect(doc, 0.0, top_n_computer);
+        }
+    }
+
+    /// Fills `output` with the segment sort key for each document in `docs`.
+    ///
+    /// `output.len()` must be at least `docs.len()`. The implementation writes
+    /// `docs.len()` slots; the caller may then `assume_init` those slots.
+    ///
+    /// The default implementation loops `segment_sort_key`. Implementations may
+    /// override this to batch fast-field reads (e.g. via `Column::first_vals`)
+    /// and avoid one vtable call per document.
+    #[inline]
+    fn segment_sort_keys_block(
+        &mut self,
+        docs: &[DocId],
+        output: &mut [std::mem::MaybeUninit<Self::SegmentSortKey>],
+    ) {
+        for (i, &doc) in docs.iter().enumerate() {
+            output[i].write(self.segment_sort_key(doc, 0.0));
+        }
+    }
+
     /// A SegmentSortKeyComputer maps to a SegmentSortKey, but it can also decide on
     /// its ordering.
     ///
@@ -233,11 +268,73 @@ where
         top_n_computer.append_doc(doc, sort_key);
     }
 
+    /// Block path for tuple-keyed computers: pre-load the head sort keys in
+    /// one batched call to amortize the per-doc fast-field dispatch, then
+    /// retain the existing per-doc lazy logic for the tail. The tail is only
+    /// evaluated when the head is `Greater` (fully materialize), or `Equal`
+    /// (lazy compare), keeping the laziness of the per-doc path.
+    #[inline]
+    fn compute_sort_key_and_collect_block<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        const BLOCK_LEN: usize = crate::COLLECT_BLOCK_BUFFER_LEN;
+        debug_assert!(docs.len() <= BLOCK_LEN);
+        // Stack-allocated `MaybeUninit` buffer so that the head sort key
+        // type does not need to be `Default`.
+        let mut head_keys: [std::mem::MaybeUninit<HeadSegmentSortKeyComputer::SegmentSortKey>;
+            BLOCK_LEN] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+        let n = docs.len();
+        let head_buf = &mut head_keys[..n];
+        self.0.segment_sort_keys_block(docs, head_buf);
+
+        for (i, &doc) in docs.iter().enumerate() {
+            // SAFETY: `segment_sort_keys_block` wrote the first `n` slots.
+            let head_sort_key = unsafe { head_buf[i].assume_init_read() };
+            let sort_key: Self::SegmentSortKey = if let Some(threshold) = &top_n_computer.threshold
+            {
+                let head_cmp = self.0.compare_segment_sort_key(&head_sort_key, &threshold.0);
+                match head_cmp {
+                    Ordering::Less => continue,
+                    Ordering::Equal => {
+                        if let Some((_tail_cmp, tail_sort_key)) =
+                            self.1.accept_sort_key_lazy(doc, 0.0, &threshold.1)
+                        {
+                            (head_sort_key, tail_sort_key)
+                        } else {
+                            continue;
+                        }
+                    }
+                    Ordering::Greater => {
+                        let tail_sort_key = self.1.segment_sort_key(doc, 0.0);
+                        (head_sort_key, tail_sort_key)
+                    }
+                }
+            } else {
+                let tail_sort_key = self.1.segment_sort_key(doc, 0.0);
+                (head_sort_key, tail_sort_key)
+            };
+            top_n_computer.append_doc(doc, sort_key);
+        }
+    }
+
     #[inline(always)]
     fn segment_sort_key(&mut self, doc: DocId, score: Score) -> Self::SegmentSortKey {
         let head_sort_key = self.0.segment_sort_key(doc, score);
         let tail_sort_key = self.1.segment_sort_key(doc, score);
         (head_sort_key, tail_sort_key)
+    }
+
+    #[inline]
+    fn segment_sort_keys_block(
+        &mut self,
+        docs: &[DocId],
+        output: &mut [std::mem::MaybeUninit<Self::SegmentSortKey>],
+    ) {
+        for (i, &doc) in docs.iter().enumerate() {
+            output[i].write(self.segment_sort_key(doc, 0.0));
+        }
     }
 
     fn accept_sort_key_lazy(
@@ -309,6 +406,28 @@ where
     ) {
         self.sort_key_computer
             .compute_sort_key_and_collect(doc, score, top_n_computer);
+    }
+
+    /// Forward the batched path to the inner computer.
+    #[inline]
+    fn compute_sort_key_and_collect_block<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        self.sort_key_computer
+            .compute_sort_key_and_collect_block(docs, top_n_computer);
+    }
+
+    /// Forward the batched key-loading path to the inner computer.
+    #[inline]
+    fn segment_sort_keys_block(
+        &mut self,
+        docs: &[DocId],
+        output: &mut [std::mem::MaybeUninit<Self::SegmentSortKey>],
+    ) {
+        self.sort_key_computer
+            .segment_sort_keys_block(docs, output);
     }
 
     fn convert_segment_sort_key(&self, segment_sort_key: Self::SegmentSortKey) -> Self::SortKey {

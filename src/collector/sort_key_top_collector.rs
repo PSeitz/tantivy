@@ -120,6 +120,16 @@ where
         );
     }
 
+    #[inline]
+    fn collect_block(&mut self, docs: &[DocId]) {
+        // Routed when scoring is not required and there is no alive bitset
+        // filter. Implementations of `compute_sort_key_and_collect_block` may
+        // batch their fast-field reads (e.g., `Column::first_vals`) for better
+        // performance.
+        self.segment_sort_key_computer
+            .compute_sort_key_and_collect_block(docs, &mut self.topn_computer);
+    }
+
     fn harvest(self) -> Self::Fruit {
         let segment_ord = self.segment_ord;
         let segment_hits: Vec<(TSegmentSortKeyComputer::SortKey, DocAddress)> = self

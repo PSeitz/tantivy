@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 
 use columnar::Column;
 
-use crate::collector::sort_key::NaturalComparator;
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
+use crate::collector::sort_key::{Comparator, NaturalComparator};
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::{DocId, Score, SegmentReader};
 
@@ -88,6 +88,45 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
     #[inline(always)]
     fn segment_sort_key(&mut self, doc: DocId, _score: Score) -> Self::SegmentSortKey {
         self.sort_column.first(doc)
+    }
+
+    /// Batched read: load `Option<u64>` for each doc via `Column::first_vals`,
+    /// then push. This avoids a vtable call per document in the hot loop.
+    #[inline]
+    fn compute_sort_key_and_collect_block<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        // Stack-allocated buffer matching `crate::COLLECT_BLOCK_BUFFER_LEN` (= 64).
+        const BLOCK_LEN: usize = crate::COLLECT_BLOCK_BUFFER_LEN;
+        debug_assert!(docs.len() <= BLOCK_LEN);
+        let mut sort_keys: [Option<u64>; BLOCK_LEN] = [None; BLOCK_LEN];
+        let n = docs.len();
+        let sort_keys_slice = &mut sort_keys[..n];
+        self.sort_column.first_vals(docs, sort_keys_slice);
+        for (&doc, &sort_key) in docs.iter().zip(sort_keys_slice.iter()) {
+            top_n_computer.push(sort_key, doc);
+        }
+    }
+
+    /// Batched read for the head-of-tuple case: write `Option<u64>` per doc
+    /// directly into the caller's `MaybeUninit` buffer.
+    #[inline]
+    fn segment_sort_keys_block(
+        &mut self,
+        docs: &[DocId],
+        output: &mut [std::mem::MaybeUninit<Self::SegmentSortKey>],
+    ) {
+        const BLOCK_LEN: usize = crate::COLLECT_BLOCK_BUFFER_LEN;
+        debug_assert!(docs.len() <= BLOCK_LEN);
+        let mut tmp: [Option<u64>; BLOCK_LEN] = [None; BLOCK_LEN];
+        let n = docs.len();
+        let tmp_slice = &mut tmp[..n];
+        self.sort_column.first_vals(docs, tmp_slice);
+        for (i, v) in tmp_slice.iter().enumerate() {
+            output[i].write(*v);
+        }
     }
 
     fn convert_segment_sort_key(&self, sort_key: Self::SegmentSortKey) -> Self::SortKey {
