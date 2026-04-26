@@ -151,6 +151,34 @@ mod tests {
         );
     }
 
+    /// Regression test: a regex that admits an empty match (e.g. `\d*`) at a
+    /// position where the actual interesting tokens come *later* in the text
+    /// must not cause tokenization to stop prematurely.
+    ///
+    /// `\d*` is a perfectly valid pattern — it means "zero or more digits".
+    /// Per the tokenizer doc, empty tokens shall just not be emitted. Today,
+    /// the tokenizer instead stops the moment the regex returns an empty
+    /// match, dropping every later non-empty match (here, `123`).
+    #[test]
+    fn test_regexp_tokenizer_skips_empty_match_and_continues() {
+        let tokens = token_stream_helper("abc 123", r"\d+|[^\W\d_]+");
+        // `\d+|[^\W\d_]+` matches either digits or letters, never empty.
+        // Sanity check that the helper itself works for this input.
+        assert_eq!(tokens.len(), 2, "sanity: pattern with no empty match");
+
+        // Now use a pattern that admits an empty match. The real interesting
+        // matches (`123`) come later in the input, but the engine first
+        // returns an empty match at position 0 (because `\d*` matches zero
+        // digits), and the tokenizer aborts.
+        let tokens = token_stream_helper("abc 123", r"\d*");
+        assert_eq!(
+            tokens.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            vec!["123"],
+            "the digit run `123` must still be emitted even though `\\d*` \
+             matches empty at position 0"
+        );
+    }
+
     fn token_stream_helper(text: &str, pattern: &str) -> Vec<Token> {
         let r = RegexTokenizer::new(pattern).unwrap();
         let mut a = TextAnalyzer::from(r);
