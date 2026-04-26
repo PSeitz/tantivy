@@ -457,7 +457,7 @@ impl FieldType {
                 }
             }
             JsonValue::Number(field_val_num) => match self {
-                FieldType::I64(_) | FieldType::Date(_) => {
+                FieldType::I64(_) => {
                     if let Some(field_val_i64) = field_val_num.as_i64() {
                         Ok(OwnedValue::I64(field_val_i64))
                     } else {
@@ -467,6 +467,10 @@ impl FieldType {
                         })
                     }
                 }
+                FieldType::Date(_) => Err(ValueParsingError::TypeError {
+                    expected: "rfc3339 format",
+                    json: JsonValue::Number(field_val_num),
+                }),
                 FieldType::U64(_) => {
                     if let Some(field_val_u64) = field_val_num.as_u64() {
                         Ok(OwnedValue::U64(field_val_u64))
