@@ -286,6 +286,70 @@ impl OptionalIndex {
         let mut select_batch = self.select_cursor();
         (0..self.num_non_null_docs).map(move |rank| select_batch.select(rank))
     }
+
+    /// Batched first-value loader.
+    ///
+    /// Equivalent to calling `rank_if_exists` per docid and feeding the rowid
+    /// into `values.get_val`, but processes runs of consecutive docids that
+    /// belong to the same block in a tight loop. This avoids redundant
+    /// `block_metas`/`block` lookups and lets the compiler keep the resolved
+    /// `Block` variant hoisted out of the inner loop.
+    ///
+    /// `output[i]` is set to `Some(values.get_val(rank))` if `doc_ids[i]` has
+    /// a value, else `None`.
+    #[inline]
+    pub fn first_vals_batch<T: PartialOrd + Copy + std::fmt::Debug + Send + Sync + 'static>(
+        &self,
+        doc_ids: &[DocId],
+        output: &mut [Option<T>],
+        values: &dyn crate::ColumnValues<T>,
+    ) {
+        debug_assert_eq!(doc_ids.len(), output.len());
+        let mut i: usize = 0;
+        let len = doc_ids.len();
+        while i < len {
+            let doc_id = doc_ids[i];
+            let block_id = (doc_id / ELEMENTS_PER_BLOCK) as u16;
+            let Some(&block_meta) = self.block_metas.get(block_id as usize) else {
+                for slot in &mut output[i..] {
+                    *slot = None;
+                }
+                return;
+            };
+            let block = self.block(block_meta);
+            let block_first_doc = (block_id as u32) * ELEMENTS_PER_BLOCK;
+            let block_last_doc_excl = block_first_doc + ELEMENTS_PER_BLOCK;
+            let non_null_rows_before_block = block_meta.non_null_rows_before_block;
+            match block {
+                Block::Dense(dense_block) => {
+                    while i < len {
+                        let d = doc_ids[i];
+                        if d >= block_last_doc_excl || d < block_first_doc {
+                            break;
+                        }
+                        let in_block = (d - block_first_doc) as u16;
+                        output[i] = dense_block
+                            .rank_if_exists(in_block)
+                            .map(|r| values.get_val(non_null_rows_before_block + r as u32));
+                        i += 1;
+                    }
+                }
+                Block::Sparse(sparse_block) => {
+                    while i < len {
+                        let d = doc_ids[i];
+                        if d >= block_last_doc_excl || d < block_first_doc {
+                            break;
+                        }
+                        let in_block = (d - block_first_doc) as u16;
+                        output[i] = sparse_block
+                            .rank_if_exists(in_block)
+                            .map(|r| values.get_val(non_null_rows_before_block + r as u32));
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
     pub fn select_batch(&self, ranks: &mut [RowId]) {
         let mut select_cursor = self.select_cursor();
         for rank in ranks.iter_mut() {

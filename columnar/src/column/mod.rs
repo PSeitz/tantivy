@@ -14,7 +14,7 @@ pub use serialize::{
     serialize_column_mappable_to_u128,
 };
 
-use crate::column_index::{ColumnIndex, Set};
+use crate::column_index::ColumnIndex;
 use crate::column_values::monotonic_mapping::StrictlyMonotonicMappingToInternal;
 use crate::column_values::{ColumnValues, monotonic_map_column};
 use crate::{Cardinality, DocId, EmptyColumnValues, MonotonicallyMappableToU64, RowId};
@@ -96,11 +96,7 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
             ColumnIndex::Empty { .. } => {}
             ColumnIndex::Full => self.values.get_vals_opt(docids, output),
             ColumnIndex::Optional(optional_index) => {
-                for (i, docid) in docids.iter().enumerate() {
-                    output[i] = optional_index
-                        .rank_if_exists(*docid)
-                        .map(|rowid| self.values.get_val(rowid));
-                }
+                optional_index.first_vals_batch(docids, output, &*self.values);
             }
             ColumnIndex::Multivalued(multivalued_index) => {
                 for (i, docid) in docids.iter().enumerate() {
