@@ -146,7 +146,7 @@ fn main() {
         ),
         (
             "only_intersection",
-            &["+c +b", "+c +b +d", "+c +e", "+e +a"] as &[&str],
+            &["+c +b", "+c +b +d", "+c +e", "+e +a", "+c +d +e", "+d +e +c"] as &[&str],
         ),
         (
             "union_intersection",
