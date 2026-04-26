@@ -91,6 +91,31 @@ impl DocSet for BitSetDocSet {
     fn size_hint(&self) -> u32 {
         self.docs.len() as u32
     }
+
+    /// Counts the remaining matching documents without iterating one doc at a
+    /// time.
+    ///
+    /// Uses the underlying tiny bitset structure to sum popcounts across the
+    /// remaining buckets in O(num_buckets) instead of O(num_set_bits).
+    fn count_including_deleted(&mut self) -> u32 {
+        if self.doc == TERMINATED {
+            return 0;
+        }
+        // The current `doc` has already been popped from `cursor_tinybitset`,
+        // so we have to count it separately.
+        let mut count: u32 = 1;
+        count += self.cursor_tinybitset.len();
+        let num_buckets = self.docs.num_tinysets();
+        for bucket in (self.cursor_bucket + 1)..num_buckets {
+            count += self.docs.tinyset(bucket).len();
+        }
+        // Drain the docset to honor the consumption contract of `DocSet::count`.
+        self.cursor_tinybitset = TinySet::empty();
+        self.cursor_bucket = num_buckets;
+        self.doc = TERMINATED;
+        count
+    }
+
 }
 
 #[cfg(test)]

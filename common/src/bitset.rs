@@ -328,6 +328,12 @@ impl BitSet {
     pub fn tinyset(&self, bucket: u32) -> TinySet {
         self.tinysets[bucket as usize]
     }
+
+    /// Returns the number of tiny bitset buckets.
+    #[inline]
+    pub fn num_tinysets(&self) -> u32 {
+        self.tinysets.len() as u32
+    }
 }
 
 /// Serialized BitSet.

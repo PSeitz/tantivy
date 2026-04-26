@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
+use crate::fastfield::AliveBitSet;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
@@ -133,6 +134,14 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
 
     fn cost(&self) -> u64 {
         self.docset.cost()
+    }
+
+    fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
+        self.docset.count(alive_bitset)
+    }
+
+    fn count_including_deleted(&mut self) -> u32 {
+        self.docset.count_including_deleted()
     }
 }
 
