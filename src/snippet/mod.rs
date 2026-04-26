@@ -212,7 +212,14 @@ fn search_fragments(
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
     while let Some(next) = token_stream.next() {
-        if (next.offset_to - fragment.start_offset) > max_num_chars {
+        // The contract is in *characters*, not bytes — for multi-byte
+        // UTF-8 (e.g. CJK), counting bytes would cut fragments far
+        // shorter than the documented budget.
+        let candidate_char_len = text
+            .get(fragment.start_offset..next.offset_to)
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
+        if candidate_char_len > max_num_chars {
             if fragment.score > 0.0 {
                 fragments.push(fragment)
             };
