@@ -1,4 +1,5 @@
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+use crate::fastfield::AliveBitSet;
 use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
@@ -101,6 +102,42 @@ impl DocSet for AllScorer {
 
     fn size_hint(&self) -> u32 {
         self.max_doc
+    }
+
+    /// `AllScorer` is a contiguous range `[doc, max_doc)`. The number of remaining
+    /// documents is therefore known in O(1) without walking through every doc.
+    /// We also advance the cursor to `TERMINATED` to leave the docset in a
+    /// consumed state, matching the contract of the default loop-based impl.
+    #[inline]
+    fn count_including_deleted(&mut self) -> u32 {
+        if self.doc == TERMINATED {
+            return 0;
+        }
+        let remaining = self.max_doc - self.doc;
+        self.doc = TERMINATED;
+        remaining
+    }
+
+    /// Count the alive docs in `[doc, max_doc)` using the alive bitset's
+    /// O(1) `num_alive_docs`, falling back to the default per-doc loop when
+    /// the cursor is past 0.
+    #[inline]
+    fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
+        if self.doc == 0 {
+            // Whole-segment case: avoid the per-doc `is_alive` loop.
+            self.doc = TERMINATED;
+            alive_bitset.num_alive_docs() as u32
+        } else {
+            let mut count = 0u32;
+            let mut doc = self.doc;
+            while doc != TERMINATED {
+                if alive_bitset.is_alive(doc) {
+                    count += 1;
+                }
+                doc = self.advance();
+            }
+            count
+        }
     }
 }
 
