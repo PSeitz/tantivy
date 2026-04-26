@@ -429,6 +429,10 @@ pub struct DocumentQueryEvaluator {
     /// For AllQuery, this is a full BitSet (all bits set).
     /// For other queries, only matching document bits are set.
     pub(crate) bitset: BitSet,
+    /// True iff the underlying query is `AllQuery`. When set, every doc in the
+    /// segment matches and `filter_batch` can skip the per-doc bitset lookup
+    /// and just clone the input slice into the output.
+    is_full: bool,
 }
 
 impl DocumentQueryEvaluator {
@@ -446,6 +450,7 @@ impl DocumentQueryEvaluator {
         if query.as_any().downcast_ref::<AllQuery>().is_some() {
             return Ok(Self {
                 bitset: BitSet::with_max_value_and_full(max_doc),
+                is_full: true,
             });
         }
 
@@ -466,13 +471,19 @@ impl DocumentQueryEvaluator {
             doc = scorer.advance();
         }
 
-        Ok(Self { bitset })
+        Ok(Self {
+            bitset,
+            is_full: false,
+        })
     }
 
     /// Evaluate if a document matches the filter query
     /// O(1) lookup in the precomputed BitSet
     #[inline]
     pub fn matches_document(&self, doc: DocId) -> bool {
+        if self.is_full {
+            return true;
+        }
         self.bitset.contains(doc)
     }
 
@@ -480,6 +491,11 @@ impl DocumentQueryEvaluator {
     /// Returns matching documents from the input batch
     #[inline]
     pub fn filter_batch(&self, docs: &[DocId], output: &mut Vec<DocId>) {
+        // Fast path: AllQuery — every doc matches, skip per-doc bitset lookup.
+        if self.is_full {
+            output.extend_from_slice(docs);
+            return;
+        }
         for &doc in docs {
             if self.bitset.contains(doc) {
                 output.push(doc);
