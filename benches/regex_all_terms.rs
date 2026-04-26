@@ -16,7 +16,7 @@ use std::fmt::Write;
 
 use binggan::{black_box, BenchRunner};
 use tantivy::collector::Count;
-use tantivy::query::RegexQuery;
+use tantivy::query::{AllQuery, RegexQuery};
 use tantivy::schema::{Schema, TEXT};
 use tantivy::{doc, Index, ReloadPolicy};
 
@@ -48,8 +48,15 @@ fn main() {
             "regex_all_terms_t{}_d{}_k{}",
             config.num_terms, config.num_docs, config.tokens_per_doc
         ));
+        let searcher_for_all = searcher.clone();
         group.register("regex_count", move |_| {
             let count = searcher.search(&query, &Count).expect("search");
+            black_box(count);
+        });
+        group.register("all_query_count", move |_| {
+            let count = searcher_for_all
+                .search(&AllQuery, &Count)
+                .expect("all search");
             black_box(count);
         });
         group.run();

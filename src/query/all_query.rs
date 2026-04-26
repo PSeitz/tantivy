@@ -36,6 +36,13 @@ impl Weight for AllWeight {
         }
         Ok(Explanation::new("AllQuery", 1.0))
     }
+
+    /// `AllQuery` matches every alive document in the segment, so the count is
+    /// just the segment's alive doc count. This avoids iterating through all
+    /// docs via the default scorer-based count.
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
+        Ok(reader.num_docs())
+    }
 }
 
 /// Scorer associated with the `AllQuery` query.
