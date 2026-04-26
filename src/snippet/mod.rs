@@ -904,4 +904,60 @@ Survey in 2016, 2017, and 2018."#;
         let result = collapse_overlapped_ranges(&ranges);
         assert_eq!(result, vec![0..0, 1..1, 2..2, 3..3]);
     }
+
+    #[test]
+    fn test_snippet_max_num_chars_with_multi_byte_utf8() -> crate::Result<()> {
+        // Per the documented contract on `search_fragments`:
+        //   "All fragments should contain at least one target term and
+        //    have at most `max_num_chars` characters (not bytes)."
+        //
+        // Each CJK character takes 3 bytes in UTF-8. Build a text whose
+        // total *char* length is well below `max_num_chars`, so a correct
+        // implementation would produce a single fragment containing the
+        // whole text.
+        //
+        // Text: 20 CJK chars + " language" + 20 CJK chars
+        //   chars: 20 + 9 + 20 = 49
+        //   bytes: 60 + 9 + 60 = 129
+        //
+        // With `max_num_chars = 60` (chars):
+        //   - Correct (chars) interpretation: 49 chars <= 60 chars, the
+        //     entire text fits in a single fragment, and the snippet
+        //     surrounding "language" should include the CJK context on
+        //     both sides.
+        //   - Buggy (bytes) interpretation: 129 bytes > 60 bytes, so
+        //     fragments get flushed roughly every ~20 chars (60 bytes
+        //     of CJK) and the snippet around "language" loses most or
+        //     all of its CJK context.
+        let cjk_left: String = "東".repeat(20);
+        let cjk_right: String = "京".repeat(20);
+        let text = format!("{cjk_left} language {cjk_right}");
+
+        let mut terms = BTreeMap::new();
+        terms.insert(String::from("language"), 1.0);
+
+        let fragments = search_fragments(
+            &mut From::from(SimpleTokenizer::default()),
+            &text,
+            &terms,
+            60,
+        );
+
+        assert!(!fragments.is_empty());
+        let snippet = select_best_fragment_combination(&fragments[..], &text);
+        let frag = snippet.fragment();
+        let char_count = frag.chars().count();
+        // Total text is 49 chars, well under the 60-char budget. A correct
+        // implementation should return a fragment with substantially more
+        // than just the term + a tiny window of CJK context.
+        // We require at least 30 chars (the term plus reasonable CJK
+        // context on at least one side).
+        assert!(
+            char_count >= 30,
+            "snippet fragment is too short for the documented \
+             max_num_chars budget (60 chars). Total text was 49 chars, \
+             but snippet only contains {char_count} chars: {frag:?}"
+        );
+        Ok(())
+    }
 }
