@@ -692,6 +692,40 @@ mod tests {
     }
 
     #[test]
+    fn test_date_field_json_number_inconsistent_with_indexing() {
+        // Bug: `value_from_json` accepts a JSON number for a Date field
+        // and silently produces an `OwnedValue::I64` (because the match arm
+        // groups Date with I64). The indexer however requires `as_datetime()`,
+        // so commit() then fails with a SchemaError.
+        // The two pieces of the public API disagree about whether a JSON
+        // number is a valid Date, leading to an unrecoverable failure path
+        // even though parse_json reported success.
+        let mut schema_builder = Schema::builder();
+        let _date_field = schema_builder.add_date_field("date", INDEXED);
+        let schema = schema_builder.build();
+        let doc_json = r#"{"date": 1700000000}"#;
+        let parse_res = TantivyDocument::parse_json(&schema, doc_json);
+        match parse_res {
+            Ok(doc) => {
+                // If parse_json accepts the number, indexing should also work.
+                let index = crate::Index::create_in_ram(schema.clone());
+                let mut writer: crate::IndexWriter = index.writer_for_tests().unwrap();
+                writer.add_document(doc).unwrap();
+                let commit_res = writer.commit();
+                assert!(
+                    commit_res.is_ok(),
+                    "parse_json accepted a JSON number for a Date field, but \
+                     commit() rejected the resulting document: {commit_res:?}. \
+                     parse_json and indexing should agree on what is valid.",
+                );
+            }
+            Err(_) => {
+                // Acceptable: rejected at parse time.
+            }
+        }
+    }
+
+    #[test]
     fn test_serialize_json_date() {
         let mut doc = TantivyDocument::new();
         let mut schema_builder = Schema::builder();
