@@ -86,23 +86,38 @@ pub struct RegexTokenStream<'a> {
 
 impl TokenStream for RegexTokenStream<'_> {
     fn advance(&mut self) -> bool {
-        let Some(regex_match) = self.regex.find(self.text) else {
-            return false;
-        };
-        if regex_match.as_str().is_empty() {
-            return false;
+        // If the user-supplied regex admits an empty match (e.g. `\d*`,
+        // `[a-z]*`), `find` may return an empty match at a position where a
+        // later non-empty match also exists. We must skip those empty matches
+        // and keep looking forward; otherwise tokenization aborts after the
+        // first empty match and silently drops every subsequent token.
+        loop {
+            let Some(regex_match) = self.regex.find(self.text) else {
+                return false;
+            };
+            if !regex_match.as_str().is_empty() {
+                self.token.text.clear();
+                self.token.text.push_str(regex_match.as_str());
+
+                self.token.offset_from = self.cursor + regex_match.start();
+                self.cursor += regex_match.end();
+                self.token.offset_to = self.cursor;
+
+                self.token.position = self.token.position.wrapping_add(1);
+
+                self.text = &self.text[regex_match.end()..];
+                return true;
+            }
+            // Empty match: advance past it by one full UTF-8 character so we
+            // make forward progress without splitting a code point. If the
+            // empty match is at the very end of the input, we're done.
+            let skip_to = match self.text[regex_match.end()..].chars().next() {
+                Some(c) => regex_match.end() + c.len_utf8(),
+                None => return false,
+            };
+            self.cursor += skip_to;
+            self.text = &self.text[skip_to..];
         }
-        self.token.text.clear();
-        self.token.text.push_str(regex_match.as_str());
-
-        self.token.offset_from = self.cursor + regex_match.start();
-        self.cursor += regex_match.end();
-        self.token.offset_to = self.cursor;
-
-        self.token.position = self.token.position.wrapping_add(1);
-
-        self.text = &self.text[regex_match.end()..];
-        true
     }
 
     fn token(&self) -> &Token {
