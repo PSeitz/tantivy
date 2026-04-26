@@ -1812,6 +1812,45 @@ mod tests {
 
         assert_eq!(&docs_limit_2, &docs_limit_3[..2],);
     }
+
+    #[test]
+    fn test_top_field_collector_f64_nan_sort_key() -> crate::Result<()> {
+        // Index 5 docs with f64 sort keys: [1.0, 2.0, NaN, 3.0, 4.0].
+        // Sort descending. NaN's exact final position is left unspecified, but
+        // *non-NaN* docs must still appear in strictly descending order.
+        let mut schema_builder = Schema::builder();
+        let altitude = schema_builder.add_f64_field("altitude", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(doc!(altitude => 1.0f64))?;
+        index_writer.add_document(doc!(altitude => 2.0f64))?;
+        index_writer.add_document(doc!(altitude => f64::NAN))?;
+        index_writer.add_document(doc!(altitude => 3.0f64))?;
+        index_writer.add_document(doc!(altitude => 4.0f64))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let top_collector = TopDocs::with_limit(5).order_by_fast_field("altitude", Order::Desc);
+        let top_docs: Vec<(Option<f64>, DocAddress)> =
+            searcher.search(&AllQuery, &top_collector)?;
+
+        // Filter out the NaN entry and verify the remaining ones are in
+        // strictly descending order (4.0, 3.0, 2.0, 1.0).
+        let non_nan: Vec<f64> = top_docs
+            .iter()
+            .filter_map(|(v, _)| match v {
+                Some(x) if !x.is_nan() => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            non_nan,
+            vec![4.0f64, 3.0f64, 2.0f64, 1.0f64],
+            "non-NaN docs should be in descending order; got top_docs = {:?}",
+            top_docs,
+        );
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "unstable"))]
