@@ -134,6 +134,12 @@ impl<TDocSet: DocSet> DocSet for ConstScorer<TDocSet> {
     fn cost(&self) -> u64 {
         self.docset.cost()
     }
+
+    fn count_including_deleted(&mut self) -> u32 {
+        // Forward to the underlying docset so specialized fast counts (e.g. on a
+        // `BitSetDocSet`) are not lost behind the const-scorer wrapper.
+        self.docset.count_including_deleted()
+    }
 }
 
 impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {

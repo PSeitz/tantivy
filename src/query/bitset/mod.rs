@@ -91,6 +91,34 @@ impl DocSet for BitSetDocSet {
     fn size_hint(&self) -> u32 {
         self.docs.len() as u32
     }
+
+    /// Counts the remaining docs in the bitset.
+    ///
+    /// Default impl in [`DocSet`] walks every doc one-by-one via `advance()`. For a
+    /// `BitSetDocSet` this is wasteful: we can sum tinybitset popcounts in O(num_buckets)
+    /// instead of O(num_docs).
+    fn count_including_deleted(&mut self) -> u32 {
+        if self.doc == TERMINATED {
+            return 0;
+        }
+        // Bits remaining in the current bucket (the bit for `self.doc` has already been
+        // popped from `cursor_tinybitset`, so we need to count it explicitly).
+        let mut count = 1u32 + self.cursor_tinybitset.len();
+        // Sum popcounts of all subsequent buckets.
+        let max_bucket = self.docs.max_value().div_ceil(64);
+        for bucket in (self.cursor_bucket + 1)..max_bucket {
+            count += self.docs.tinyset(bucket).len();
+        }
+        // Mark the docset as exhausted. Park `cursor_bucket` at the last valid bucket so
+        // that subsequent `advance()` calls (which read `tinysets[cursor_bucket + 1..]`)
+        // remain in-bounds.
+        self.cursor_tinybitset = TinySet::empty();
+        if max_bucket > 0 {
+            self.cursor_bucket = max_bucket - 1;
+        }
+        self.doc = TERMINATED;
+        count
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +257,67 @@ mod tests {
             assert_eq!(docset.doc(), 6666);
             assert_eq!(docset.advance(), TERMINATED);
         }
+    }
+
+    #[test]
+    fn test_count_including_deleted_fresh() {
+        // Fresh docset, count covers all docs.
+        let docs = [1, 5, 6, 7, 63, 64, 65, 5112, 5500, 6666];
+        let mut docset = create_docbitset(&docs, 10_000);
+        assert_eq!(docset.count_including_deleted(), docs.len() as u32);
+        // After count_including_deleted, the docset should be terminated.
+        assert_eq!(docset.doc(), TERMINATED);
+        assert_eq!(docset.advance(), TERMINATED);
+    }
+
+    #[test]
+    fn test_count_including_deleted_after_advance() {
+        // After some advances, count covers remaining docs (including current).
+        let docs = [1, 5, 6, 7, 63, 64, 65, 5112, 5500, 6666];
+        let mut docset = create_docbitset(&docs, 10_000);
+        assert_eq!(docset.doc(), 1);
+        docset.advance(); // -> 5
+        docset.advance(); // -> 6
+        // Remaining: 6, 7, 63, 64, 65, 5112, 5500, 6666 -> 8
+        assert_eq!(docset.count_including_deleted(), 8);
+        assert_eq!(docset.doc(), TERMINATED);
+    }
+
+    #[test]
+    fn test_count_including_deleted_after_seek_into_other_bucket() {
+        let docs = [1, 5, 6, 7, 63, 64, 65, 5112, 5500, 6666];
+        let mut docset = create_docbitset(&docs, 10_000);
+        assert_eq!(docset.seek(5112), 5112);
+        // Remaining: 5112, 5500, 6666 -> 3
+        assert_eq!(docset.count_including_deleted(), 3);
+        assert_eq!(docset.doc(), TERMINATED);
+    }
+
+    #[test]
+    fn test_count_including_deleted_terminated() {
+        let mut docset = create_docbitset(&[], 100);
+        assert_eq!(docset.count_including_deleted(), 0);
+    }
+
+    #[test]
+    fn test_count_including_deleted_matches_walk() {
+        // For an arbitrary bitset, the new fast count must match the manual walk.
+        let arr = generate_nonunique_unsorted(50_000, 2_500);
+        let mut bitset = common::BitSet::with_max_value(50_000);
+        for el in &arr {
+            bitset.insert(*el);
+        }
+        let walk_count = {
+            let mut walker = BitSetDocSet::from(bitset.clone());
+            let mut c = 0u32;
+            while walker.doc() != TERMINATED {
+                c += 1;
+                walker.advance();
+            }
+            c
+        };
+        let mut fast = BitSetDocSet::from(bitset);
+        assert_eq!(fast.count_including_deleted(), walk_count);
     }
 }
 
