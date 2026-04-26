@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cmp::Ordering;
 
 use columnar::MonotonicallyMappableToU64;
@@ -6,6 +7,55 @@ use serde::{Deserialize, Serialize};
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::schema::{OwnedValue, Schema};
 use crate::{DocId, Order, Score};
+
+/// Compares two `T` values using a meaningful, transitive ordering.
+///
+/// For most types this is just `partial_cmp` with `unwrap_or(Equal)`. For
+/// floating-point types (and `Option<f64>` / `Option<f32>`), this dispatches
+/// to `total_cmp` so that NaN sorts deterministically. This is critical
+/// because heap-based top-K and `sort_unstable_by` require a transitive
+/// (i.e. *total*) ordering to produce well-defined results.
+#[inline]
+fn natural_compare<T: PartialOrd + 'static>(lhs: &T, rhs: &T) -> Ordering {
+    // Specialize at runtime for float types — for any other type, the
+    // downcast checks return None and the partial_cmp fallback is used.
+    // The compiler can typically elide the downcasts after monomorphization.
+    if let (Some(l), Some(r)) = (
+        (lhs as &dyn Any).downcast_ref::<f64>(),
+        (rhs as &dyn Any).downcast_ref::<f64>(),
+    ) {
+        return l.total_cmp(r);
+    }
+    if let (Some(l), Some(r)) = (
+        (lhs as &dyn Any).downcast_ref::<f32>(),
+        (rhs as &dyn Any).downcast_ref::<f32>(),
+    ) {
+        return l.total_cmp(r);
+    }
+    if let (Some(l), Some(r)) = (
+        (lhs as &dyn Any).downcast_ref::<Option<f64>>(),
+        (rhs as &dyn Any).downcast_ref::<Option<f64>>(),
+    ) {
+        return match (l, r) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(l), Some(r)) => l.total_cmp(r),
+        };
+    }
+    if let (Some(l), Some(r)) = (
+        (lhs as &dyn Any).downcast_ref::<Option<f32>>(),
+        (rhs as &dyn Any).downcast_ref::<Option<f32>>(),
+    ) {
+        return match (l, r) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(l), Some(r)) => l.total_cmp(r),
+        };
+    }
+    lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
+}
 
 fn compare_owned_value<const NULLS_FIRST: bool>(lhs: &OwnedValue, rhs: &OwnedValue) -> Ordering {
     match (lhs, rhs) {
@@ -81,10 +131,10 @@ pub trait Comparator<T>: Send + Sync + std::fmt::Debug + Default {
 #[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
 pub struct NaturalComparator;
 
-impl<T: PartialOrd> Comparator<T> for NaturalComparator {
+impl<T: PartialOrd + 'static> Comparator<T> for NaturalComparator {
     #[inline(always)]
     fn compare(&self, lhs: &T, rhs: &T) -> Ordering {
-        lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
+        natural_compare(lhs, rhs)
     }
 }
 
