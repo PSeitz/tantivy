@@ -47,7 +47,18 @@ fn to_lowercase_unicode(text: &str, output: &mut String) {
     for c in text.chars() {
         // Contrary to the std, we do not take care of sigma special case.
         // This will have an normalizationo effect, which is ok for search.
-        output.extend(c.to_lowercase());
+        //
+        // Special-case U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE): the
+        // standard Unicode lowercase mapping produces "i\u{307}" (i +
+        // COMBINING DOT ABOVE), which would prevent a token like "İstanbul"
+        // from being retrieved by a search for "istanbul". For search
+        // purposes we collapse it to plain ASCII 'i', matching the behavior
+        // of dotless-I locales and giving a sensible cross-locale match.
+        if c == '\u{0130}' {
+            output.push('i');
+        } else {
+            output.extend(c.to_lowercase());
+        }
     }
 }
 
