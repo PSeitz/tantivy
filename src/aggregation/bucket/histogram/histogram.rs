@@ -330,37 +330,51 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
     ) -> crate::Result<()> {
         let req = agg_data.take_histogram_req_data(self.accessor_idx);
         let mem_pre = self.get_memory_consumption(parent_bucket_id);
-        let buckets = &mut self.parent_buckets[parent_bucket_id as usize].buckets;
-
-        let bounds = req.bounds;
-        let interval = req.req.interval;
-        let offset = req.offset;
-        let get_bucket_pos = |val| get_bucket_pos_f64(val, interval, offset) as i64;
 
         agg_data
             .column_block_accessor
             .fetch_block(docs, &req.accessor);
-        for (doc, val) in agg_data
-            .column_block_accessor
-            .iter_docid_vals(docs, &req.accessor)
-        {
-            let val = f64_from_fastfield_u64(val, req.field_type);
-            let bucket_pos = get_bucket_pos(val);
-            if bounds.contains(val) {
-                let bucket = buckets.entry(bucket_pos).or_insert_with(|| {
-                    let key = get_bucket_key_from_pos(bucket_pos as f64, interval, offset);
-                    SegmentHistogramBucketEntry {
-                        key,
-                        doc_count: 0,
-                        bucket_id: self.bucket_id_provider.next_bucket_id(),
-                    }
-                });
-                bucket.doc_count += 1;
-                if let Some(sub_agg) = &mut self.sub_agg {
-                    sub_agg.push(bucket.bucket_id, doc);
-                }
+
+        // Hoist the `field_type` match out of the per-value hot loop by
+        // dispatching to a const-generic specialization.
+        match req.field_type {
+            ColumnType::U64 => self.collect_specialized::<{ ColumnType::U64 as u8 }>(
+                parent_bucket_id,
+                docs,
+                &req,
+                agg_data,
+            ),
+            ColumnType::I64 => self.collect_specialized::<{ ColumnType::I64 as u8 }>(
+                parent_bucket_id,
+                docs,
+                &req,
+                agg_data,
+            ),
+            ColumnType::F64 => self.collect_specialized::<{ ColumnType::F64 as u8 }>(
+                parent_bucket_id,
+                docs,
+                &req,
+                agg_data,
+            ),
+            ColumnType::Bool => self.collect_specialized::<{ ColumnType::Bool as u8 }>(
+                parent_bucket_id,
+                docs,
+                &req,
+                agg_data,
+            ),
+            ColumnType::DateTime => self.collect_specialized::<{ ColumnType::DateTime as u8 }>(
+                parent_bucket_id,
+                docs,
+                &req,
+                agg_data,
+            ),
+            other => {
+                return Err(TantivyError::InvalidArgument(format!(
+                    "unexpected column type for histogram: {other:?}"
+                )));
             }
         }
+
         agg_data.put_back_histogram_req_data(self.accessor_idx, req);
 
         let mem_delta = self.get_memory_consumption(parent_bucket_id) - mem_pre;
@@ -399,6 +413,46 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
 impl SegmentHistogramCollector {
     fn get_memory_consumption(&self, parent_bucket_id: BucketId) -> u64 {
         self.parent_buckets[parent_bucket_id as usize].memory_consumption()
+    }
+
+    /// Inner per-value loop, monomorphized per `ColumnType` so that
+    /// `convert_to_f64::<COLUMN_TYPE_ID>` is fully inlined instead of going
+    /// through a runtime `match` on every value.
+    #[inline]
+    fn collect_specialized<const COLUMN_TYPE_ID: u8>(
+        &mut self,
+        parent_bucket_id: BucketId,
+        docs: &[crate::DocId],
+        req: &HistogramAggReqData,
+        agg_data: &mut AggregationsSegmentCtx,
+    ) {
+        let buckets = &mut self.parent_buckets[parent_bucket_id as usize].buckets;
+        let bounds = req.bounds;
+        let interval = req.req.interval;
+        let offset = req.offset;
+
+        for (doc, val) in agg_data
+            .column_block_accessor
+            .iter_docid_vals(docs, &req.accessor)
+        {
+            let val = convert_to_f64::<COLUMN_TYPE_ID>(val);
+            if !bounds.contains(val) {
+                continue;
+            }
+            let bucket_pos = get_bucket_pos_f64(val, interval, offset) as i64;
+            let bucket = buckets.entry(bucket_pos).or_insert_with(|| {
+                let key = get_bucket_key_from_pos(bucket_pos as f64, interval, offset);
+                SegmentHistogramBucketEntry {
+                    key,
+                    doc_count: 0,
+                    bucket_id: self.bucket_id_provider.next_bucket_id(),
+                }
+            });
+            bucket.doc_count += 1;
+            if let Some(sub_agg) = &mut self.sub_agg {
+                sub_agg.push(bucket.bucket_id, doc);
+            }
+        }
     }
 
     /// Converts the collector result into a intermediate bucket result.
