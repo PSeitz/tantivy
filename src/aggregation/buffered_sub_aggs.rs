@@ -106,6 +106,11 @@ pub(crate) struct HighCardSubAggBuffer {
     /// We want to keep this cheap, because high cardinality aggregations can have a lot of
     /// buckets, and there may be nothing to group.
     partitions: Box<[PartitionEntry; NUM_PARTITIONS]>,
+    /// The maximum bucket id pushed since the last flush. Tracked incrementally in `push`
+    /// to avoid an O(N) scan in `flush_local`. Only valid when at least one push has
+    /// occurred since construction or the last clear, but `flush_local` is only invoked
+    /// when there are buffered docs, so we never read it in the empty case.
+    max_bucket: BucketId,
 }
 
 impl HighCardSubAggBuffer {
@@ -114,6 +119,7 @@ impl HighCardSubAggBuffer {
         for partition in self.partitions.iter_mut() {
             partition.clear();
         }
+        self.max_bucket = 0;
     }
 }
 
@@ -135,14 +141,19 @@ impl SubAggBuffer for HighCardSubAggBuffer {
     fn new() -> Self {
         Self {
             partitions: Box::new(core::array::from_fn(|_| PartitionEntry::default())),
+            max_bucket: 0,
         }
     }
 
+    #[inline]
     fn push(&mut self, bucket_id: BucketId, doc_id: DocId) {
         let idx = bucket_id % NUM_PARTITIONS as u32;
         let slot = &mut self.partitions[idx as usize];
         slot.bucket_ids.push(bucket_id);
         slot.docs.push(doc_id);
+        if bucket_id > self.max_bucket {
+            self.max_bucket = bucket_id;
+        }
     }
 
     fn flush_local(
@@ -151,14 +162,7 @@ impl SubAggBuffer for HighCardSubAggBuffer {
         agg_data: &mut AggregationsSegmentCtx,
         _force: bool,
     ) -> crate::Result<()> {
-        let mut max_bucket = 0u32;
-        for partition in self.partitions.iter() {
-            if let Some(&local_max) = partition.bucket_ids.iter().max() {
-                max_bucket = max_bucket.max(local_max);
-            }
-        }
-
-        sub_agg.prepare_max_bucket(max_bucket, agg_data)?;
+        sub_agg.prepare_max_bucket(self.max_bucket, agg_data)?;
 
         for slot in self.partitions.iter() {
             if !slot.bucket_ids.is_empty() {
