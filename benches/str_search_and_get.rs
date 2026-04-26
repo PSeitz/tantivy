@@ -367,17 +367,26 @@ impl FetchAllStringsSearchTask {
         docs.sort();
         let mut strings = Vec::with_capacity(docs.len());
 
-        for doc_address in docs {
-            let segment_reader = &self.searcher.segment_readers()[doc_address.segment_ord as usize];
-            let str_column_opt = segment_reader.fast_fields().str("str_fast");
+        // Open the str column once per segment, outside of the per-doc loop.
+        // Re-opening the column on every doc is wasteful: it reparses the
+        // SSTable footer/index and rebuilds the dictionary handle, defeating
+        // any caching that the column might do internally.
+        let segment_readers = self.searcher.segment_readers();
+        let mut str_columns: Vec<Option<_>> = Vec::with_capacity(segment_readers.len());
+        for segment_reader in segment_readers {
+            str_columns.push(segment_reader.fast_fields().str("str_fast").ok().flatten());
+        }
+        let mut str_buffer = String::new();
 
-            if let Ok(Some(str_column)) = str_column_opt {
-                let doc_id = doc_address.doc_id;
-                let term_ord = str_column.term_ords(doc_id).next().unwrap();
-                let mut str_buffer = String::new();
-                if str_column.ord_to_str(term_ord, &mut str_buffer).is_ok() {
-                    strings.push(str_buffer);
-                }
+        for doc_address in docs {
+            let Some(str_column) = &str_columns[doc_address.segment_ord as usize] else {
+                continue;
+            };
+            let doc_id = doc_address.doc_id;
+            let term_ord = str_column.term_ords(doc_id).next().unwrap();
+            str_buffer.clear();
+            if str_column.ord_to_str(term_ord, &mut str_buffer).is_ok() {
+                strings.push(std::mem::take(&mut str_buffer));
             }
         }
 

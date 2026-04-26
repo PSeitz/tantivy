@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use common::bounds::{TransformBound, transform_bound_inner_res};
 use common::file_slice::FileSlice;
@@ -39,13 +39,57 @@ use crate::{
 /// block boundary.
 ///
 /// (See also README.md)
-#[derive(Debug, Clone)]
+/// Cache for the most recently accessed block in the `Dictionary`.
+///
+/// Without this cache, repeated `ord_to_term` calls (a common pattern when
+/// resolving the string for many docs through a fast field) re-decode the
+/// block from its first ordinal on each call. For N lookups within the same
+/// block the original cost is O(N * block_size).
+///
+/// The cache lazily materializes the keys of a block as they are requested,
+/// so:
+///  - sequential / monotonically increasing ord lookups within the same
+///    block become amortized O(1) instead of O(ord) per call;
+///  - jumping back within the same block is also O(1) since previously
+///    decoded keys are still in `keys`.
+#[derive(Debug, Default)]
+struct LastBlockCache {
+    /// Identifier of the cached block (we use the byte_range start of the
+    /// block as a cheap, unique key — the sstable index produces stable
+    /// `BlockAddr`s for the same block).
+    block_byte_range_start: usize,
+    /// Materialized keys for the block, indexed by `ord - first_ordinal`.
+    /// The vec grows lazily as more ords are requested.
+    keys: Vec<Box<[u8]>>,
+    /// Reusable scratch buffer used when extending `keys`.
+    scratch: Vec<u8>,
+    /// `true` when `keys` covers every term in the block.
+    fully_decoded: bool,
+}
+
+#[derive(Debug)]
 pub struct Dictionary<TSSTable: SSTable = VoidSSTable> {
     pub sstable_slice: FileSlice,
     pub sstable_index: SSTableIndex,
     num_bytes: ByteCount,
     num_terms: u64,
+    /// Single-block cache of materialized keys, shared across clones so that
+    /// repeated lookups via cloned dictionaries can hit the same cache.
+    last_block_cache: Arc<Mutex<Option<LastBlockCache>>>,
     phantom_data: PhantomData<TSSTable>,
+}
+
+impl<TSSTable: SSTable> Clone for Dictionary<TSSTable> {
+    fn clone(&self) -> Self {
+        Dictionary {
+            sstable_slice: self.sstable_slice.clone(),
+            sstable_index: self.sstable_index.clone(),
+            num_bytes: self.num_bytes,
+            num_terms: self.num_terms,
+            last_block_cache: self.last_block_cache.clone(),
+            phantom_data: PhantomData,
+        }
+    }
 }
 
 impl Dictionary<VoidSSTable> {
@@ -321,6 +365,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             sstable_index,
             num_bytes,
             num_terms,
+            last_block_cache: Arc::new(Mutex::new(None)),
             phantom_data: PhantomData,
         })
     }
@@ -495,17 +540,59 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     pub fn ord_to_term(&self, ord: TermOrdinal, bytes: &mut Vec<u8>) -> io::Result<bool> {
         // find block in which the term would be
         let block_addr = self.sstable_index.get_block_with_ord(ord);
+        let block_byte_range_start = block_addr.byte_range.start;
         let first_ordinal = block_addr.first_ordinal;
+        let inner_offset = (ord - first_ordinal) as usize;
 
-        // then search inside that block only
+        let mut cache_guard = self.last_block_cache.lock().expect("ord_to_term cache poisoned");
+
+        // If a different block is cached, evict and start fresh.
+        let cache = match cache_guard.as_mut() {
+            Some(cache) if cache.block_byte_range_start == block_byte_range_start => cache,
+            _ => {
+                *cache_guard = Some(LastBlockCache {
+                    block_byte_range_start,
+                    ..Default::default()
+                });
+                cache_guard.as_mut().expect("just inserted")
+            }
+        };
+
+        // Fast path: the key was already decoded into the cache.
+        if let Some(key) = cache.keys.get(inner_offset) {
+            bytes.clear();
+            bytes.extend_from_slice(key);
+            return Ok(true);
+        }
+        if cache.fully_decoded {
+            // Already walked the whole block; ord is out of range.
+            return Ok(false);
+        }
+
+        // Slow path: walk forward from where the cache left off until we have
+        // decoded the requested ord (or hit end of block).
         let mut sstable_delta_reader = self.sstable_delta_reader_block(block_addr)?;
-        for _ in first_ordinal..=ord {
+        // Advance the reader past the keys that are already cached.
+        for _ in 0..cache.keys.len() {
             if !sstable_delta_reader.advance()? {
+                cache.fully_decoded = true;
                 return Ok(false);
             }
-            bytes.truncate(sstable_delta_reader.common_prefix_len());
-            bytes.extend_from_slice(sstable_delta_reader.suffix());
+            cache.scratch.truncate(sstable_delta_reader.common_prefix_len());
+            cache.scratch.extend_from_slice(sstable_delta_reader.suffix());
         }
+        // Decode forward, materializing each key into the cache.
+        while cache.keys.len() <= inner_offset {
+            if !sstable_delta_reader.advance()? {
+                cache.fully_decoded = true;
+                return Ok(false);
+            }
+            cache.scratch.truncate(sstable_delta_reader.common_prefix_len());
+            cache.scratch.extend_from_slice(sstable_delta_reader.suffix());
+            cache.keys.push(cache.scratch.as_slice().into());
+        }
+        bytes.clear();
+        bytes.extend_from_slice(&cache.keys[inner_offset]);
         Ok(true)
     }
 
