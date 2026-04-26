@@ -123,26 +123,33 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> DocSet
 {
     fn advance(&mut self) -> DocId {
         let mut current_num_matches = 0;
-        while let Some(mut candidate) = self.chains.pop() {
-            let next = candidate.doc();
-            if next != TERMINATED {
-                // Peek next doc.
-                if self.current_doc != next {
-                    if current_num_matches >= self.minimum_matches_required {
-                        self.chains.push(candidate);
-                        self.current_score = self.score_combiner.score();
-                        return self.current_doc;
-                    }
-                    // Reset current_num_matches and scores.
-                    current_num_matches = 0;
-                    self.current_doc = next;
-                    self.score_combiner.clear();
-                }
-                current_num_matches += 1;
-                self.score_combiner.update(&mut candidate.scorer);
-                candidate.advance();
-                self.chains.push(candidate);
+        // We use `peek_mut` to update the smallest entry in-place when we advance it
+        // and `pop` only when an entry is exhausted. This halves the heap work compared
+        // to popping then pushing on every step.
+        while let Some(mut top) = self.chains.peek_mut() {
+            let next = top.doc();
+            if next == TERMINATED {
+                // Remove the exhausted scorer from the heap.
+                std::collections::binary_heap::PeekMut::pop(top);
+                continue;
             }
+            // Peek next doc.
+            if self.current_doc != next {
+                if current_num_matches >= self.minimum_matches_required {
+                    // Drop without modifying: heap order is preserved.
+                    self.current_score = self.score_combiner.score();
+                    return self.current_doc;
+                }
+                // Reset current_num_matches and scores.
+                current_num_matches = 0;
+                self.current_doc = next;
+                self.score_combiner.clear();
+            }
+            current_num_matches += 1;
+            self.score_combiner.update(&mut top.scorer);
+            top.advance();
+            // `top` is dropped here, triggering a single sift-down to restore the heap
+            // invariant. This replaces the previous pop+push pair (two sift operations).
         }
         if current_num_matches < self.minimum_matches_required {
             self.current_doc = TERMINATED;

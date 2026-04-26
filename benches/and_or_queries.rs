@@ -22,9 +22,9 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tantivy::collector::sort_key::SortByStaticFastValue;
 use tantivy::collector::{Collector, Count, TopDocs};
-use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, FAST, TEXT};
-use tantivy::{doc, Index, Order, ReloadPolicy, Searcher};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
+use tantivy::{doc, Index, Order, ReloadPolicy, Searcher, Term};
 
 #[derive(Clone)]
 struct BenchIndex {
@@ -32,6 +32,7 @@ struct BenchIndex {
     index: Index,
     searcher: Searcher,
     query_parser: QueryParser,
+    body_field: Field,
 }
 
 /// Build a single index containing both fields (title, body) and
@@ -99,11 +100,13 @@ fn build_index(num_docs: usize, terms: &[(&str, f32)]) -> (BenchIndex, BenchInde
         index: index.clone(),
         searcher: searcher.clone(),
         query_parser: qp_single,
+        body_field: f_body,
     };
     let title_and_body = BenchIndex {
         index,
         searcher,
         query_parser: qp_multi,
+        body_field: f_body,
     };
     (only_title, title_and_body)
 }
@@ -162,8 +165,8 @@ fn main() {
         .collect();
 
     for (view_name, bench_index) in [
-        ("single_field", only_title),
-        ("multi_field", title_and_body),
+        ("single_field", only_title.clone()),
+        ("multi_field", title_and_body.clone()),
     ] {
         for (category_name, category_queries) in queries {
             for query_str in *category_queries {
@@ -206,6 +209,54 @@ fn main() {
 
                 group.run();
             }
+        }
+    }
+
+    // Disjunction (min_should_match > 1) benches: triggers the Disjunction scorer
+    // (BinaryHeap-based) instead of the regular union scorer.
+    for (view_name, bench_index) in [
+        ("single_field", only_title.clone()),
+        ("multi_field", title_and_body.clone()),
+    ] {
+        // (label, terms, min_match)
+        let configs: &[(&str, &[&str], usize)] = &[
+            ("min2_of_3_e_d_c", &["e", "d", "c"], 2),
+            ("min2_of_4_e_d_c_b", &["e", "d", "c", "b"], 2),
+            ("min3_of_4_e_d_c_b", &["e", "d", "c", "b"], 3),
+            ("min2_of_5_e_d_c_b_a", &["e", "d", "c", "b", "a"], 2),
+            ("min3_of_5_e_d_c_b_a", &["e", "d", "c", "b", "a"], 3),
+        ];
+        for (label, terms_used, min_match) in configs {
+            let mut group = runner.new_group();
+            group.set_name(format!("{}_disjunction_{}", view_name, label));
+            let subqueries: Vec<(Occur, Box<dyn Query>)> = terms_used
+                .iter()
+                .map(|t| {
+                    let term = Term::from_field_text(bench_index.body_field, t);
+                    let term_query: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                    (Occur::Should, term_query)
+                })
+                .collect();
+            let bool_query =
+                BooleanQuery::with_minimum_required_clauses(subqueries, *min_match);
+            let query: Box<dyn Query> = Box::new(bool_query);
+            let searcher_count = bench_index.searcher.clone();
+            let query_count = query.box_clone();
+            group.register("count", move |_| {
+                black_box(searcher_count.search(&*query_count, &Count).unwrap())
+            });
+            let searcher_top = bench_index.searcher.clone();
+            let query_top = query.box_clone();
+            group.register("top10_inv_idx", move |_| {
+                black_box(
+                    searcher_top
+                        .search(&*query_top, &TopDocs::with_limit(10).order_by_score())
+                        .unwrap()
+                        .len(),
+                )
+            });
+            group.run();
         }
     }
 }
