@@ -7,7 +7,8 @@ mod set_block;
 use common::{BinarySerializable, OwnedBytes, VInt};
 pub use set::{SelectCursor, Set, SetCodec};
 use set_block::{
-    DENSE_BLOCK_NUM_BYTES, DenseBlock, DenseBlockCodec, SparseBlock, SparseBlockCodec,
+    DENSE_BLOCK_NUM_BYTES, DenseBlock, DenseBlockCodec, DenseBlockSetIter, SparseBlock,
+    SparseBlockCodec,
 };
 
 use crate::iterable::Iterable;
@@ -280,11 +281,13 @@ impl OptionalIndex {
         self.num_non_null_docs
     }
 
-    pub fn iter_non_null_docs(&self) -> impl Iterator<Item = RowId> + '_ {
-        // TODO optimize. We could iterate over the blocks directly.
-        // We use the dense value ids and retrieve the doc ids via select.
-        let mut select_batch = self.select_cursor();
-        (0..self.num_non_null_docs).map(move |rank| select_batch.select(rank))
+    pub fn iter_non_null_docs(&self) -> IterNonNullDocs<'_> {
+        IterNonNullDocs {
+            optional_index: self,
+            block_pos: 0,
+            block_state: BlockIterState::Empty,
+            block_doc_idx_start: 0,
+        }
     }
     pub fn select_batch(&self, ranks: &mut [RowId]) {
         let mut select_cursor = self.select_cursor();
@@ -333,6 +336,71 @@ impl OptionalIndex {
 enum Block<'a> {
     Dense(DenseBlock<'a>),
     Sparse(SparseBlock<'a>),
+}
+
+enum BlockIterState<'a> {
+    Empty,
+    Dense(DenseBlockSetIter<'a>),
+    Sparse {
+        bytes: &'a [u8],
+        next_idx: usize,
+    },
+}
+
+/// Iterator over the doc ids of all non-null rows in an [`OptionalIndex`].
+///
+/// Iterates blocks directly, yielding each set bit in O(1) amortized time.
+pub struct IterNonNullDocs<'a> {
+    optional_index: &'a OptionalIndex,
+    /// Index of the next block in `block_metas` to load once the current one is exhausted.
+    block_pos: u32,
+    block_state: BlockIterState<'a>,
+    /// `block_pos * ELEMENTS_PER_BLOCK` for the currently-active block_state, captured
+    /// when the block was loaded.
+    block_doc_idx_start: u32,
+}
+
+impl Iterator for IterNonNullDocs<'_> {
+    type Item = RowId;
+
+    #[inline]
+    fn next(&mut self) -> Option<RowId> {
+        loop {
+            match &mut self.block_state {
+                BlockIterState::Dense(iter) => {
+                    if let Some(in_block) = iter.next() {
+                        return Some(self.block_doc_idx_start + in_block as u32);
+                    }
+                }
+                BlockIterState::Sparse { bytes, next_idx } => {
+                    if *next_idx + 2 <= bytes.len() {
+                        let i = *next_idx;
+                        let in_block =
+                            u16::from_le_bytes([bytes[i], bytes[i + 1]]) as u32;
+                        *next_idx = i + 2;
+                        return Some(self.block_doc_idx_start + in_block);
+                    }
+                }
+                BlockIterState::Empty => {}
+            }
+            // Current block exhausted (or empty), advance to next.
+            let block_pos = self.block_pos as usize;
+            if block_pos >= self.optional_index.block_metas.len() {
+                self.block_state = BlockIterState::Empty;
+                return None;
+            }
+            let block_meta = self.optional_index.block_metas[block_pos];
+            self.block_doc_idx_start = self.block_pos * ELEMENTS_PER_BLOCK;
+            self.block_pos += 1;
+            self.block_state = match self.optional_index.block(block_meta) {
+                Block::Dense(dense_block) => BlockIterState::Dense(dense_block.iter_set()),
+                Block::Sparse(sparse_block) => BlockIterState::Sparse {
+                    bytes: sparse_block.raw_bytes(),
+                    next_idx: 0,
+                },
+            };
+        }
+    }
 }
 
 fn serialize_optional_index_block(block_els: &[u16], out: &mut impl io::Write) -> io::Result<()> {

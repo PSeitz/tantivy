@@ -69,7 +69,7 @@ fn get_u16(data: &[u8], byte_position: usize) -> u16 {
     u16::from_le_bytes(bytes)
 }
 
-impl SparseBlock<'_> {
+impl<'a> SparseBlock<'a> {
     #[inline(always)]
     fn value_at_idx(&self, data: &[u8], idx: u16) -> u16 {
         let start_offset: usize = idx as usize * 2;
@@ -79,6 +79,15 @@ impl SparseBlock<'_> {
     #[inline]
     fn num_vals(&self) -> u16 {
         (self.0.len() / 2) as u16
+    }
+
+    /// Returns the raw byte slice backing the sparse block.
+    ///
+    /// The bytes are pairs of `u16` little-endian values, each giving the in-block position
+    /// of a set value.
+    #[inline]
+    pub fn raw_bytes(&self) -> &'a [u8] {
+        self.0
     }
 
     #[inline]

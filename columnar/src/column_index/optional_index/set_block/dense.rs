@@ -174,7 +174,7 @@ impl<'a> Set<u16> for DenseBlock<'a> {
     }
 }
 
-impl DenseBlock<'_> {
+impl<'a> DenseBlock<'a> {
     #[inline]
     fn mini_block(&self, mini_block_id: u16) -> DenseMiniBlock {
         let data_start_pos = mini_block_id as usize * MINI_BLOCK_NUM_BYTES;
@@ -200,6 +200,21 @@ impl DenseBlock<'_> {
             })
     }
 
+    /// Iterator over the in-block positions (`u16`) of all set bits, in ascending order.
+    ///
+    /// This is much faster than calling `select(rank)` for each rank because it avoids
+    /// the per-element `select_u64` walk through the bitvec. Each set bit is yielded in
+    /// O(1) amortized time using `trailing_zeros`.
+    #[inline]
+    pub(crate) fn iter_set(&self) -> DenseBlockSetIter<'a> {
+        DenseBlockSetIter {
+            data: self.0,
+            cur_bitvec: 0,
+            cur_miniblock_offset: 0,
+            next_miniblock_id: 0,
+        }
+    }
+
     /// Finds the block position containing the dense_idx.
     ///
     /// # Correctness
@@ -212,6 +227,55 @@ impl DenseBlock<'_> {
             .take_while(|(_, block)| block.rank <= rank)
             .map(|(block_id, _)| block_id)
             .last()
+    }
+}
+
+/// Iterator yielding the in-block positions of set bits in a [`DenseBlock`], in ascending order.
+///
+/// Used to scan all non-null docs of an [`super::super::OptionalIndex`] block without
+/// the per-rank `select_u64` walk.
+pub struct DenseBlockSetIter<'a> {
+    data: &'a [u8],
+    /// Bitvec of the miniblock currently being drained. Bits are consumed via
+    /// `trailing_zeros` + Kernighan's trick.
+    cur_bitvec: u64,
+    /// `miniblock_id * ELEMENTS_PER_MINI_BLOCK`, i.e. the doc-position offset
+    /// inside the parent block of the miniblock currently being drained.
+    cur_miniblock_offset: u32,
+    /// Next miniblock id to read once `cur_bitvec` is empty.
+    next_miniblock_id: u32,
+}
+
+impl Iterator for DenseBlockSetIter<'_> {
+    type Item = u16;
+
+    #[inline]
+    fn next(&mut self) -> Option<u16> {
+        // Fast path: bit available in the current miniblock.
+        if self.cur_bitvec != 0 {
+            let lowest = self.cur_bitvec.trailing_zeros();
+            self.cur_bitvec &= self.cur_bitvec - 1;
+            return Some(self.cur_miniblock_offset as u16 + lowest as u16);
+        }
+        // Skip empty miniblocks.
+        let total_miniblocks = self.data.len() / MINI_BLOCK_NUM_BYTES;
+        while (self.next_miniblock_id as usize) < total_miniblocks {
+            let mb_id = self.next_miniblock_id as usize;
+            let start = mb_id * MINI_BLOCK_NUM_BYTES;
+            let bitvec_bytes: [u8; MINI_BLOCK_BITVEC_NUM_BYTES] = self.data
+                [start..start + MINI_BLOCK_BITVEC_NUM_BYTES]
+                .try_into()
+                .unwrap();
+            let bitvec = u64::from_le_bytes(bitvec_bytes);
+            self.next_miniblock_id += 1;
+            if bitvec != 0 {
+                let lowest = bitvec.trailing_zeros();
+                self.cur_bitvec = bitvec & (bitvec - 1);
+                self.cur_miniblock_offset = (mb_id as u32) * (ELEMENTS_PER_MINI_BLOCK as u32);
+                return Some(self.cur_miniblock_offset as u16 + lowest as u16);
+            }
+        }
+        None
     }
 }
 
