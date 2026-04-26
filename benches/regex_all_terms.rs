@@ -78,6 +78,17 @@ fn default_configs() -> Vec<BenchConfig> {
             num_docs: 100_000,
             tokens_per_doc: 8,
         },
+        // Count-dominated: very few terms (cheap scorer construction), many docs in bitset.
+        BenchConfig {
+            num_terms: 100,
+            num_docs: 1_000_000,
+            tokens_per_doc: 1,
+        },
+        BenchConfig {
+            num_terms: 1_000,
+            num_docs: 1_000_000,
+            tokens_per_doc: 1,
+        },
     ]
 }
 
