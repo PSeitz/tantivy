@@ -160,6 +160,10 @@ pub struct SegmentRangeCollector<B: SubAggBuffer> {
     /// The buckets containing the aggregation data.
     /// One for each ParentBucketId
     parent_buckets: Vec<Vec<SegmentRangeAndBucketEntry>>,
+    /// Cache of the bucket range start values, shared across all parent buckets (since the
+    /// ranges are identical). Used by `get_bucket_pos` for a cache-friendly binary search
+    /// instead of probing the much larger `SegmentRangeAndBucketEntry` structs.
+    range_starts: Vec<u64>,
     column_type: ColumnType,
     pub(crate) accessor_idx: usize,
     sub_agg: Option<BufferedSubAggs<B>>,
@@ -288,16 +292,26 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentRangeCollector<B> {
             .fetch_block(docs, &req.accessor);
 
         let buckets = &mut self.parent_buckets[parent_bucket_id as usize];
+        let range_starts = &self.range_starts[..];
 
-        for (doc, val) in agg_data
-            .column_block_accessor
-            .iter_docid_vals(docs, &req.accessor)
-        {
-            let bucket_pos = get_bucket_pos(val, buckets);
-            let bucket = &mut buckets[bucket_pos];
-            bucket.bucket.doc_count += 1;
-            if let Some(sub_agg) = self.sub_agg.as_mut() {
+        if let Some(sub_agg) = self.sub_agg.as_mut() {
+            for (doc, val) in agg_data
+                .column_block_accessor
+                .iter_docid_vals(docs, &req.accessor)
+            {
+                let bucket_pos = get_bucket_pos_from_starts(val, range_starts);
+                let bucket = &mut buckets[bucket_pos];
+                bucket.bucket.doc_count += 1;
                 sub_agg.push(bucket.bucket.bucket_id, doc);
+            }
+        } else {
+            for (_doc, val) in agg_data
+                .column_block_accessor
+                .iter_docid_vals(docs, &req.accessor)
+            {
+                let bucket_pos = get_bucket_pos_from_starts(val, range_starts);
+                let bucket = &mut buckets[bucket_pos];
+                bucket.bucket.doc_count += 1;
             }
         }
 
@@ -323,6 +337,10 @@ impl<B: SubAggBuffer> SegmentAggregationCollector for SegmentRangeCollector<B> {
     ) -> crate::Result<()> {
         while self.parent_buckets.len() <= max_bucket as usize {
             let new_buckets = self.create_new_buckets(agg_data)?;
+            if self.range_starts.is_empty() && !new_buckets.is_empty() {
+                self.range_starts =
+                    new_buckets.iter().map(|b| b.range.start).collect();
+            }
             self.parent_buckets.push(new_buckets);
         }
 
@@ -356,6 +374,7 @@ pub(crate) fn build_segment_range_collector(
             column_type: field_type,
             accessor_idx,
             parent_buckets: Vec::new(),
+            range_starts: Vec::new(),
             bucket_id_provider: BucketIdProvider::default(),
             limits: agg_data.context.limits.clone(),
         }))
@@ -365,6 +384,7 @@ pub(crate) fn build_segment_range_collector(
             column_type: field_type,
             accessor_idx,
             parent_buckets: Vec::new(),
+            range_starts: Vec::new(),
             bucket_id_provider: BucketIdProvider::default(),
             limits: agg_data.context.limits.clone(),
         }))
@@ -421,6 +441,7 @@ impl<B: SubAggBuffer> SegmentRangeCollector<B> {
         Ok(buckets)
     }
 }
+#[cfg(test)]
 #[inline]
 fn get_bucket_pos(val: u64, buckets: &[SegmentRangeAndBucketEntry]) -> usize {
     let pos = buckets
@@ -428,6 +449,20 @@ fn get_bucket_pos(val: u64, buckets: &[SegmentRangeAndBucketEntry]) -> usize {
         .unwrap_or_else(|pos| pos - 1);
     debug_assert!(buckets[pos].range.contains(&val));
     pos
+}
+
+/// Find the bucket index for `val` using a separate cache of range start values.
+///
+/// `range_starts` is sorted ascending and the first element is `u64::MIN`, so the
+/// `Err(0)` branch never triggers and the subtraction is always valid.
+/// Working on a contiguous `&[u64]` is dramatically more cache-friendly than
+/// indirecting through the much larger `SegmentRangeAndBucketEntry` structs in the hot
+/// per-doc path.
+#[inline]
+fn get_bucket_pos_from_starts(val: u64, range_starts: &[u64]) -> usize {
+    range_starts
+        .binary_search(&val)
+        .unwrap_or_else(|pos| pos - 1)
 }
 
 /// Converts the user provided f64 range value to fast field value space.
@@ -595,8 +630,10 @@ mod tests {
             })
             .collect();
 
+        let range_starts = buckets.iter().map(|b| b.range.start).collect();
         SegmentRangeCollector {
             parent_buckets: vec![buckets],
+            range_starts,
             column_type: field_type,
             accessor_idx: 0,
             sub_agg: None,
