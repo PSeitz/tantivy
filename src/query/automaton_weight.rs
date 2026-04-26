@@ -6,7 +6,7 @@ use tantivy_fst::Automaton;
 
 use super::phrase_prefix_query::prefix_end;
 use crate::index::SegmentReader;
-use crate::postings::TermInfo;
+use crate::postings::{BlockSegmentPostings, TermInfo};
 use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
 use crate::termdict::{TermDictionary, TermStreamer};
@@ -90,10 +90,26 @@ where
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
         let mut term_stream = self.automaton_stream(term_dict)?;
+        // Reuse a single `BlockSegmentPostings` across all matched terms to avoid
+        // re-allocating its ~1KB worth of decoder buffers on every iteration. This
+        // matters when the automaton matches many terms (e.g. a regex like `t.*`).
+        let mut block_segment_postings_opt: Option<BlockSegmentPostings> = None;
         while term_stream.advance() {
             let term_info = term_stream.value();
-            let mut block_segment_postings = inverted_index
-                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+            let block_segment_postings = match &mut block_segment_postings_opt {
+                Some(block_segment_postings) => {
+                    inverted_index.reset_block_postings_from_terminfo(
+                        term_info,
+                        block_segment_postings,
+                    )?;
+                    block_segment_postings
+                }
+                slot @ None => {
+                    let block_segment_postings = inverted_index
+                        .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+                    slot.insert(block_segment_postings)
+                }
+            };
             loop {
                 let docs = block_segment_postings.docs();
                 if docs.is_empty() {
