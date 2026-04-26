@@ -33,11 +33,26 @@ impl<TDocSet: DocSet> SimpleUnion<TDocSet> {
     fn advance_to_next(&mut self) -> DocId {
         let mut next_doc = TERMINATED;
 
-        for docset in &mut self.docsets {
-            if docset.doc() <= self.doc {
-                docset.advance();
+        // Walk backwards so we can swap_remove terminated docsets without
+        // skipping the swapped-in element. Once a child is exhausted there is
+        // nothing more it can contribute to the union, so removing it speeds
+        // up future iterations (this matters when a union has many children
+        // with varying lengths).
+        let mut i = self.docsets.len();
+        while i > 0 {
+            i -= 1;
+            let doc = {
+                let docset = &mut self.docsets[i];
+                if docset.doc() <= self.doc {
+                    docset.advance();
+                }
+                docset.doc()
+            };
+            if doc == TERMINATED {
+                self.docsets.swap_remove(i);
+            } else if doc < next_doc {
+                next_doc = doc;
             }
-            next_doc = next_doc.min(docset.doc());
         }
         self.doc = next_doc;
         self.doc
