@@ -92,6 +92,46 @@ mod tests {
         assert_token(&tokens[1], 1, "текст", 15, 25);
     }
 
+    /// Regression test for "İ" (Turkish capital I with dot above, U+0130).
+    ///
+    /// Per Unicode, `'İ'.to_lowercase()` returns the two-character sequence
+    /// `"i\u{307}"` (LATIN SMALL LETTER I + COMBINING DOT ABOVE). Tantivy's
+    /// `LowerCaser` consumes this directly, which means an indexed token
+    /// `"İstanbul"` becomes `"i\u{307}stanbul"`, while the lowercase of plain
+    /// ASCII `"Istanbul"` becomes `"istanbul"`. The two no longer compare
+    /// equal, so a TermQuery search for "istanbul" against a document
+    /// containing "İstanbul" returns 0 hits even though both forms should
+    /// canonicalize to the same searchable token.
+    ///
+    /// This end-to-end test indexes a document containing "İstanbul" and
+    /// queries it with the lowercased ASCII form.
+    #[test]
+    fn test_lowercaser_turkish_capital_i_matches_ascii_i() -> crate::Result<()> {
+        use crate::collector::Count;
+        use crate::query::TermQuery;
+        use crate::schema::{IndexRecordOption, Schema, Term, TEXT};
+        use crate::Index;
+
+        let mut schema_builder = Schema::builder();
+        let title = schema_builder.add_text_field("title", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(crate::doc!(title => "İstanbul"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+
+        let term = Term::from_field_text(title, "istanbul");
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let count = searcher.search(&query, &Count)?;
+        assert_eq!(
+            count, 1,
+            "expected 'istanbul' to match a document containing 'İstanbul' \
+             after case-folding, but got {count} hits"
+        );
+        Ok(())
+    }
+
     fn token_stream_helper(text: &str) -> Vec<Token> {
         let mut token_stream = TextAnalyzer::builder(SimpleTokenizer::default())
             .filter(LowerCaser)
