@@ -14,7 +14,7 @@ use crate::aggregation::agg_data::{
     build_segment_agg_collectors, AggRefNode, AggregationsSegmentCtx,
 };
 use crate::aggregation::bucket::composite::accessors::{
-    CompositeAccessor, CompositeAggReqData, PrecomputedDateInterval,
+    CompositeAccessor, CompositeAggReqData, PrecomputedAfterKey, PrecomputedDateInterval,
 };
 use crate::aggregation::bucket::composite::calendar_interval;
 use crate::aggregation::bucket::composite::map::{DynArrayHeapMap, MAX_DYN_ARRAY_SIZE};
@@ -155,16 +155,28 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
         let mem_pre = self.get_memory_consumption(parent_bucket_id);
         let composite_agg_data = agg_data.take_composite_req_data(self.accessor_idx);
 
-        for doc in docs {
-            let mut visitor = CompositeKeyVisitor {
-                doc_id: *doc,
-                composite_agg_data: &composite_agg_data,
-                buckets: &mut self.parent_buckets[parent_bucket_id as usize],
-                sub_agg: &mut self.sub_agg,
-                bucket_id_provider: &mut self.bucket_id_provider,
-                sub_level_values: SmallVec::new(),
-            };
-            visitor.visit(0, true)?;
+        // Fast path for the common case of a single Terms source with a single
+        // accessor and no after_key pruning to apply. This skips the recursive
+        // visitor and uses the block-fetch column accessor for batched reads.
+        let used_fast_path = self.try_collect_single_terms_fast_path(
+            parent_bucket_id,
+            docs,
+            agg_data,
+            &composite_agg_data,
+        );
+
+        if !used_fast_path {
+            for doc in docs {
+                let mut visitor = CompositeKeyVisitor {
+                    doc_id: *doc,
+                    composite_agg_data: &composite_agg_data,
+                    buckets: &mut self.parent_buckets[parent_bucket_id as usize],
+                    sub_agg: &mut self.sub_agg,
+                    bucket_id_provider: &mut self.bucket_id_provider,
+                    sub_level_values: SmallVec::new(),
+                };
+                visitor.visit(0, true)?;
+            }
         }
         agg_data.put_back_composite_req_data(self.accessor_idx, composite_agg_data);
 
@@ -204,6 +216,85 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
 impl SegmentCompositeCollector {
     fn get_memory_consumption(&self, parent_bucket_id: BucketId) -> u64 {
         self.parent_buckets[parent_bucket_id as usize].memory_consumption()
+    }
+
+    /// Fast path for the most common composite-aggregation shape: exactly one
+    /// `Terms` source backed by a single accessor, with no after_key pruning to
+    /// apply, no `missing_bucket`, and no allowed-term filtering. In that
+    /// regime the recursive `CompositeKeyVisitor` collapses to "for each value
+    /// for the doc, push an `InternalValueRepr::new_term`, record bucket, pop"
+    /// — exactly what `iter_docid_vals` over a fetched block already does.
+    ///
+    /// Returns `true` when the fast path was taken and the caller should skip
+    /// the generic visitor walk.
+    fn try_collect_single_terms_fast_path(
+        &mut self,
+        parent_bucket_id: BucketId,
+        docs: &[crate::DocId],
+        agg_data: &mut AggregationsSegmentCtx,
+        composite_agg_data: &CompositeAggReqData,
+    ) -> bool {
+        if composite_agg_data.req.sources.len() != 1
+            || composite_agg_data.composite_accessors.len() != 1
+        {
+            return false;
+        }
+        let source = &composite_agg_data.req.sources[0];
+        let CompositeAggregationSource::Terms(terms_source) = source else {
+            return false;
+        };
+        if terms_source.missing_bucket {
+            return false;
+        }
+        let source_accessors = &composite_agg_data.composite_accessors[0];
+        if source_accessors.accessors.len() != 1 {
+            return false;
+        }
+        // Skip the fast path whenever the after_key could prune values. The
+        // generic visitor uses both `after_key` and `after_key_accessor_idx`
+        // to decide whether to break out of the column entirely or to skip
+        // some values. We require both to indicate "no pruning needed".
+        if source_accessors.after_key_accessor_idx != 0 {
+            return false;
+        }
+        let order = terms_source.order;
+        let after_key_is_no_op = match (&source_accessors.after_key, order) {
+            (PrecomputedAfterKey::Next(0), Order::Asc) => true,
+            (PrecomputedAfterKey::Next(v), Order::Desc) if *v == u64::MAX => true,
+            _ => false,
+        };
+        if !after_key_is_no_op {
+            return false;
+        }
+
+        let accessor = &source_accessors.accessors[0];
+
+        agg_data
+            .column_block_accessor
+            .fetch_block(docs, &accessor.column);
+
+        let buckets = &mut self.parent_buckets[parent_bucket_id as usize];
+        let limit_num_buckets = composite_agg_data.req.size as usize;
+        let bucket_id_provider = &mut self.bucket_id_provider;
+        let sub_agg = &mut self.sub_agg;
+
+        let mut key_buf = [InternalValueRepr::default(); 1];
+        for (doc_id, value) in agg_data
+            .column_block_accessor
+            .iter_docid_vals(docs, &accessor.column)
+        {
+            key_buf[0] = InternalValueRepr::new_term(value, 0, order);
+            collect_bucket_with_limit(
+                doc_id,
+                limit_num_buckets,
+                buckets,
+                &key_buf,
+                sub_agg,
+                bucket_id_provider,
+            );
+        }
+
+        true
     }
 
     pub(crate) fn from_req_and_validate(
