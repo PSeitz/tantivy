@@ -1,10 +1,18 @@
 use core::fmt::Debug;
 use std::ops::RangeInclusive;
+use std::sync::OnceLock;
 
 use columnar::Column;
 
 use crate::docset::SeekDangerResult;
 use crate::{DocId, DocSet, TERMINATED};
+
+/// A/B TOGGLE (not for merge): caches whether TANTIVY_OLD_SEEK_DANGER is set. When set,
+/// `seek_danger` falls back to the pre-#2963 default (a full `seek`) — i.e. v0.1.30 behavior.
+static OLD_SEEK_DANGER: OnceLock<bool> = OnceLock::new();
+/// A/B TOGGLE (not for merge): when TANTIVY_SCALAR_NO_FASTPATH is set, disables the `Full`-column
+/// fast path so `seek_danger` always goes through `values_for_doc` — i.e. cp-rc-0.1.31 behavior.
+static SCALAR_NO_FASTPATH: OnceLock<bool> = OnceLock::new();
 
 /// Helper to have a cursor over a vec of docids
 #[derive(Debug)]
@@ -189,6 +197,18 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
     /// point lookup on the column instead of scanning forward to materialize the next match (the
     /// expensive part of a regular `seek`).
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
+        // A/B TOGGLE (not for merge): pre-#2963 behavior — a full `seek` that materializes the next
+        // actual match and reports it as the lower bound (v0.1.30).
+        if OLD_SEEK_DANGER.get_or_init(|| std::env::var("TANTIVY_OLD_SEEK_DANGER").is_ok()) == &true
+        {
+            let doc = self.seek(target);
+            return if doc == target {
+                SeekDangerResult::Found
+            } else {
+                SeekDangerResult::SeekLowerBound(doc)
+            };
+        }
+
         // Covers `target == TERMINATED` and any target past the last doc: no match is possible.
         if target >= self.column.num_docs() {
             return SeekDangerResult::SeekLowerBound(TERMINATED);
@@ -199,10 +219,20 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> DocSet for RangeDocSe
         }
         self.last_seek_pos_opt = Some(target);
 
-        let is_match = self
-            .column
-            .values_for_doc(target)
-            .any(|value| self.value_range.contains(&value));
+        // Fast path: for a `Full` column the row id equals the doc id, so we can read the value
+        // straight from the column and skip the `value_row_ids` indirection and the
+        // `values_for_doc` iterator plumbing entirely. This is the common case for a required
+        // fast field such as the timestamp.
+        let use_fastpath = self.column.get_cardinality().is_full()
+            && !SCALAR_NO_FASTPATH
+                .get_or_init(|| std::env::var("TANTIVY_SCALAR_NO_FASTPATH").is_ok());
+        let is_match = if use_fastpath {
+            self.value_range.contains(&self.column.values.get_val(target))
+        } else {
+            self.column
+                .values_for_doc(target)
+                .any(|value| self.value_range.contains(&value))
+        };
         if is_match {
             // Leave the docset in a valid state positioned on `target`, so `doc()` returns it and a
             // following `advance()` resumes the scan right after it.
