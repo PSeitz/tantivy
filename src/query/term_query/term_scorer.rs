@@ -1,8 +1,13 @@
+use std::ops::Range;
+
+use common::TinySet;
+
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
+use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
-use crate::query::{Explanation, Scorer};
+use crate::query::{Explanation, ScoredBlockOutput, Scorer, SCORE_BLOCK_LEN};
 use crate::{DocId, Score};
 
 #[derive(Clone)]
@@ -110,6 +115,76 @@ impl TermScorer {
     pub(crate) fn bm25_weight(&self) -> &Bm25Weight {
         &self.similarity_weight
     }
+
+    fn fill_compact_scored_buffer_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        let mut term_freqs = [0; SCORE_BLOCK_LEN];
+        let len = self
+            .postings
+            .fill_doc_freqs_up_to(horizon, &mut docs[..], &mut term_freqs[..]);
+        let mut fieldnorm_ids = [0; SCORE_BLOCK_LEN];
+        self.fieldnorm_reader
+            .fieldnorm_ids(&docs[..len], &mut fieldnorm_ids[..len]);
+        self.similarity_weight.score_batch(
+            &fieldnorm_ids[..len],
+            &term_freqs[..len],
+            &mut scores[..len],
+        );
+        len
+    }
+
+    fn fill_scored_blocks_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId],
+        scores: &mut [Score],
+    ) -> Range<usize> {
+        assert_eq!(docs.len(), scores.len());
+        assert_eq!(
+            docs.len() % crate::postings::compression::COMPRESSION_BLOCK_SIZE,
+            0
+        );
+        let mut term_freqs = [0; crate::postings::compression::COMPRESSION_BLOCK_SIZE];
+        let mut fieldnorm_ids = [0; crate::postings::compression::COMPRESSION_BLOCK_SIZE];
+        let mut range_start = None;
+        let mut range_end = 0;
+
+        for (block_ord, (docs_block, scores_block)) in docs
+            .chunks_exact_mut(crate::postings::compression::COMPRESSION_BLOCK_SIZE)
+            .zip(scores.chunks_exact_mut(crate::postings::compression::COMPRESSION_BLOCK_SIZE))
+            .enumerate()
+        {
+            let docs_block: &mut [DocId; crate::postings::compression::COMPRESSION_BLOCK_SIZE] =
+                docs_block.try_into().unwrap();
+            let local_range =
+                self.postings
+                    .fill_doc_freq_block_up_to(horizon, docs_block, &mut term_freqs);
+            if local_range.is_empty() {
+                break;
+            }
+            self.fieldnorm_reader.fieldnorm_ids(
+                &docs_block[local_range.clone()],
+                &mut fieldnorm_ids[local_range.clone()],
+            );
+            self.similarity_weight.score_batch(
+                &fieldnorm_ids[local_range.clone()],
+                &term_freqs[local_range.clone()],
+                &mut scores_block[local_range.clone()],
+            );
+            let block_offset = block_ord * crate::postings::compression::COMPRESSION_BLOCK_SIZE;
+            range_start.get_or_insert(block_offset + local_range.start);
+            range_end = block_offset + local_range.end;
+            if local_range.end < crate::postings::compression::COMPRESSION_BLOCK_SIZE {
+                break;
+            }
+        }
+
+        range_start.unwrap_or(0)..range_end
+    }
 }
 
 impl DocSet for TermScorer {
@@ -120,7 +195,10 @@ impl DocSet for TermScorer {
 
     #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
-        debug_assert!(target >= self.doc());
+        let current = self.postings.doc();
+        if current >= target {
+            return current;
+        }
         self.postings.seek(target)
     }
 
@@ -133,11 +211,10 @@ impl DocSet for TermScorer {
         self.postings.size_hint()
     }
 
-    // TODO
-    // It is probably possible to optimize fill_bitset_block for TermScorer,
-    // working directly with the blocks, enabling vectorization.
-    // I did not manage to get a performance improvement on Mac ARM,
-    // and do not have access to x86 to investigate.
+    #[inline]
+    fn fill_bitset_block(&mut self, min_doc: DocId, horizon: DocId, mask: &mut [TinySet]) -> DocId {
+        self.postings.fill_bitset_block(min_doc, horizon, mask)
+    }
 }
 
 impl Scorer for TermScorer {
@@ -146,6 +223,48 @@ impl Scorer for TermScorer {
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
         self.similarity_weight.score(fieldnorm_id, term_freq)
+    }
+
+    #[inline]
+    fn fill_scored_buffer_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        self.fill_compact_scored_buffer_up_to(horizon, docs, scores)
+    }
+
+    fn fill_scored_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        horizon: DocId,
+        output: &mut dyn ScoredBlockOutput,
+    ) -> DocId {
+        let mut fieldnorm_ids = [0; COMPRESSION_BLOCK_SIZE];
+        let fieldnorm_reader = &self.fieldnorm_reader;
+        let similarity_weight = &self.similarity_weight;
+
+        self.postings.for_each_scored_block(
+            min_doc,
+            horizon,
+            |docs, term_freqs, scores| {
+                let fieldnorm_ids = &mut fieldnorm_ids[..docs.len()];
+                fieldnorm_reader.fieldnorm_ids(docs, fieldnorm_ids);
+                similarity_weight.score_batch(fieldnorm_ids, term_freqs, scores);
+            },
+            |docs, scores| output.update_docs(docs, scores),
+        )
+    }
+
+    #[inline]
+    fn fill_scored_buffer_range_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId],
+        scores: &mut [Score],
+    ) -> Range<usize> {
+        self.fill_scored_blocks_up_to(horizon, docs, scores)
     }
 }
 
@@ -158,11 +277,133 @@ mod tests {
     use crate::merge_policy::NoMergePolicy;
     use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
     use crate::query::term_query::TermScorer;
-    use crate::query::{Bm25Weight, EnableScoring, Scorer, TermQuery};
+    use crate::query::{Bm25Weight, EnableScoring, Scorer, TermQuery, SCORE_BLOCK_LEN};
     use crate::schema::{IndexRecordOption, Schema, TEXT};
     use crate::{
         assert_nearly_equals, DocId, DocSet, Index, IndexWriter, Score, Searcher, Term, TERMINATED,
     };
+
+    #[test]
+    fn test_term_scorer_scored_buffers_match_scalar_scoring() {
+        let num_docs = SCORE_BLOCK_LEN + 76;
+        let doc_and_tfs: Vec<(DocId, u32)> = (0..num_docs as DocId)
+            .map(|doc| (doc, doc % 5 + 1))
+            .collect();
+        let fieldnorms: Vec<u32> = (0..num_docs as u32).map(|doc| doc % 17 + 1).collect();
+        let weight = Bm25Weight::for_one_term(num_docs as u64, 10_000, 9.0);
+        let mut scorer = TermScorer::create_for_test(&doc_and_tfs, &fieldnorms, weight.clone());
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+
+        assert_eq!(
+            scorer.fill_scored_buffer(&mut docs, &mut scores),
+            SCORE_BLOCK_LEN
+        );
+        for i in 0..SCORE_BLOCK_LEN {
+            assert_eq!(docs[i], i as DocId);
+            assert_eq!(
+                scores[i],
+                weight.score(
+                    crate::fieldnorm::FieldNormReader::fieldnorm_to_id(fieldnorms[i]),
+                    doc_and_tfs[i].1
+                )
+            );
+        }
+
+        let first_unreturned = SCORE_BLOCK_LEN as DocId;
+        assert_eq!(
+            scorer.score(),
+            weight.score(scorer.fieldnorm_id(), doc_and_tfs[SCORE_BLOCK_LEN].1)
+        );
+        assert_eq!(scorer.advance(), first_unreturned + 1);
+        let horizon = first_unreturned + 36;
+        assert_eq!(
+            scorer.fill_scored_buffer_up_to(horizon, &mut docs, &mut scores),
+            35
+        );
+        assert_eq!(
+            &docs[..35],
+            &(first_unreturned + 1..horizon).collect::<Vec<_>>()
+        );
+        assert_eq!(scorer.doc(), horizon);
+
+        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 40);
+        assert_eq!(
+            &docs[..40],
+            &(horizon..num_docs as DocId).collect::<Vec<_>>()
+        );
+        assert_eq!(scorer.doc(), TERMINATED);
+        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 0);
+    }
+
+    #[test]
+    fn test_term_scorer_scored_horizon_fill_decodes_all_blocks_at_once() {
+        const HORIZON: usize = 64 * 64;
+        const BUFFER_LEN: usize = HORIZON + COMPRESSION_BLOCK_SIZE;
+        let doc_and_tfs: Vec<(DocId, u32)> = (0..4_300).map(|doc| (doc, doc % 5 + 1)).collect();
+        let fieldnorms: Vec<u32> = (0..4_300).map(|doc| doc % 17 + 1).collect();
+        let weight = Bm25Weight::for_one_term(4_300, 20_000, 9.0);
+        let mut scorer = TermScorer::create_for_test(&doc_and_tfs, &fieldnorms, weight.clone());
+        assert_eq!(scorer.seek(65), 65);
+        let mut docs = [0; BUFFER_LEN];
+        let mut scores = [0.0; BUFFER_LEN];
+
+        let range =
+            scorer.fill_scored_buffer_range_up_to(65 + HORIZON as DocId, &mut docs, &mut scores);
+        assert_eq!(range, 65..65 + HORIZON);
+        assert_eq!(
+            &docs[range.clone()],
+            &(65..65 + HORIZON as DocId).collect::<Vec<_>>()
+        );
+        for idx in range {
+            let doc = docs[idx] as usize;
+            assert_eq!(
+                scores[idx],
+                weight.score(
+                    crate::fieldnorm::FieldNormReader::fieldnorm_to_id(fieldnorms[doc]),
+                    doc_and_tfs[doc].1
+                )
+            );
+        }
+        assert_eq!(scorer.doc(), 65 + HORIZON as DocId);
+
+        let range = scorer.fill_scored_buffer_range_up_to(TERMINATED, &mut docs, &mut scores);
+        assert_eq!(range, 65..204);
+        assert_eq!(
+            &docs[range.clone()],
+            &(65 + HORIZON as DocId..4_300).collect::<Vec<_>>()
+        );
+        for idx in range {
+            let doc = docs[idx] as usize;
+            assert_eq!(
+                scores[idx],
+                weight.score(
+                    crate::fieldnorm::FieldNormReader::fieldnorm_to_id(fieldnorms[doc]),
+                    doc_and_tfs[doc].1
+                )
+            );
+        }
+        assert_eq!(scorer.doc(), TERMINATED);
+    }
+
+    #[test]
+    fn test_term_scorer_scored_buffer_with_basic_postings() {
+        let postings = crate::postings::SegmentPostings::create_from_docs(&[1, 4, 7]);
+        let fieldnorms = [2, 3, 4, 5, 6, 7, 8, 9];
+        let fieldnorm_reader = crate::fieldnorm::FieldNormReader::for_test(&fieldnorms);
+        let weight = Bm25Weight::for_one_term(3, 8, 5.5);
+        let mut scorer = TermScorer::new(postings, fieldnorm_reader, weight.clone());
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+
+        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 3);
+        assert_eq!(&docs[..3], &[1, 4, 7]);
+        for i in 0..3 {
+            let fieldnorm_id =
+                crate::fieldnorm::FieldNormReader::fieldnorm_to_id(fieldnorms[docs[i] as usize]);
+            assert_eq!(scores[i], weight.score(fieldnorm_id, 1));
+        }
+    }
 
     #[test]
     fn test_term_scorer_max_score() -> crate::Result<()> {

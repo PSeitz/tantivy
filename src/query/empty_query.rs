@@ -2,7 +2,7 @@ use super::Scorer;
 use crate::docset::TERMINATED;
 use crate::index::SegmentReader;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Weight};
+use crate::query::{EnableScoring, Explanation, Query, Weight, SCORE_BLOCK_LEN};
 use crate::{DocId, DocSet, Score, Searcher};
 
 /// `EmptyQuery` is a dummy `Query` in which no document matches.
@@ -58,6 +58,15 @@ impl Scorer for EmptyScorer {
     #[inline]
     fn score(&mut self) -> Score {
         0.0
+    }
+
+    fn fill_scored_buffer_up_to(
+        &mut self,
+        _horizon: DocId,
+        _docs: &mut [DocId; SCORE_BLOCK_LEN],
+        _scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        0
     }
 }
 

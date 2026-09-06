@@ -29,6 +29,7 @@ pub(crate) use self::indexing_context::IndexingContext;
 pub(crate) use self::per_field_postings_writer::PerFieldPostingsWriter;
 pub use self::postings::Postings;
 pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, PostingsWriter};
+pub(crate) use self::segment_postings::update_scored_bitset;
 pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};

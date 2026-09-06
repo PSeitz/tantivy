@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
+use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight, SCORE_BLOCK_LEN};
+use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term, TERMINATED};
 
 /// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
 /// The wrapped query is evaluated with scoring disabled and only determines which documents
@@ -117,6 +117,26 @@ impl<TDocSet: DocSet> ConstScorer<TDocSet> {
     pub fn new(docset: TDocSet, score: Score) -> ConstScorer<TDocSet> {
         ConstScorer { docset, score }
     }
+
+    fn fill_compact_scored_buffer_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        let mut len = 0;
+        while len < SCORE_BLOCK_LEN {
+            let doc = self.docset.doc();
+            if doc == TERMINATED || doc >= horizon {
+                break;
+            }
+            docs[len] = doc;
+            len += 1;
+            self.docset.advance();
+        }
+        scores[..len].fill(self.score);
+        len
+    }
 }
 
 impl<TDocSet: DocSet> From<TDocSet> for ConstScorer<TDocSet> {
@@ -160,14 +180,24 @@ impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
     fn score(&mut self) -> Score {
         self.score
     }
+
+    fn fill_scored_buffer_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        self.fill_compact_scored_buffer_up_to(horizon, docs, scores)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ConstScoreQuery;
+    use super::{ConstScoreQuery, ConstScorer};
     use crate::collector::TopDocs;
     use crate::query::{
-        Bm25StatisticsProvider, BoostQuery, EnableScoring, Query, Scorer, TermQuery,
+        AllScorer, Bm25StatisticsProvider, BoostQuery, EnableScoring, Query, Scorer, TermQuery,
+        SCORE_BLOCK_LEN,
     };
     use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
     use crate::{DocAddress, Index, IndexWriter, TantivyDocument, TantivyError, Term, TERMINATED};
@@ -186,6 +216,23 @@ mod tests {
         fn doc_freq(&self, _term: &Term) -> crate::Result<u64> {
             panic!("ConstScoreQuery child requested doc_freq")
         }
+    }
+
+    #[test]
+    fn test_const_scorer_fills_constant_scores_with_horizon() {
+        let mut scorer = ConstScorer::new(AllScorer::new(5), 0.42);
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+
+        assert_eq!(
+            scorer.fill_scored_buffer_up_to(2, &mut docs, &mut scores),
+            2
+        );
+        assert_eq!(&docs[..2], &[0, 1]);
+        assert_eq!(&scores[..2], &[0.42; 2]);
+        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 3);
+        assert_eq!(&docs[..3], &[2, 3, 4]);
+        assert_eq!(&scores[..3], &[0.42; 3]);
     }
 
     #[test]

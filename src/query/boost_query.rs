@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight, SCORE_BLOCK_LEN};
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
@@ -148,14 +148,58 @@ impl<S: Scorer> Scorer for BoostScorer<S> {
     fn score(&mut self) -> Score {
         self.underlying.score() * self.boost
     }
+
+    fn fill_scored_buffer(
+        &mut self,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        let len = self.underlying.fill_scored_buffer(docs, scores);
+        for score in &mut scores[..len] {
+            *score *= self.boost;
+        }
+        len
+    }
+
+    fn fill_scored_buffer_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        let len = self
+            .underlying
+            .fill_scored_buffer_up_to(horizon, docs, scores);
+        for score in &mut scores[..len] {
+            *score *= self.boost;
+        }
+        len
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BoostQuery;
-    use crate::query::{AllQuery, Query};
+    use super::{BoostQuery, BoostScorer};
+    use crate::query::{AllQuery, AllScorer, Query, Scorer, SCORE_BLOCK_LEN};
     use crate::schema::Schema;
     use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
+
+    #[test]
+    fn test_boost_scorer_forwards_scored_buffers() {
+        let mut scorer = BoostScorer::new(AllScorer::new(5), 2.5);
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+
+        assert_eq!(
+            scorer.fill_scored_buffer_up_to(3, &mut docs, &mut scores),
+            3
+        );
+        assert_eq!(&docs[..3], &[0, 1, 2]);
+        assert_eq!(&scores[..3], &[2.5; 3]);
+        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 2);
+        assert_eq!(&docs[..2], &[3, 4]);
+        assert_eq!(&scores[..2], &[2.5; 2]);
+    }
 
     #[test]
     fn test_boost_query_explain() -> crate::Result<()> {

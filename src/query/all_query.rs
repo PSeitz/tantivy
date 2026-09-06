@@ -2,7 +2,7 @@ use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight, SCORE_BLOCK_LEN};
 use crate::{DocId, Score};
 
 /// Query that matches all of the documents.
@@ -47,15 +47,38 @@ pub struct AllScorer {
 impl AllScorer {
     /// Creates a new AllScorer with `max_doc` docs.
     pub fn new(max_doc: DocId) -> AllScorer {
-        let doc = if max_doc == 0u32 { TERMINATED } else { 0 };
+        let doc = if max_doc == 0 { TERMINATED } else { 0 };
         AllScorer { doc, max_doc }
+    }
+
+    fn fill_compact_scored_buffer_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        if self.doc == TERMINATED || self.doc >= horizon {
+            return 0;
+        }
+        let end = self
+            .doc
+            .saturating_add(SCORE_BLOCK_LEN as DocId)
+            .min(self.max_doc)
+            .min(horizon);
+        let len = (end - self.doc) as usize;
+        for (offset, output_doc) in docs[..len].iter_mut().enumerate() {
+            *output_doc = self.doc + offset as DocId;
+        }
+        scores[..len].fill(1.0);
+        self.doc = if end == self.max_doc { TERMINATED } else { end };
+        len
     }
 }
 
 impl DocSet for AllScorer {
     #[inline(always)]
     fn advance(&mut self) -> DocId {
-        if self.doc + 1 >= self.max_doc {
+        if self.doc == TERMINATED || self.doc + 1 >= self.max_doc {
             self.doc = TERMINATED;
             return TERMINATED;
         }
@@ -110,13 +133,22 @@ impl Scorer for AllScorer {
     fn score(&mut self) -> Score {
         1.0
     }
+
+    fn fill_scored_buffer_up_to(
+        &mut self,
+        horizon: DocId,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        self.fill_compact_scored_buffer_up_to(horizon, docs, scores)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AllQuery;
     use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
-    use crate::query::{AllScorer, EnableScoring, Query};
+    use crate::query::{AllScorer, EnableScoring, Query, Scorer, SCORE_BLOCK_LEN};
     use crate::schema::{Schema, TEXT};
     use crate::{Index, IndexWriter};
 
@@ -175,6 +207,41 @@ mod tests {
             assert_eq!(scorer.score(), 1.5);
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_fill_scored_buffer_with_horizon_and_partial_block() {
+        let mut scorer = AllScorer::new(SCORE_BLOCK_LEN as u32 + 6);
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+
+        assert_eq!(
+            scorer.fill_scored_buffer_up_to(3, &mut docs, &mut scores),
+            3
+        );
+        assert_eq!(&docs[..3], &[0, 1, 2]);
+        assert_eq!(&scores[..3], &[1.0; 3]);
+        assert_eq!(scorer.doc(), 3);
+        assert_eq!(
+            scorer.fill_scored_buffer(&mut docs, &mut scores),
+            SCORE_BLOCK_LEN
+        );
+        assert_eq!(docs[0], 3);
+        assert_eq!(docs[SCORE_BLOCK_LEN - 1], SCORE_BLOCK_LEN as u32 + 2);
+        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 3);
+        assert_eq!(
+            &docs[..3],
+            &[
+                SCORE_BLOCK_LEN as u32 + 3,
+                SCORE_BLOCK_LEN as u32 + 4,
+                SCORE_BLOCK_LEN as u32 + 5,
+            ]
+        );
+        assert_eq!(scorer.doc(), TERMINATED);
+
+        let mut empty = AllScorer::new(0);
+        assert_eq!(empty.fill_scored_buffer(&mut docs, &mut scores), 0);
+        assert_eq!(empty.advance(), TERMINATED);
     }
 
     #[test]

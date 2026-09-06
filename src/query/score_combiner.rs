@@ -13,6 +13,26 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
     /// see every matching term, so it must not be pruned this way.
     const SUPPORTS_BLOCK_WAND: bool = false;
 
+    /// Whether this combiner needs child scores while merging matches.
+    const REQUIRES_SCORING: bool;
+
+    /// Whether an exhaustive dense window can use its output scores as the native accumulator.
+    ///
+    /// This is intentionally limited to combiners whose complete state is one `Score` value.
+    #[doc(hidden)]
+    const ACCUMULATES_IN_DENSE_OUTPUT: bool = false;
+
+    /// Adds one child score directly to a dense output accumulator.
+    ///
+    /// Callers may invoke this only when [`Self::ACCUMULATES_IN_DENSE_OUTPUT`] is true.
+    #[doc(hidden)]
+    fn update_dense_output(_output: &mut Score, _score: Score) {
+        unreachable!("combiner does not accumulate directly in dense output")
+    }
+
+    /// Aggregates a precomputed score into this combiner.
+    fn update_score(&mut self, score: Score);
+
     /// Aggregates the score combiner with the given scorer.
     ///
     /// The `ScoreCombiner` may decide to call `.scorer.score()`
@@ -34,6 +54,10 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
 pub struct DoNothingCombiner;
 
 impl ScoreCombiner for DoNothingCombiner {
+    const REQUIRES_SCORING: bool = false;
+
+    fn update_score(&mut self, _score: Score) {}
+
     fn update<TScorer: Scorer>(&mut self, _scorer: &mut TScorer) {}
 
     fn clear(&mut self) {}
@@ -45,6 +69,7 @@ impl ScoreCombiner for DoNothingCombiner {
 }
 
 /// Sums the score of different scorers.
+#[repr(transparent)]
 #[derive(Default, Clone, Copy)]
 pub struct SumCombiner {
     score: Score,
@@ -52,9 +77,20 @@ pub struct SumCombiner {
 
 impl ScoreCombiner for SumCombiner {
     const SUPPORTS_BLOCK_WAND: bool = true;
+    const REQUIRES_SCORING: bool = true;
+    const ACCUMULATES_IN_DENSE_OUTPUT: bool = true;
+
+    #[inline]
+    fn update_dense_output(output: &mut Score, score: Score) {
+        *output += score;
+    }
+
+    fn update_score(&mut self, score: Score) {
+        self.score += score;
+    }
 
     fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) {
-        self.score += scorer.score();
+        self.update_score(scorer.score());
     }
 
     fn clear(&mut self) {
@@ -88,10 +124,15 @@ impl DisjunctionMaxCombiner {
 }
 
 impl ScoreCombiner for DisjunctionMaxCombiner {
-    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) {
-        let score = scorer.score();
+    const REQUIRES_SCORING: bool = true;
+
+    fn update_score(&mut self, score: Score) {
         self.max = Score::max(score, self.max);
         self.sum += score;
+    }
+
+    fn update<TScorer: Scorer>(&mut self, scorer: &mut TScorer) {
+        self.update_score(scorer.score());
     }
 
     fn clear(&mut self) {
@@ -102,5 +143,88 @@ impl ScoreCombiner for DisjunctionMaxCombiner {
     #[inline]
     fn score(&self) -> Score {
         self.max + (self.sum - self.max) * self.tie_breaker
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DisjunctionMaxCombiner, DoNothingCombiner, ScoreCombiner, SumCombiner};
+    use crate::query::Scorer;
+    use crate::{DocId, DocSet, Score, TERMINATED};
+
+    struct FixedScorer(Score);
+
+    impl DocSet for FixedScorer {
+        fn advance(&mut self) -> DocId {
+            TERMINATED
+        }
+
+        fn doc(&self) -> DocId {
+            0
+        }
+
+        fn size_hint(&self) -> u32 {
+            1
+        }
+    }
+
+    impl Scorer for FixedScorer {
+        fn score(&mut self) -> Score {
+            self.0
+        }
+    }
+
+    struct PanickingScorer;
+
+    impl DocSet for PanickingScorer {
+        fn advance(&mut self) -> DocId {
+            TERMINATED
+        }
+
+        fn doc(&self) -> DocId {
+            0
+        }
+
+        fn size_hint(&self) -> u32 {
+            1
+        }
+    }
+
+    impl Scorer for PanickingScorer {
+        fn score(&mut self) -> Score {
+            panic!("DoNothingCombiner must not score")
+        }
+    }
+
+    #[test]
+    fn test_sum_update_score_matches_scorer_update() {
+        let scores = [1.0, 0.25, 3.5, 2.0];
+        let mut from_scores = SumCombiner::default();
+        let mut from_scorers = SumCombiner::default();
+        for score in scores {
+            from_scores.update_score(score);
+            from_scorers.update(&mut FixedScorer(score));
+        }
+        assert_eq!(from_scores.score(), from_scorers.score());
+    }
+
+    #[test]
+    fn test_dismax_update_score_matches_scorer_update() {
+        let scores = [1.0, 0.25, 3.5, 2.0];
+        let mut from_scores = DisjunctionMaxCombiner::with_tie_breaker(0.3);
+        let mut from_scorers = DisjunctionMaxCombiner::with_tie_breaker(0.3);
+        for score in scores {
+            from_scores.update_score(score);
+            from_scorers.update(&mut FixedScorer(score));
+        }
+        assert_eq!(from_scores.score(), from_scorers.score());
+    }
+
+    #[test]
+    fn test_do_nothing_update_never_scores() {
+        let mut combiner = DoNothingCombiner;
+        combiner.update(&mut PanickingScorer);
+        combiner.update_score(42.0);
+        assert_eq!(combiner.score(), 1.0);
     }
 }
