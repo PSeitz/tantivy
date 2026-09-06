@@ -14,16 +14,50 @@ mod tests {
 
     use std::ops::Bound;
 
+    use common::TinySet;
+
     use super::*;
     use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
     use crate::collector::{Count, TopDocs};
+    use crate::query::score_combiner::DoNothingCombiner;
     use crate::query::term_query::TermScorer;
+    use crate::query::union::SimpleUnion;
     use crate::query::{
-        AllScorer, EmptyScorer, EnableScoring, Intersection, Occur, Query, QueryParser, RangeQuery,
-        RequiredOptionalScorer, Scorer, SumCombiner, TermQuery,
+        AllScorer, BufferedUnionScorer, EmptyScorer, EnableScoring, Intersection, Occur, Query,
+        QueryParser, RangeQuery, RequiredOptionalScorer, ScoredBatchConsumer, Scorer, SumCombiner,
+        TermQuery,
     };
     use crate::schema::*;
     use crate::{assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score};
+
+    #[derive(Default)]
+    struct RecordingScoredBatchConsumer {
+        compact_blocks: usize,
+        windows: usize,
+        docs: Vec<DocId>,
+    }
+
+    impl ScoredBatchConsumer for RecordingScoredBatchConsumer {
+        fn collect_scored_block(&mut self, docs: &[DocId], _scores: &[Score]) {
+            self.compact_blocks += 1;
+            self.docs.extend_from_slice(docs);
+        }
+
+        fn collect_scored_window(
+            &mut self,
+            base_doc: DocId,
+            match_tinysets: &[TinySet; 64],
+            _scores: &[Score; 4096],
+        ) {
+            self.windows += 1;
+            for (tinyset_idx, &tinyset) in match_tinysets.iter().enumerate() {
+                for bit in tinyset {
+                    self.docs
+                        .push(base_doc + (tinyset_idx * 64 + bit as usize) as DocId);
+                }
+            }
+        }
+    }
 
     fn aux_test_helper() -> crate::Result<(Index, Field)> {
         let mut schema_builder = Schema::builder();
@@ -41,6 +75,130 @@ mod tests {
             index_writer.commit()?;
         }
         Ok((index, text_field))
+    }
+
+    #[test]
+    fn test_flat_term_union_emits_dense_scored_windows() -> crate::Result<()> {
+        let (index, text_field) = aux_test_helper()?;
+        let query = QueryParser::for_index(&index, vec![text_field]).parse_query("a b")?;
+        let searcher = index.reader()?.searcher();
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        assert!(scorer.is::<BufferedUnionScorer<TermScorer, SumCombiner>>());
+        let mut consumer = RecordingScoredBatchConsumer::default();
+        weight.for_each_scored_batch(searcher.segment_reader(0), &mut consumer)?;
+
+        assert_eq!(consumer.compact_blocks, 0);
+        assert_eq!(consumer.windows, 1);
+        assert_eq!(consumer.docs, vec![0, 1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sparse_flat_term_union_compact_matches_scalar_exactly() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        for doc_id in 0..5_000 {
+            let text = match doc_id {
+                3 | 4_097 => "a",
+                100 => "a b",
+                2_049 => "b",
+                4_999 => "c",
+                _ => "x",
+            };
+            index_writer.add_document(doc!(text_field => text))?;
+        }
+        index_writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+        let query = QueryParser::for_index(&index, vec![text_field]).parse_query("a b c")?;
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let scorer = weight.scorer(reader, 1.0)?;
+        assert!(scorer.is::<SimpleUnion<TermScorer, SumCombiner>>());
+        let mut scalar = Vec::new();
+        weight.for_each(reader, &mut |doc, score| scalar.push((doc, score)))?;
+        let mut blocked = Vec::new();
+        weight.for_each_scored_block(reader, &mut |docs, scores| {
+            blocked.extend(docs.iter().copied().zip(scores.iter().copied()));
+        })?;
+
+        assert_eq!(blocked, scalar);
+        assert_eq!(
+            blocked.iter().map(|&(doc, _)| doc).collect::<Vec<_>>(),
+            [3, 100, 2_049, 4_097, 4_999]
+        );
+
+        let mut consumer = RecordingScoredBatchConsumer::default();
+        weight.for_each_scored_batch(reader, &mut consumer)?;
+        assert!(consumer.compact_blocks > 0);
+        assert_eq!(consumer.windows, 0);
+        assert_eq!(consumer.docs, [3, 100, 2_049, 4_097, 4_999]);
+
+        let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let scorer = weight.scorer(reader, 1.0)?;
+        assert!(scorer.is::<SimpleUnion<TermScorer, DoNothingCombiner>>());
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_sparse_term_union_is_simple_union() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        for doc_id in 0..5_000 {
+            let text = match doc_id {
+                3 | 4_097 => "a",
+                100 => "b rare",
+                2_049 => "c",
+                _ => "x",
+            };
+            index_writer.add_document(doc!(text_field => text))?;
+        }
+        index_writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+        let query =
+            QueryParser::for_index(&index, vec![text_field]).parse_query("+(a b c) +rare")?;
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        let intersection = scorer
+            .downcast_ref::<Intersection<Box<dyn Scorer>>>()
+            .expect("nested union should be a child of the intersection");
+        assert!(intersection.has_child::<SimpleUnion<TermScorer, SumCombiner>>());
+        assert!(!intersection.has_child::<BufferedUnionScorer<TermScorer, SumCombiner>>());
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_term_union_intersection_matches_scalar_exactly() -> crate::Result<()> {
+        let (index, text_field) = aux_test_helper()?;
+        let query_parser = QueryParser::for_index(&index, vec![text_field]);
+        let searcher = index.reader()?.searcher();
+        let reader = searcher.segment_reader(0);
+
+        for (query_text, expected_docs) in
+            [("+(a b) +c", vec![0, 1, 2, 3]), ("+(a b) +c +d", vec![3])]
+        {
+            let query = query_parser.parse_query(query_text)?;
+            let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            let mut scalar = Vec::new();
+            weight.for_each(reader, &mut |doc, score| scalar.push((doc, score)))?;
+            let mut blocked = Vec::new();
+            weight.for_each_scored_block(reader, &mut |docs, scores| {
+                blocked.extend(docs.iter().copied().zip(scores.iter().copied()));
+            })?;
+
+            assert_eq!(blocked, scalar);
+            assert_eq!(
+                blocked.iter().map(|&(doc, _)| doc).collect::<Vec<_>>(),
+                expected_docs
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -686,7 +844,7 @@ mod proptest_boolean_query {
     use proptest::collection::vec;
     use proptest::prelude::*;
 
-    use crate::collector::DocSetCollector;
+    use crate::collector::{Collector, DocSetCollector, SegmentCollector};
     use crate::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
     use crate::schema::{Field, NumericOptions, OwnedValue, Schema, TEXT};
     use crate::{DocId, Index, Term};
@@ -839,6 +997,177 @@ mod proptest_boolean_query {
             let result_docs: HashSet<DocId> =
                 doc_addresses.into_iter().map(|doc_address| doc_address.doc_id).collect();
             prop_assert_eq!(result_docs, matching_docs);
+        });
+    }
+
+    struct ScoredDocSetCollector;
+
+    struct ScoredDocSetSegmentCollector {
+        segment_ord: u32,
+        docs: HashSet<DocId>,
+    }
+
+    impl Collector for ScoredDocSetCollector {
+        type Fruit = HashSet<crate::DocAddress>;
+        type Child = ScoredDocSetSegmentCollector;
+
+        fn for_segment(
+            &self,
+            segment_ord: crate::SegmentOrdinal,
+            _reader: &crate::SegmentReader,
+        ) -> crate::Result<Self::Child> {
+            Ok(ScoredDocSetSegmentCollector {
+                segment_ord,
+                docs: HashSet::new(),
+            })
+        }
+
+        fn requires_scoring(&self) -> bool {
+            true
+        }
+
+        fn merge_fruits(
+            &self,
+            segment_fruits: Vec<(u32, HashSet<DocId>)>,
+        ) -> crate::Result<Self::Fruit> {
+            Ok(segment_fruits
+                .into_iter()
+                .flat_map(|(segment_ord, docs)| {
+                    docs.into_iter()
+                        .map(move |doc| crate::DocAddress::new(segment_ord, doc))
+                })
+                .collect())
+        }
+    }
+
+    impl SegmentCollector for ScoredDocSetSegmentCollector {
+        type Fruit = (u32, HashSet<DocId>);
+
+        fn collect(&mut self, doc: DocId, _score: crate::Score) {
+            self.docs.insert(doc);
+        }
+
+        fn harvest(self) -> Self::Fruit {
+            (self.segment_ord, self.docs)
+        }
+    }
+
+    const UNION_NUM_DOCS: DocId = 10_000;
+    const UNION_TOKEN_NAMES: [&str; 6] = [
+        "dense",
+        "frequent",
+        "periodic",
+        "sparsealpha",
+        "sparsebeta",
+        "sparsetail",
+    ];
+
+    #[derive(Clone, Debug)]
+    enum UnionQueryAST {
+        Leaf(usize),
+        Union(Vec<UnionQueryAST>),
+    }
+
+    impl UnionQueryAST {
+        fn matches(&self, doc: DocId) -> bool {
+            match self {
+                UnionQueryAST::Leaf(token) => token_matches(*token, doc),
+                UnionQueryAST::Union(children) => children.iter().any(|child| child.matches(doc)),
+            }
+        }
+
+        fn to_query(&self, field: Field) -> Box<dyn Query> {
+            match self {
+                UnionQueryAST::Leaf(token) => Box::new(TermQuery::new(
+                    Term::from_field_text(field, UNION_TOKEN_NAMES[*token]),
+                    crate::schema::IndexRecordOption::Basic,
+                )),
+                UnionQueryAST::Union(children) => Box::new(BooleanQuery::new(
+                    children
+                        .iter()
+                        .map(|child| (Occur::Should, child.to_query(field)))
+                        .collect(),
+                )),
+            }
+        }
+    }
+
+    fn token_matches(token: usize, doc: DocId) -> bool {
+        match token {
+            0 => doc % 3 == 0,
+            1 => doc % 5 <= 1,
+            2 => doc % 257 == 17,
+            // These gaps are deliberately larger than the buffered union's 4,096-doc window.
+            3 => matches!(doc, 10 | 9_001),
+            4 => matches!(doc, 63 | 4_700 | 9_990),
+            5 => matches!(doc, 8_500 | 9_999),
+            _ => unreachable!(),
+        }
+    }
+
+    fn create_sparse_union_index() -> (Index, Field) {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("tokens", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index.writer_for_tests().unwrap();
+
+        for doc in 0..UNION_NUM_DOCS {
+            let text = UNION_TOKEN_NAMES
+                .iter()
+                .enumerate()
+                .filter_map(|(token, name)| token_matches(token, doc).then_some(*name))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut document: BTreeMap<_, OwnedValue> = BTreeMap::default();
+            document.insert(field, text.into());
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().unwrap();
+        (index, field)
+    }
+
+    fn arb_union_query_ast() -> impl Strategy<Value = UnionQueryAST> {
+        (0..UNION_TOKEN_NAMES.len())
+            .prop_map(UnionQueryAST::Leaf)
+            .prop_recursive(4, 32, 6, |inner| {
+                vec(inner, 2..6).prop_map(UnionQueryAST::Union)
+            })
+    }
+
+    #[test]
+    fn proptest_real_index_buffered_union() {
+        let (index, field) = create_sparse_union_index();
+        let searcher = index.reader().unwrap().searcher();
+
+        proptest!(ProptestConfig::with_cases(32), |(generated in arb_union_query_ast())| {
+            // Keeping these two leaves in every generated tree makes a later refill see the
+            // sparse scorer already positioned beyond the next union window. `generated` makes
+            // the resulting unions flat or nested and adds other posting distributions.
+            let ast = UnionQueryAST::Union(vec![
+                UnionQueryAST::Leaf(0),
+                UnionQueryAST::Leaf(3),
+                generated,
+            ]);
+            let query = ast.to_query(field);
+            let expected: HashSet<DocId> = (0..UNION_NUM_DOCS)
+                .filter(|&doc| ast.matches(doc))
+                .collect();
+
+            let unscored_docs = searcher.search(&*query, &DocSetCollector).unwrap();
+            let unscored_result: HashSet<DocId> = unscored_docs
+                .into_iter()
+                .map(|address| address.doc_id)
+                .collect();
+            prop_assert_eq!(&unscored_result, &expected);
+
+            // This collector requests scores without enabling TopDocs' Block-WAND path, so it
+            // exercises the scored buffered-union refill.
+            let scored_docs = searcher.search(&*query, &ScoredDocSetCollector).unwrap();
+            let scored_result: HashSet<DocId> = scored_docs
+                .into_iter()
+                .map(|address| address.doc_id)
+                .collect();
+            prop_assert_eq!(scored_result, expected);
         });
     }
 }
