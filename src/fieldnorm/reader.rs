@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::{fieldnorm_to_id, id_to_fieldnorm};
 use crate::directory::{CompositeFile, FileSlice, OwnedBytes};
+use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::schema::{Field, Schema};
 use crate::space_usage::PerFieldSpaceUsage;
 use crate::DocId;
@@ -135,6 +136,47 @@ impl FieldNormReader {
         }
     }
 
+    /// Gathers fieldnorm IDs for `docs` into `output`.
+    #[inline(always)]
+    pub fn fieldnorm_ids(&self, docs: &[DocId], output: &mut [u8]) {
+        assert_eq!(docs.len(), output.len());
+        if docs.len() == COMPRESSION_BLOCK_SIZE {
+            return self.fieldnorm_ids_block(docs.try_into().unwrap(), output.try_into().unwrap());
+        }
+        match &self.0 {
+            ReaderImplEnum::FromData(data) => {
+                let fieldnorm_ids = data.as_slice();
+                for (&doc, output_id) in docs.iter().zip(output) {
+                    *output_id = fieldnorm_ids[doc as usize];
+                }
+            }
+            ReaderImplEnum::Const { fieldnorm_id, .. } => output.fill(*fieldnorm_id),
+        }
+    }
+
+    #[inline(never)]
+    fn fieldnorm_ids_block(
+        &self,
+        docs: &[DocId; COMPRESSION_BLOCK_SIZE],
+        output: &mut [u8; COMPRESSION_BLOCK_SIZE],
+    ) {
+        match &self.0 {
+            ReaderImplEnum::FromData(data) => {
+                let fieldnorm_ids = data.as_slice();
+                let mut doc_chunks = docs.chunks_exact(32);
+                let mut output_chunks = output.chunks_exact_mut(32);
+
+                debug_assert!(docs.iter().all(|doc| (*doc as usize) < fieldnorm_ids.len()));
+                for (docs, output) in doc_chunks.by_ref().zip(output_chunks.by_ref()) {
+                    for (doc, out) in docs.iter().zip(output.iter_mut()) {
+                        *out = unsafe { *fieldnorm_ids.get_unchecked(*doc as usize) };
+                    }
+                }
+            }
+            ReaderImplEnum::Const { fieldnorm_id, .. } => output.fill(*fieldnorm_id),
+        }
+    }
+
     /// Converts a `fieldnorm_id` into a fieldnorm.
     #[inline]
     pub fn id_to_fieldnorm(id: u8) -> u32 {
@@ -163,6 +205,7 @@ impl FieldNormReader {
 #[cfg(test)]
 mod tests {
     use crate::fieldnorm::FieldNormReader;
+    use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 
     #[test]
     fn test_from_fieldnorms_array() {
@@ -190,5 +233,22 @@ mod tests {
         assert_eq!(fieldnorm_reader.num_docs(), 1_000_000u32);
         assert_eq!(fieldnorm_reader.fieldnorm(0u32), 280u32);
         assert_eq!(fieldnorm_reader.fieldnorm_id(0u32), 72u8);
+    }
+
+    #[test]
+    fn test_fieldnorm_ids_gather() {
+        let fieldnorm_reader = FieldNormReader::for_test(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let mut output = [0; 10];
+        fieldnorm_reader.fieldnorm_ids(&[9, 8, 7, 6, 5, 4, 3, 2, 1, 0], &mut output);
+        assert_eq!(output, [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+
+        let block_docs: [u32; COMPRESSION_BLOCK_SIZE] = std::array::from_fn(|i| (i % 10) as u32);
+        let mut block_output = [0; COMPRESSION_BLOCK_SIZE];
+        fieldnorm_reader.fieldnorm_ids(&block_docs, &mut block_output);
+        assert_eq!(block_output, std::array::from_fn(|i| (i % 10 + 1) as u8));
+
+        let constant_reader = FieldNormReader::constant(10, 300);
+        constant_reader.fieldnorm_ids(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], &mut output);
+        assert_eq!(output, [72; 10]);
     }
 }

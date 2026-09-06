@@ -78,8 +78,7 @@ impl BlockEncoder {
 
 #[derive(Clone)]
 pub struct BlockDecoder {
-    bitpacker: BitPacker4x,
-    output: [u32; COMPRESSION_BLOCK_SIZE],
+    output: Box<[u32; COMPRESSION_BLOCK_SIZE]>,
     pub output_len: usize,
 }
 
@@ -92,8 +91,7 @@ impl Default for BlockDecoder {
 impl BlockDecoder {
     pub fn with_val(val: u32) -> BlockDecoder {
         BlockDecoder {
-            bitpacker: BitPacker4x::new(),
-            output: [val; COMPRESSION_BLOCK_SIZE],
+            output: Box::new([val; COMPRESSION_BLOCK_SIZE]),
             output_len: 0,
         }
     }
@@ -109,21 +107,39 @@ impl BlockDecoder {
         num_bits: u8,
         strict_delta: bool,
     ) -> usize {
+        self.output_len = COMPRESSION_BLOCK_SIZE;
+        Self::uncompress_block_sorted_into(
+            compressed_data,
+            offset,
+            num_bits,
+            strict_delta,
+            &mut self.output,
+        )
+    }
+
+    pub(crate) fn uncompress_block_sorted_into(
+        compressed_data: &[u8],
+        offset: u32,
+        num_bits: u8,
+        strict_delta: bool,
+        out: &mut [u32; COMPRESSION_BLOCK_SIZE],
+    ) -> usize {
+        let bitpacker = BitPacker4x::new();
         if strict_delta {
             let offset = std::num::NonZeroU32::new(offset).map(std::num::NonZeroU32::get);
-
-            self.output_len = COMPRESSION_BLOCK_SIZE;
-            self.bitpacker.decompress_strictly_sorted(
-                offset,
-                compressed_data,
-                &mut self.output,
-                num_bits,
-            )
+            bitpacker.decompress_strictly_sorted(offset, compressed_data, out, num_bits)
         } else {
-            self.output_len = COMPRESSION_BLOCK_SIZE;
-            self.bitpacker
-                .decompress_sorted(offset, compressed_data, &mut self.output, num_bits)
+            bitpacker.decompress_sorted(offset, compressed_data, out, num_bits)
         }
+    }
+
+    pub(crate) fn uncompress_vint_sorted_into(
+        compressed_data: &[u8],
+        offset: u32,
+        num_els: usize,
+        out: &mut [u32; COMPRESSION_BLOCK_SIZE],
+    ) -> usize {
+        vint::uncompress_sorted(compressed_data, &mut out[..num_els], offset)
     }
 
     /// Decompress block of unsorted integers.
@@ -138,15 +154,36 @@ impl BlockDecoder {
         minus_one_encoded: bool,
     ) -> usize {
         self.output_len = COMPRESSION_BLOCK_SIZE;
-        let res = self
-            .bitpacker
-            .decompress(compressed_data, &mut self.output, num_bits);
+        Self::uncompress_block_unsorted_into(
+            compressed_data,
+            num_bits,
+            minus_one_encoded,
+            &mut self.output,
+        )
+    }
+
+    pub(crate) fn uncompress_block_unsorted_into(
+        compressed_data: &[u8],
+        num_bits: u8,
+        minus_one_encoded: bool,
+        out: &mut [u32; COMPRESSION_BLOCK_SIZE],
+    ) -> usize {
+        let bitpacker = BitPacker4x::new();
+        let num_bytes = bitpacker.decompress(compressed_data, out, num_bits);
         if minus_one_encoded {
-            for val in &mut self.output {
+            for val in out {
                 *val += 1;
             }
         }
-        res
+        num_bytes
+    }
+
+    pub(crate) fn uncompress_vint_unsorted_into(
+        compressed_data: &[u8],
+        num_els: usize,
+        out: &mut [u32; COMPRESSION_BLOCK_SIZE],
+    ) -> usize {
+        vint::uncompress_unsorted(compressed_data, &mut out[..num_els])
     }
 
     #[inline]
@@ -263,7 +300,7 @@ impl VIntDecoder for BlockDecoder {
     }
 
     fn uncompress_vint_unsorted_until_end(&mut self, compressed_data: &[u8]) {
-        let num_els = vint::uncompress_unsorted_until_end(compressed_data, &mut self.output);
+        let num_els = vint::uncompress_unsorted_until_end(compressed_data, &mut self.output[..]);
         self.output_len = num_els;
     }
 }

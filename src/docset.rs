@@ -16,11 +16,41 @@ pub const TERMINATED: DocId = i32::MAX as u32;
 /// exactly this size as long as we can fill the buffer.
 pub const COLLECT_BLOCK_BUFFER_LEN: usize = 64;
 
-/// Number of `TinySet` (64-bit) buckets in a block used by [`DocSet::fill_bitset_block`].
+/// Default number of `TinySet` (64-bit) buckets used with [`DocSet::fill_bitset_block`].
 pub const BLOCK_NUM_TINYBITSETS: usize = 16;
 
-/// Number of doc IDs covered by one block: `BLOCK_NUM_TINYBITSETS * 64 = 1024`.
-pub const BLOCK_WINDOW: u32 = BLOCK_NUM_TINYBITSETS as u32 * 64;
+/// Inserts sorted document IDs into a bitset window.
+///
+/// # Panics
+/// `docs` must be non-empty.
+#[inline]
+pub(crate) fn insert_docs_into_bitset(docs: &[DocId], min_doc: DocId, bitsets: &mut [TinySet]) {
+    debug_assert!(!docs.is_empty());
+    debug_assert!(docs
+        .iter()
+        .all(|&doc| { doc >= min_doc && (doc - min_doc) as usize / 64 < bitsets.len() }));
+
+    let mut bucket = 0;
+    let mut bits = TinySet::empty();
+
+    for &doc in docs {
+        let delta = doc - min_doc;
+        let next_bucket = (delta / 64) as usize;
+        if next_bucket == bucket {
+            bits = bits.insert(delta % 64);
+        } else {
+            // SAFETY: all docs were checked to be within the bitset window above. Avoiding this
+            // bounds check matters when processing complete posting blocks.
+            let output = unsafe { bitsets.get_unchecked_mut(bucket) };
+            *output = output.union(bits);
+            bucket = next_bucket;
+            bits = TinySet::singleton(delta % 64);
+        }
+    }
+    // SAFETY: all docs were checked to be within the bitset window above.
+    let output = unsafe { bitsets.get_unchecked_mut(bucket) };
+    *output = output.union(bits);
+}
 
 /// Represents an iterable set of sorted doc ids.
 pub trait DocSet: Send {
@@ -168,27 +198,44 @@ pub trait DocSet: Send {
         self.size_hint() as u64
     }
 
-    /// Fills a bitmask representing which documents in `[min_doc, min_doc + BLOCK_WINDOW)` are
-    /// present in this docset.
+    /// Fills a bitmask representing which documents in `[min_doc, horizon)` are present in this
+    /// docset. `mask` must have enough 64-document buckets to cover the range.
     ///
-    /// The window is divided into `BLOCK_NUM_TINYBITSETS` buckets of 64 docs each.
-    /// Returns the next doc `>= min_doc + BLOCK_WINDOW`, or `TERMINATED` if exhausted.
-    fn fill_bitset_block(
-        &mut self,
-        min_doc: DocId,
-        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
-    ) -> DocId {
-        self.seek(min_doc);
-        let horizon = min_doc + BLOCK_WINDOW;
+    /// Returns the first document at or beyond `horizon`, or `TERMINATED` if exhausted.
+    fn fill_bitset_block(&mut self, min_doc: DocId, horizon: DocId, mask: &mut [TinySet]) -> DocId {
+        debug_assert!(horizon >= min_doc);
+        debug_assert!((horizon - min_doc) as usize <= mask.len() * 64);
+        if self.doc() < min_doc {
+            self.seek(min_doc);
+        }
+        let doc = self.doc();
+        if doc >= horizon {
+            return doc;
+        }
+
+        let first_delta = doc - min_doc;
+        let mut bucket = (first_delta / 64) as usize;
+        let mut bits = TinySet::singleton(first_delta % 64);
         loop {
-            let doc = self.doc();
+            let doc = self.advance();
             if doc >= horizon {
+                // SAFETY: `bucket` came from a document below `horizon`, and the mask was checked
+                // to cover the range.
+                let output = unsafe { mask.get_unchecked_mut(bucket) };
+                *output = output.union(bits);
                 return doc;
             }
+
             let delta = doc - min_doc;
-            mask[(delta / 64) as usize].insert_mut(delta % 64);
-            if self.advance() == TERMINATED {
-                return TERMINATED;
+            let next_bucket = (delta / 64) as usize;
+            if next_bucket == bucket {
+                bits = bits.insert(delta % 64);
+            } else {
+                // SAFETY: `doc < horizon` and the mask was checked to cover the range.
+                let output = unsafe { mask.get_unchecked_mut(bucket) };
+                *output = output.union(bits);
+                bucket = next_bucket;
+                bits = TinySet::singleton(delta % 64);
             }
         }
     }
@@ -256,12 +303,8 @@ impl DocSet for &mut dyn DocSet {
         (**self).fill_buffer(buffer)
     }
 
-    fn fill_bitset_block(
-        &mut self,
-        min_doc: DocId,
-        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
-    ) -> DocId {
-        (**self).fill_bitset_block(min_doc, mask)
+    fn fill_bitset_block(&mut self, min_doc: DocId, horizon: DocId, mask: &mut [TinySet]) -> DocId {
+        (**self).fill_bitset_block(min_doc, horizon, mask)
     }
 
     fn doc(&self) -> u32 {
@@ -306,13 +349,9 @@ impl<TDocSet: DocSet + ?Sized> DocSet for Box<TDocSet> {
         unboxed.fill_buffer(buffer)
     }
 
-    fn fill_bitset_block(
-        &mut self,
-        min_doc: DocId,
-        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
-    ) -> DocId {
+    fn fill_bitset_block(&mut self, min_doc: DocId, horizon: DocId, mask: &mut [TinySet]) -> DocId {
         let unboxed: &mut TDocSet = self.borrow_mut();
-        unboxed.fill_bitset_block(min_doc, mask)
+        unboxed.fill_bitset_block(min_doc, horizon, mask)
     }
 
     fn doc(&self) -> DocId {

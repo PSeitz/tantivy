@@ -180,6 +180,28 @@ impl Bm25Weight {
         self.weight * self.tf_factor(fieldnorm_id, term_freq)
     }
 
+    /// Computes BM25 scores for parallel fieldnorm-ID and term-frequency slices.
+    pub fn score_batch(&self, fieldnorm_ids: &[u8], term_freqs: &[u32], output: &mut [Score]) {
+        assert_eq!(fieldnorm_ids.len(), term_freqs.len());
+        assert_eq!(fieldnorm_ids.len(), output.len());
+        for ((&fieldnorm_id, &term_freq), output_score) in
+            fieldnorm_ids.iter().zip(term_freqs).zip(output)
+        {
+            *output_score = self.score(fieldnorm_id, term_freq);
+        }
+    }
+
+    /// Adds BM25 scores to `output` for parallel fieldnorm-ID and term-frequency slices.
+    pub fn add_scores_batch(&self, fieldnorm_ids: &[u8], term_freqs: &[u32], output: &mut [Score]) {
+        assert_eq!(fieldnorm_ids.len(), term_freqs.len());
+        assert_eq!(fieldnorm_ids.len(), output.len());
+        for ((&fieldnorm_id, &term_freq), output_score) in
+            fieldnorm_ids.iter().zip(term_freqs).zip(output)
+        {
+            *output_score += self.score(fieldnorm_id, term_freq);
+        }
+    }
+
     /// Compute the maximum possible BM25 score given this weight.
     pub fn max_score(&self) -> Score {
         self.score(255u8, 2_013_265_944)
@@ -236,5 +258,24 @@ mod tests {
     fn test_idf() {
         let score: Score = 2.0;
         assert_nearly_equals!(idf(1, 2), score.ln());
+    }
+
+    #[test]
+    fn test_score_batch_and_add_scores_batch() {
+        let weight = super::Bm25Weight::for_one_term(3, 10, 8.0);
+        let fieldnorm_ids = [1, 7, 12, 3];
+        let term_freqs = [1, 2, 5, 3];
+        let expected =
+            std::array::from_fn::<_, 4, _>(|i| weight.score(fieldnorm_ids[i], term_freqs[i]));
+
+        let mut scores = [0.0; 4];
+        weight.score_batch(&fieldnorm_ids, &term_freqs, &mut scores);
+        assert_eq!(scores, expected);
+
+        let mut added_scores = [1.0; 4];
+        weight.add_scores_batch(&fieldnorm_ids, &term_freqs, &mut added_scores);
+        for i in 0..4 {
+            assert_eq!(added_scores[i], 1.0 + expected[i]);
+        }
     }
 }

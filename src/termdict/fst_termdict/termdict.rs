@@ -190,6 +190,7 @@ impl TermDictionary {
     }
 
     /// Returns the number of terms in the dictionary.
+    #[inline]
     pub fn term_info_from_ord(&self, term_ord: TermOrdinal) -> TermInfo {
         self.term_info_store.get(term_ord)
     }

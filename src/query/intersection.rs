@@ -306,13 +306,16 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> 
 
         while next_base < TERMINATED {
             let base = next_base;
+            let horizon = base
+                .saturating_add(BLOCK_NUM_TINYBITSETS as DocId * 64)
+                .min(TERMINATED);
 
             // Fill lead bitmask.
             let mut mask = EMPTY_BLOCK;
-            next_base = next_base.max(self.left.fill_bitset_block(base, &mut mask));
+            next_base = next_base.max(self.left.fill_bitset_block(base, horizon, &mut mask));
 
             let mut tail_mask = EMPTY_BLOCK;
-            next_base = next_base.max(self.right.fill_bitset_block(base, &mut tail_mask));
+            next_base = next_base.max(self.right.fill_bitset_block(base, horizon, &mut tail_mask));
 
             if and_blocks_and_return_is_empty(&mut mask, &tail_mask) {
                 continue;
@@ -320,7 +323,7 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> Intersection<TDocSet, TOtherDocSet> 
             // AND with each additional tail.
             for other in &mut self.others {
                 let mut other_mask = EMPTY_BLOCK;
-                next_base = next_base.max(other.fill_bitset_block(base, &mut other_mask));
+                next_base = next_base.max(other.fill_bitset_block(base, horizon, &mut other_mask));
                 if and_blocks_and_return_is_empty(&mut mask, &other_mask) {
                     continue;
                 }

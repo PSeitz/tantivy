@@ -47,6 +47,12 @@ impl TinySet {
         TinySet(val)
     }
 
+    /// Creates a `TinySet` from its raw bit mask.
+    #[inline]
+    pub fn from_bits(bits: u64) -> TinySet {
+        TinySet(bits)
+    }
+
     /// An empty `TinySet` constant.
     pub const EMPTY: TinySet = TinySet(0u64);
 
@@ -85,6 +91,12 @@ impl TinySet {
     #[inline]
     pub fn len(self) -> u32 {
         self.0.count_ones()
+    }
+
+    /// Returns the raw bit mask backing this set.
+    #[inline]
+    pub fn bits(self) -> u64 {
+        self.0
     }
 
     /// Returns the intersection of `self` and `other`

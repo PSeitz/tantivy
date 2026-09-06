@@ -135,6 +135,7 @@ impl TermInfoStore {
         })
     }
 
+    #[inline]
     pub fn get(&self, term_ord: TermOrdinal) -> TermInfo {
         let block_id = (term_ord as usize) / BLOCK_LEN;
         let buffer = self.block_meta_bytes.as_slice();
