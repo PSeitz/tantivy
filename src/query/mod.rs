@@ -71,6 +71,8 @@ pub use self::term_query::TermQuery;
 pub use self::union::BufferedUnionScorer;
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
+#[doc(hidden)]
+pub use self::weight::ScoredBatchConsumer;
 pub use self::weight::Weight;
 
 #[cfg(test)]

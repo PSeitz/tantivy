@@ -3,7 +3,7 @@ use common::TinySet;
 use super::size_hint::estimate_intersection;
 use crate::docset::{DocSet, SeekDangerResult, BLOCK_NUM_TINYBITSETS, TERMINATED};
 use crate::query::term_query::TermScorer;
-use crate::query::{EmptyScorer, Scorer};
+use crate::query::{EmptyScorer, Scorer, SCORE_BLOCK_LEN};
 use crate::{DocId, Score};
 
 /// Returns the intersection scorer.
@@ -61,6 +61,15 @@ pub struct Intersection<TDocSet: DocSet, TOtherDocSet: DocSet = Box<dyn Scorer>>
     right: TDocSet,
     others: Vec<TOtherDocSet>,
     segment_num_docs: u32,
+}
+
+#[cfg(test)]
+impl Intersection<Box<dyn Scorer>> {
+    pub(crate) fn has_child<TScorer: Scorer + 'static>(&self) -> bool {
+        self.left.is::<TScorer>()
+            || self.right.is::<TScorer>()
+            || self.others.iter().any(|scorer| scorer.is::<TScorer>())
+    }
 }
 
 fn go_to_first_doc<TDocSet: DocSet>(docsets: &mut [TDocSet]) -> DocId {
@@ -250,7 +259,6 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
     }
 
     fn count_including_deleted(&mut self) -> u32 {
-        const DENSITY_THRESHOLD_INVERSE: u32 = 32;
         if self
             .left
             .size_hint()
@@ -269,6 +277,48 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
 }
 
 const EMPTY_BLOCK: [TinySet; BLOCK_NUM_TINYBITSETS] = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+const DENSITY_THRESHOLD_INVERSE: u32 = 32;
+
+/// Enumerates and scores a flat term intersection using seek convergence.
+///
+/// All traversal state is carried by the document IDs returned from `seek` and `advance`; the
+/// intersection never needs to query `doc` explicitly.
+pub(crate) fn for_each_term_intersection_seek_scored(
+    mut scorers: Vec<TermScorer>,
+    callback: &mut dyn FnMut(&[DocId], &[Score]),
+) {
+    debug_assert!(scorers.len() >= 2);
+    scorers.sort_by_key(DocSet::cost);
+
+    let mut docs = [0; SCORE_BLOCK_LEN];
+    let mut scores = [0.0; SCORE_BLOCK_LEN];
+    let mut len = 0;
+    let mut candidate = scorers[0].seek(0);
+
+    'converge: while candidate != TERMINATED {
+        for scorer_ord in 1..scorers.len() {
+            let follower_doc = scorers[scorer_ord].seek(candidate);
+            if follower_doc > candidate {
+                candidate = scorers[0].seek(follower_doc);
+                continue 'converge;
+            }
+        }
+
+        docs[len] = candidate;
+        scores[len] = (scorers[0].score() + scorers[1].score())
+            + scorers[2..].iter_mut().map(Scorer::score).sum::<Score>();
+        len += 1;
+        if len == SCORE_BLOCK_LEN {
+            callback(&docs, &scores);
+            len = 0;
+        }
+        candidate = scorers[0].advance();
+    }
+
+    if len != 0 {
+        callback(&docs[..len], &scores[..len]);
+    }
+}
 
 /// ANDs `other` into `mask` in-place. Returns `true` if the result is all zeros.
 #[inline]
@@ -355,13 +405,42 @@ where
 mod tests {
     use proptest::prelude::*;
 
-    use super::Intersection;
+    use super::{intersect_scorers, Intersection};
     use crate::collector::Count;
     use crate::docset::{DocSet, TERMINATED};
     use crate::postings::tests::test_skip_against_unoptimized;
-    use crate::query::{QueryParser, VecDocSet};
+    use crate::query::weight::for_each_scorer_scored_block;
+    use crate::query::{ConstScorer, QueryParser, VecDocSet};
     use crate::schema::{Schema, TEXT};
     use crate::Index;
+
+    #[test]
+    fn test_scored_blocks_preserve_score_association_and_zero_scores() {
+        let docs = vec![3_000, 5_000];
+        let scores = [2.0, 2.0, 1e20, -1e20, 3.0, 0.0];
+        let scorers = scores
+            .into_iter()
+            .map(|score| {
+                Box::new(ConstScorer::new(VecDocSet::from(docs.clone()), score))
+                    as Box<dyn crate::query::Scorer>
+            })
+            .collect();
+        let mut intersection = intersect_scorers(scorers, 6_000);
+        let mut actual = Vec::new();
+        for_each_scorer_scored_block(
+            intersection.as_mut(),
+            &mut |matched_docs, matched_scores| {
+                actual.extend(
+                    matched_docs
+                        .iter()
+                        .copied()
+                        .zip(matched_scores.iter().copied()),
+                );
+            },
+        );
+
+        assert_eq!(actual, vec![(3_000, 7.0), (5_000, 7.0)]);
+    }
 
     #[test]
     fn test_intersection() {

@@ -1,6 +1,9 @@
 use std::cmp::Ordering;
 
-use super::Scorer;
+use common::TinySet;
+use downcast_rs::{impl_downcast, Downcast};
+
+use super::{BufferedUnionScorer, ScoreCombiner, Scorer, SCORE_BLOCK_LEN};
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::query::Explanation;
@@ -16,6 +19,55 @@ pub(crate) fn for_each_scorer<TScorer: Scorer + ?Sized>(
     while doc != TERMINATED {
         callback(doc, scorer.score());
         doc = scorer.advance();
+    }
+}
+
+/// Iterates through aligned blocks of scored documents.
+pub(crate) fn for_each_scorer_scored_block<TScorer: Scorer + ?Sized>(
+    scorer: &mut TScorer,
+    callback: &mut dyn FnMut(&[DocId], &[Score]),
+) {
+    let mut docs = [0; SCORE_BLOCK_LEN];
+    let mut scores = [0.0; SCORE_BLOCK_LEN];
+    loop {
+        let len = scorer.fill_scored_buffer(&mut docs, &mut scores);
+        if len == 0 {
+            break;
+        }
+        callback(&docs[..len], &scores[..len]);
+    }
+}
+
+/// Compacts buffered union windows into parallel document and score buffers.
+pub(crate) fn for_each_buffered_scored_block<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
+    scorer: &mut BufferedUnionScorer<TScorer, TScoreCombiner>,
+    max_doc: DocId,
+    callback: &mut dyn FnMut(&[DocId], &[Score]),
+) {
+    let mut matches = [TinySet::EMPTY; 64];
+    let mut dense_scores = [0.0; 4096];
+    let mut docs = Vec::with_capacity(SCORE_BLOCK_LEN);
+    let mut scores = Vec::with_capacity(SCORE_BLOCK_LEN);
+    let mut start = 0;
+    while start < max_doc {
+        let end = start.saturating_add(SCORE_BLOCK_LEN as DocId).min(max_doc);
+        let next = scorer.fill_scored_window(start..end, &mut matches, &mut dense_scores);
+        for (bucket, bits) in matches.iter().enumerate() {
+            for bit in *bits {
+                let offset = bucket * 64 + bit as usize;
+                docs.push(start + offset as DocId);
+                scores.push(dense_scores[offset]);
+            }
+        }
+        if !docs.is_empty() {
+            callback(&docs, &scores);
+            docs.clear();
+            scores.clear();
+        }
+        if next == TERMINATED {
+            break;
+        }
+        start = next;
     }
 }
 
@@ -61,11 +113,53 @@ pub(crate) fn for_each_pruning_scorer<TScorer: Scorer + ?Sized>(
     }
 }
 
+/// Receives scored matches in either their conventional compact form or as a dense
+/// 4,096-document window.
+///
+/// This trait is an internal traversal contract. Its methods deliberately borrow their input only
+/// for the duration of each call, so producers can immediately reuse their buffers afterwards.
+#[doc(hidden)]
+pub trait ScoredBatchConsumer {
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]);
+
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    );
+}
+
+pub(crate) fn for_each_dense_scored_windows<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
+    scorer: &mut BufferedUnionScorer<TScorer, TScoreCombiner>,
+    max_doc: DocId,
+    consumer: &mut dyn ScoredBatchConsumer,
+) {
+    if max_doc == 0 {
+        return;
+    }
+
+    let mut matches = [TinySet::EMPTY; 64];
+    let mut dense_scores = [0.0; 4096];
+    let mut start = 0;
+    while start < max_doc {
+        let end = start.saturating_add(4096).min(max_doc);
+        let next = scorer.fill_scored_window(start..end, &mut matches, &mut dense_scores);
+        if matches.iter().any(|tinyset| !tinyset.is_empty()) {
+            consumer.collect_scored_window(start, &matches, &dense_scores);
+        }
+        if next == TERMINATED {
+            break;
+        }
+        start = next;
+    }
+}
+
 /// A Weight is the specialization of a `Query`
 /// for a given set of segments.
 ///
 /// See [`Query`](crate::query::Query).
-pub trait Weight: Send + Sync + 'static {
+pub trait Weight: Downcast + Send + Sync + 'static {
     /// Returns the scorer for the given segment.
     ///
     /// `boost` is a multiplier to apply to the score.
@@ -130,6 +224,32 @@ pub trait Weight: Send + Sync + 'static {
 
     /// Iterates through all of the document matched by the DocSet
     /// `DocSet` and push the scored documents to the collector.
+    fn for_each_scored_block(
+        &self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(&[DocId], &[Score]),
+    ) -> crate::Result<()> {
+        let mut scorer = self.scorer(reader, 1.0)?;
+        for_each_scorer_scored_block(scorer.as_mut(), callback);
+        Ok(())
+    }
+
+    /// Iterates through scored matches using the representation naturally produced by the query.
+    ///
+    /// The default implementation emits compact blocks. Queries backed by a dense window may
+    /// override this method without changing the collector-facing traversal API.
+    #[doc(hidden)]
+    fn for_each_scored_batch(
+        &self,
+        reader: &SegmentReader,
+        consumer: &mut dyn ScoredBatchConsumer,
+    ) -> crate::Result<()> {
+        self.for_each_scored_block(reader, &mut |docs, scores| {
+            consumer.collect_scored_block(docs, scores);
+        })
+    }
+
+    /// Iterates through blocks of matching document IDs without computing scores.
     fn for_each_no_score(
         &self,
         reader: &SegmentReader,
@@ -163,3 +283,5 @@ pub trait Weight: Send + Sync + 'static {
         Ok(())
     }
 }
+
+impl_downcast!(Weight);

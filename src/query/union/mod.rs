@@ -16,10 +16,12 @@ mod tests {
     use super::{SimpleUnion, *};
     use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
     use crate::postings::tests::test_skip_against_unoptimized;
-    use crate::query::score_combiner::DoNothingCombiner;
+    use crate::query::score_combiner::{
+        DisjunctionMaxCombiner, DoNothingCombiner, ScoreCombiner, SumCombiner,
+    };
     use crate::query::union::bitset_union::BitSetPostingUnion;
-    use crate::query::{BitSetDocSet, ConstScorer, VecDocSet};
-    use crate::{tests, DocId};
+    use crate::query::{BitSetDocSet, ConstScorer, Scorer, VecDocSet};
+    use crate::{tests, DocId, Score};
 
     fn vec_doc_set_from_docs_list(
         docs_list: &[Vec<DocId>],
@@ -52,6 +54,42 @@ mod tests {
             vec_doc_set_from_docs_list(docs_list).collect::<Vec<VecDocSet>>(),
         ))
     }
+
+    fn scored_docsets() -> Vec<ConstScorer<VecDocSet>> {
+        vec![
+            ConstScorer::new(VecDocSet::from(vec![1, 5, 9]), 1.0e20),
+            ConstScorer::new(VecDocSet::from(vec![1, 2, 9]), -1.0e20),
+            ConstScorer::new(VecDocSet::from(vec![1, 2, 7, 9]), 3.0),
+        ]
+    }
+
+    fn collect_scored(mut scorer: impl Scorer) -> Vec<(DocId, Score)> {
+        let mut docs_and_scores = Vec::new();
+        while scorer.doc() != TERMINATED {
+            docs_and_scores.push((scorer.doc(), scorer.score()));
+            scorer.advance();
+        }
+        docs_and_scores
+    }
+
+    fn assert_scored_simple_union_parity<TScoreCombiner: ScoreCombiner>(
+        make_combiner: impl Fn() -> TScoreCombiner,
+    ) {
+        let simple = SimpleUnion::build_scored(scored_docsets(), &make_combiner);
+        let buffered = BufferedUnionScorer::build(scored_docsets(), &make_combiner, 10);
+        assert_eq!(collect_scored(simple), collect_scored(buffered));
+    }
+
+    #[test]
+    fn test_scored_simple_union_sum_parity() {
+        assert_scored_simple_union_parity(SumCombiner::default);
+    }
+
+    #[test]
+    fn test_scored_simple_union_dis_max_parity() {
+        assert_scored_simple_union_parity(|| DisjunctionMaxCombiner::with_tie_breaker(0.3));
+    }
+
     fn bitset_from_docs_list(docs_list: &[Vec<DocId>]) -> BitSetDocSet {
         let max_doc = docs_list
             .iter()
