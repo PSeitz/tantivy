@@ -140,6 +140,17 @@ fn bench_agg(runner: &mut BenchRunner, searcher: &Searcher, execute_filtered: Ag
         ],
     ));
     groups.push((
+        "metrics_with_1%_term_query",
+        execute_filtered,
+        vec![
+            benchmark_config!(average_u64),
+            benchmark_config!(average_f64),
+            benchmark_config!(average_f64_u64),
+            benchmark_config!(stats_f64),
+            benchmark_config!(extendedstats_f64),
+        ],
+    ));
+    groups.push((
         "terms",
         execute_agg,
         vec![
