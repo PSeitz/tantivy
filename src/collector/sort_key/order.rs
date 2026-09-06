@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use columnar::MonotonicallyMappableToU64;
 use serde::{Deserialize, Serialize};
 
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::schema::{OwnedValue, Schema};
 use crate::{DocId, Order, Score};
 
@@ -69,6 +69,12 @@ fn compare_owned_value<const NULLS_FIRST: bool>(lhs: &OwnedValue, rhs: &OwnedVal
 pub trait Comparator<T>: Send + Sync + std::fmt::Debug + Default {
     /// Return the order between two values.
     fn compare(&self, lhs: &T, rhs: &T) -> Ordering;
+
+    /// Returns the sort order when it can be determined from this comparator.
+    #[doc(hidden)]
+    fn sort_order(&self) -> Option<Order> {
+        None
+    }
 }
 
 /// Compare values naturally (e.g. 1 < 2).
@@ -86,6 +92,11 @@ impl<T: PartialOrd> Comparator<T> for NaturalComparator {
     fn compare(&self, lhs: &T, rhs: &T) -> Ordering {
         lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
     }
+
+    #[inline(always)]
+    fn sort_order(&self) -> Option<Order> {
+        Some(Order::Desc)
+    }
 }
 
 /// A (partial) implementation of comparison for OwnedValue.
@@ -96,6 +107,11 @@ impl Comparator<OwnedValue> for NaturalComparator {
     #[inline(always)]
     fn compare(&self, lhs: &OwnedValue, rhs: &OwnedValue) -> Ordering {
         compare_owned_value::</* NULLS_FIRST= */ true>(lhs, rhs)
+    }
+
+    #[inline(always)]
+    fn sort_order(&self) -> Option<Order> {
+        Some(Order::Desc)
     }
 }
 
@@ -120,6 +136,11 @@ where NaturalComparator: Comparator<T>
     #[inline(always)]
     fn compare(&self, lhs: &T, rhs: &T) -> Ordering {
         NaturalComparator.compare(rhs, lhs)
+    }
+
+    #[inline(always)]
+    fn sort_order(&self) -> Option<Order> {
+        Some(Order::Asc)
     }
 }
 
@@ -306,6 +327,14 @@ where
             ComparatorEnum::Reverse => ReverseComparator.compare(lhs, rhs),
             ComparatorEnum::ReverseNoneLower => ReverseNoneIsLowerComparator.compare(lhs, rhs),
             ComparatorEnum::NaturalNoneHigher => NaturalNoneIsHigherComparator.compare(lhs, rhs),
+        }
+    }
+
+    #[inline(always)]
+    fn sort_order(&self) -> Option<Order> {
+        match self {
+            ComparatorEnum::Natural | ComparatorEnum::NaturalNoneHigher => Some(Order::Desc),
+            ComparatorEnum::Reverse | ComparatorEnum::ReverseNoneLower => Some(Order::Asc),
         }
     }
 }
@@ -506,6 +535,16 @@ where
         right: &Self::SegmentSortKey,
     ) -> Ordering {
         self.comparator.compare(left, right)
+    }
+
+    fn collect_scored_block<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        scores: &[Score],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        self.segment_sort_key_computer
+            .collect_scored_block(docs, scores, top_n_computer);
     }
 
     fn convert_segment_sort_key(&self, sort_key: Self::SegmentSortKey) -> Self::SortKey {

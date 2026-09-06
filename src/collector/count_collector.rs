@@ -1,3 +1,5 @@
+use common::TinySet;
+
 use super::Collector;
 use crate::collector::SegmentCollector;
 use crate::query::Weight;
@@ -77,6 +79,27 @@ impl SegmentCollector for SegmentCountCollector {
 
     fn collect(&mut self, _: DocId, _: Score) {
         self.count += 1;
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.count += docs.len();
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        assert_eq!(docs.len(), scores.len());
+        self.count += docs.len();
+    }
+
+    fn collect_scored_window(
+        &mut self,
+        _base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        _scores: &[Score; 4096],
+    ) {
+        self.count += match_tinysets
+            .iter()
+            .map(|tinyset| tinyset.len() as usize)
+            .sum::<usize>();
     }
 
     fn harvest(self) -> usize {

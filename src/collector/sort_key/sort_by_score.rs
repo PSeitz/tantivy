@@ -1,9 +1,157 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
-use crate::collector::sort_key::NaturalComparator;
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
-use crate::{DocAddress, DocId, Score};
+use common::TinySet;
+
+use crate::collector::sort_key::{Comparator, NaturalComparator};
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
+use crate::{DocAddress, DocId, Order, Score};
+
+#[inline]
+fn scores_gt_tinyset(scores: &[Score; 64], threshold: Score) -> TinySet {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the AArch64 baseline, and the function only reads the supplied
+        // 64-element score array.
+        return TinySet::from_bits(unsafe { scores_gt_mask_neon(scores, threshold) });
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // SAFETY: this branch is compiled only when AVX2 is enabled for the target.
+        return TinySet::from_bits(unsafe { scores_gt_mask_avx2(scores, threshold) });
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let mut matches = TinySet::EMPTY;
+        for (offset, &score) in scores.iter().enumerate() {
+            if score > threshold {
+                matches = matches.insert(offset as u32);
+            }
+        }
+        matches
+    }
+}
+
+#[inline]
+fn scores_lt_tinyset(scores: &[Score; 64], threshold: Score) -> TinySet {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the AArch64 baseline, and the function only reads the supplied
+        // 64-element score array.
+        return TinySet::from_bits(unsafe { scores_lt_mask_neon(scores, threshold) });
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // SAFETY: this branch is compiled only when AVX2 is enabled for the target.
+        return TinySet::from_bits(unsafe { scores_lt_mask_avx2(scores, threshold) });
+    }
+
+    #[allow(unreachable_code)]
+    {
+        let mut matches = TinySet::EMPTY;
+        for (offset, &score) in scores.iter().enumerate() {
+            if score < threshold {
+                matches = matches.insert(offset as u32);
+            }
+        }
+        matches
+    }
+}
+
+#[inline]
+fn competitive_scores_tinyset(
+    scores: &[Score; 64],
+    threshold: Score,
+    sort_order: Order,
+) -> TinySet {
+    match sort_order {
+        Order::Desc => scores_gt_tinyset(scores, threshold),
+        Order::Asc => scores_lt_tinyset(scores, threshold),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scores_gt_mask_neon(scores: &[Score; 64], threshold: Score) -> u64 {
+    use std::arch::aarch64::{
+        vaddvq_u32, vcgtq_f32, vdupq_n_f32, vld1q_f32, vld1q_u32, vmulq_u32, vshrq_n_u32,
+    };
+
+    let threshold = vdupq_n_f32(threshold);
+    let bit_weights = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+    let mut mask = 0u64;
+    for chunk in 0..8 {
+        let offset = chunk * 8;
+        let low_scores = vld1q_f32(scores.as_ptr().add(offset));
+        let high_scores = vld1q_f32(scores.as_ptr().add(offset + 4));
+        let low_bits = vshrq_n_u32::<31>(vcgtq_f32(low_scores, threshold));
+        let high_bits = vshrq_n_u32::<31>(vcgtq_f32(high_scores, threshold));
+        let low_mask = vaddvq_u32(vmulq_u32(low_bits, bit_weights));
+        let high_mask = vaddvq_u32(vmulq_u32(high_bits, bit_weights));
+        mask |= u64::from(low_mask | (high_mask << 4)) << offset;
+    }
+    mask
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scores_lt_mask_neon(scores: &[Score; 64], threshold: Score) -> u64 {
+    use std::arch::aarch64::{
+        vaddvq_u32, vcgtq_f32, vdupq_n_f32, vld1q_f32, vld1q_u32, vmulq_u32, vshrq_n_u32,
+    };
+
+    let threshold = vdupq_n_f32(threshold);
+    let bit_weights = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+    let mut mask = 0u64;
+    for chunk in 0..8 {
+        let offset = chunk * 8;
+        let low_scores = vld1q_f32(scores.as_ptr().add(offset));
+        let high_scores = vld1q_f32(scores.as_ptr().add(offset + 4));
+        let low_bits = vshrq_n_u32::<31>(vcgtq_f32(threshold, low_scores));
+        let high_bits = vshrq_n_u32::<31>(vcgtq_f32(threshold, high_scores));
+        let low_mask = vaddvq_u32(vmulq_u32(low_bits, bit_weights));
+        let high_mask = vaddvq_u32(vmulq_u32(high_bits, bit_weights));
+        mask |= u64::from(low_mask | (high_mask << 4)) << offset;
+    }
+    mask
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn scores_gt_mask_avx2(scores: &[Score; 64], threshold: Score) -> u64 {
+    use std::arch::x86_64::{
+        _mm256_cmp_ps, _mm256_loadu_ps, _mm256_movemask_ps, _mm256_set1_ps, _CMP_GT_OQ,
+    };
+
+    let threshold = _mm256_set1_ps(threshold);
+    let mut mask = 0u64;
+    for chunk in 0..8 {
+        let values = _mm256_loadu_ps(scores.as_ptr().add(chunk * 8));
+        let comparisons = _mm256_cmp_ps::<_CMP_GT_OQ>(values, threshold);
+        mask |= (_mm256_movemask_ps(comparisons) as u64) << (chunk * 8);
+    }
+    mask
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn scores_lt_mask_avx2(scores: &[Score; 64], threshold: Score) -> u64 {
+    use std::arch::x86_64::{
+        _mm256_cmp_ps, _mm256_loadu_ps, _mm256_movemask_ps, _mm256_set1_ps, _CMP_LT_OQ,
+    };
+
+    let threshold = _mm256_set1_ps(threshold);
+    let mut mask = 0u64;
+    for chunk in 0..8 {
+        let values = _mm256_loadu_ps(scores.as_ptr().add(chunk * 8));
+        let comparisons = _mm256_cmp_ps::<_CMP_LT_OQ>(values, threshold);
+        mask |= (_mm256_movemask_ps(comparisons) as u64) << (chunk * 8);
+    }
+    mask
+}
 
 /// Sort by similarity score.
 #[derive(Clone, Debug, Copy)]
@@ -74,6 +222,80 @@ impl SegmentSortKeyComputer for SortBySimilarityScore {
     #[inline(always)]
     fn segment_sort_key(&mut self, _doc: DocId, score: Score) -> Score {
         score
+    }
+
+    fn collect_scored_block<C: Comparator<Score>>(
+        &mut self,
+        docs: &[DocId],
+        scores: &[Score],
+        top_n_computer: &mut TopNComputer<Score, DocId, C>,
+    ) {
+        assert_eq!(docs.len(), scores.len());
+        let mut doc_chunks = docs.chunks_exact(64);
+        let mut score_chunks = scores.chunks_exact(64);
+        let sort_order = top_n_computer.sort_order();
+
+        for (docs, scores) in doc_chunks.by_ref().zip(score_chunks.by_ref()) {
+            if let Some(sort_order) = sort_order {
+                if let Some(threshold) = top_n_computer.threshold {
+                    let score_chunk: &[Score; 64] = scores.try_into().unwrap();
+                    for offset in competitive_scores_tinyset(score_chunk, threshold, sort_order) {
+                        let offset = offset as usize;
+                        top_n_computer.append_doc(docs[offset], scores[offset]);
+                    }
+                } else {
+                    for (&doc, &score) in docs.iter().zip(scores) {
+                        top_n_computer.append_doc(doc, score);
+                    }
+                }
+                continue;
+            }
+
+            for (&doc, &score) in docs.iter().zip(scores) {
+                top_n_computer.push(score, doc);
+            }
+        }
+
+        for (&doc, &score) in doc_chunks.remainder().iter().zip(score_chunks.remainder()) {
+            top_n_computer.push(score, doc);
+        }
+    }
+
+    fn collect_scored_window<C: Comparator<Score>>(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+        top_n_computer: &mut TopNComputer<Score, DocId, C>,
+    ) {
+        let sort_order = top_n_computer.sort_order();
+        for (tinyset_idx, &tinyset) in match_tinysets.iter().enumerate() {
+            let score_start = tinyset_idx * 64;
+            let candidates = if let (Some(sort_order), Some(threshold)) =
+                (sort_order, top_n_computer.threshold)
+            {
+                let score_chunk: &[Score; 64] =
+                    scores[score_start..score_start + 64].try_into().unwrap();
+                tinyset.intersect(competitive_scores_tinyset(
+                    score_chunk,
+                    threshold,
+                    sort_order,
+                ))
+            } else {
+                tinyset
+            };
+
+            for bit in candidates {
+                let score_offset = score_start + bit as usize;
+                let score = scores[score_offset];
+                let doc = base_doc + score_offset as DocId;
+                if sort_order.is_some() {
+                    top_n_computer.append_doc(doc, score);
+                } else {
+                    top_n_computer.push(score, doc);
+                }
+            }
+        }
     }
 
     fn convert_segment_sort_key(&self, score: Score) -> Score {
@@ -167,6 +389,42 @@ mod tests {
     use super::*;
     use crate::collector::sort_key::NaturalComparator;
     use crate::collector::TopNComputer;
+
+    #[test]
+    fn test_scores_gt_tinyset() {
+        let mut scores = [0.0; 64];
+        for (offset, score) in scores.iter_mut().enumerate() {
+            *score = offset as Score / 10.0;
+        }
+        scores[17] = Score::NAN;
+
+        let threshold = 3.1;
+        let expected = scores
+            .iter()
+            .enumerate()
+            .fold(0u64, |mask, (offset, score)| {
+                mask | (u64::from(*score > threshold) << offset)
+            });
+        assert_eq!(scores_gt_tinyset(&scores, threshold).bits(), expected);
+    }
+
+    #[test]
+    fn test_scores_lt_tinyset() {
+        let mut scores = [0.0; 64];
+        for (offset, score) in scores.iter_mut().enumerate() {
+            *score = offset as Score / 10.0;
+        }
+        scores[17] = Score::NAN;
+
+        let threshold = 3.1;
+        let expected = scores
+            .iter()
+            .enumerate()
+            .fold(0u64, |mask, (offset, score)| {
+                mask | (u64::from(*score < threshold) << offset)
+            });
+        assert_eq!(scores_lt_tinyset(&scores, threshold).bits(), expected);
+    }
 
     #[test]
     fn test_top_n_heap_zero_capacity() {

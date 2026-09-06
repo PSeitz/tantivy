@@ -617,17 +617,28 @@ where
         }
     }
 
+    /// Returns the sort order when it can be determined from the comparator.
+    #[inline]
+    pub(crate) fn sort_order(&self) -> Option<Order> {
+        self.comparator.sort_order()
+    }
+
+    /// Returns whether a sort key passes the collector's current threshold.
+    #[inline]
+    pub(crate) fn is_competitive(&self, sort_key: &TSortKey) -> bool {
+        self.threshold.as_ref().is_none_or(|threshold| {
+            self.comparator.compare(sort_key, threshold) == Ordering::Greater
+        })
+    }
+
     /// Push a new document to the top n.
     /// If the document is below the current threshold, it will be ignored.
     ///
     /// NOTE: `push` must be called in ascending `DocId`/`DocAddress` order.
     #[inline]
     pub fn push(&mut self, sort_key: TSortKey, doc: D) {
-        if let Some(last_median) = &self.threshold {
-            // See the struct docs for an explanation of why this comparison is strict.
-            if self.comparator.compare(&sort_key, last_median) != Ordering::Greater {
-                return;
-            }
+        if !self.is_competitive(&sort_key) {
+            return;
         }
         self.append_doc(doc, sort_key);
     }

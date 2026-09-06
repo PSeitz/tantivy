@@ -1,11 +1,11 @@
 use columnar::{BytesColumn, Column};
 
 use super::*;
-use crate::query::{AllQuery, QueryParser};
-use crate::schema::{Schema, FAST, TEXT};
+use crate::query::{AllQuery, EnableScoring, Query, QueryParser, TermQuery};
+use crate::schema::{IndexRecordOption, Schema, FAST, STRING, TEXT};
 use crate::time::format_description::well_known::Rfc3339;
 use crate::time::OffsetDateTime;
-use crate::{DateTime, DocAddress, Index, Searcher, TantivyDocument};
+use crate::{DateTime, DocAddress, Index, Searcher, TantivyDocument, Term};
 
 pub const TEST_COLLECTOR_WITH_SCORE: TestCollector = TestCollector {
     compute_score: true,
@@ -305,5 +305,198 @@ fn test_option_collector_none() -> crate::Result<()> {
     let none_collector: Option<Count> = None;
     let counts = searcher.search(&AllQuery, &none_collector)?;
     assert_eq!(counts, None);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ScoredBlockCollector;
+
+struct ScoredBlockSegmentCollector {
+    block_lengths: Vec<usize>,
+}
+
+impl Collector for ScoredBlockCollector {
+    type Fruit = Vec<usize>;
+    type Child = ScoredBlockSegmentCollector;
+
+    fn for_segment(
+        &self,
+        _segment_id: SegmentOrdinal,
+        _reader: &SegmentReader,
+    ) -> crate::Result<Self::Child> {
+        Ok(ScoredBlockSegmentCollector {
+            block_lengths: Vec::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn merge_fruits(&self, children: Vec<Self::Fruit>) -> crate::Result<Self::Fruit> {
+        Ok(children.into_iter().flatten().collect())
+    }
+}
+
+impl SegmentCollector for ScoredBlockSegmentCollector {
+    type Fruit = Vec<usize>;
+
+    fn collect(&mut self, _doc: DocId, _score: Score) {
+        panic!("scored block forwarding fell back to scalar collection")
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        assert_eq!(docs.len(), scores.len());
+        self.block_lengths.push(docs.len());
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        self.block_lengths
+    }
+}
+
+fn make_all_query_searcher(num_docs: usize) -> crate::Result<Searcher> {
+    let schema = Schema::builder().build();
+    let index = Index::create_in_ram(schema);
+    let mut writer = index.writer_for_tests()?;
+    for _ in 0..num_docs {
+        writer.add_document(TantivyDocument::default())?;
+    }
+    writer.commit()?;
+    Ok(index.reader()?.searcher())
+}
+
+#[test]
+fn test_scored_block_forwarding_for_option_tuples_and_multi_collector() -> crate::Result<()> {
+    let searcher = make_all_query_searcher(crate::query::SCORE_BLOCK_LEN * 2 + 2)?;
+    let expected = vec![
+        crate::query::SCORE_BLOCK_LEN,
+        crate::query::SCORE_BLOCK_LEN,
+        2,
+    ];
+
+    assert_eq!(
+        searcher.search(&AllQuery, &Some(ScoredBlockCollector))?,
+        Some(expected.clone())
+    );
+
+    let pair = searcher.search(&AllQuery, &(ScoredBlockCollector, ScoredBlockCollector))?;
+    assert_eq!(pair, (expected.clone(), expected.clone()));
+
+    let triple = searcher.search(
+        &AllQuery,
+        &(
+            ScoredBlockCollector,
+            ScoredBlockCollector,
+            ScoredBlockCollector,
+        ),
+    )?;
+    assert_eq!(
+        triple,
+        (expected.clone(), expected.clone(), expected.clone())
+    );
+
+    let quadruple = searcher.search(
+        &AllQuery,
+        &(
+            ScoredBlockCollector,
+            ScoredBlockCollector,
+            ScoredBlockCollector,
+            ScoredBlockCollector,
+        ),
+    )?;
+    assert_eq!(
+        quadruple,
+        (
+            expected.clone(),
+            expected.clone(),
+            expected.clone(),
+            expected.clone()
+        )
+    );
+
+    let mut collectors = MultiCollector::new();
+    let first = collectors.add_collector(ScoredBlockCollector);
+    let second = collectors.add_collector(ScoredBlockCollector);
+    let mut fruits = searcher.search(&AllQuery, &collectors)?;
+    assert_eq!(first.extract(&mut fruits), expected.clone());
+    assert_eq!(second.extract(&mut fruits), expected);
+    Ok(())
+}
+
+fn assert_weight_scalar_block_parity(query: &dyn Query, searcher: &Searcher) -> crate::Result<()> {
+    let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+    for reader in searcher.segment_readers() {
+        let mut scalar = Vec::new();
+        weight.for_each(reader, &mut |doc, score| scalar.push((doc, score)))?;
+
+        let mut blocked = Vec::new();
+        weight.for_each_scored_block(reader, &mut |docs, scores| {
+            assert_eq!(docs.len(), scores.len());
+            blocked.extend(docs.iter().copied().zip(scores.iter().copied()));
+        })?;
+        assert_eq!(blocked, scalar);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_scored_blocks_tuple_and_multi_parity_with_segments_and_deletes() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let text = schema_builder.add_text_field("text", TEXT);
+    let id = schema_builder.add_text_field("id", STRING);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    let mut writer = index.writer_for_tests()?;
+
+    for doc_id in 0..150 {
+        let body = if doc_id % 3 == 0 {
+            "alpha beta beta"
+        } else if doc_id % 2 == 0 {
+            "alpha"
+        } else {
+            "beta"
+        };
+        writer.add_document(doc!(text => body, id => format!("doc-{doc_id}")))?;
+        if doc_id == 79 {
+            writer.commit()?;
+        }
+    }
+    writer.commit()?;
+    for deleted_doc in [0, 31, 63, 79, 80, 100, 149] {
+        writer.delete_term(Term::from_field_text(id, &format!("doc-{deleted_doc}")));
+    }
+    writer.commit()?;
+
+    let searcher = index.reader()?.searcher();
+    assert_eq!(searcher.segment_readers().len(), 2);
+    let parser = QueryParser::for_index(&index, vec![text]);
+    let union_query = parser.parse_query("alpha OR beta")?;
+    let term_query = TermQuery::new(
+        Term::from_field_text(text, "alpha"),
+        IndexRecordOption::WithFreqs,
+    );
+    assert_weight_scalar_block_parity(&term_query, &searcher)?;
+    assert_weight_scalar_block_parity(union_query.as_ref(), &searcher)?;
+
+    let standalone_count = searcher.search(union_query.as_ref(), &Count)?;
+    let standalone_top = searcher.search(
+        union_query.as_ref(),
+        &TopDocs::with_limit(50).order_by_score(),
+    )?;
+    let (tuple_count, tuple_top) = searcher.search(
+        union_query.as_ref(),
+        &(Count, TopDocs::with_limit(50).order_by_score()),
+    )?;
+    assert_eq!(tuple_count, standalone_count);
+    assert_eq!(tuple_count, 143);
+    assert_eq!(tuple_top, standalone_top);
+
+    let mut collectors = MultiCollector::new();
+    let count_handle = collectors.add_collector(Count);
+    let top_handle = collectors.add_collector(TopDocs::with_limit(50).order_by_score());
+    let mut fruits = searcher.search(union_query.as_ref(), &collectors)?;
+    assert_eq!(count_handle.extract(&mut fruits), standalone_count);
+    assert_eq!(top_handle.extract(&mut fruits), standalone_top);
     Ok(())
 }

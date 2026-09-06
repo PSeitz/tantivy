@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use common::TinySet;
+
 use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
 use crate::collector::{default_collect_segment_impl, SegmentCollector as _, TopNComputer};
@@ -43,6 +45,48 @@ pub trait SegmentSortKeyComputer: 'static {
     ) {
         let sort_key = self.segment_sort_key(doc, score);
         top_n_computer.push(sort_key, doc);
+    }
+
+    /// Computes sort keys for a block of documents and collects them.
+    fn collect_scored_block<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        scores: &[Score],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        assert_eq!(docs.len(), scores.len());
+        let mut doc_chunks = docs.chunks_exact(4);
+        let mut score_chunks = scores.chunks_exact(4);
+        for (docs, scores) in doc_chunks.by_ref().zip(score_chunks.by_ref()) {
+            self.compute_sort_key_and_collect(docs[0], scores[0], top_n_computer);
+            self.compute_sort_key_and_collect(docs[1], scores[1], top_n_computer);
+            self.compute_sort_key_and_collect(docs[2], scores[2], top_n_computer);
+            self.compute_sort_key_and_collect(docs[3], scores[3], top_n_computer);
+        }
+        for (&doc, &score) in doc_chunks.remainder().iter().zip(score_chunks.remainder()) {
+            self.compute_sort_key_and_collect(doc, score, top_n_computer);
+        }
+    }
+
+    /// Collects matches from a dense score window. Sort-key implementations that can compare the
+    /// dense scores directly with their Top-K threshold may override this method.
+    fn collect_scored_window<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        for (tinyset_idx, &tinyset) in match_tinysets.iter().enumerate() {
+            for bit in tinyset {
+                let score_offset = tinyset_idx * 64 + bit as usize;
+                self.compute_sort_key_and_collect(
+                    base_doc + score_offset as DocId,
+                    scores[score_offset],
+                    top_n_computer,
+                );
+            }
+        }
     }
 
     /// A SegmentSortKeyComputer maps to a SegmentSortKey, but it can also decide on
@@ -309,6 +353,16 @@ where
     ) {
         self.sort_key_computer
             .compute_sort_key_and_collect(doc, score, top_n_computer);
+    }
+
+    fn collect_scored_block<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        scores: &[Score],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        self.sort_key_computer
+            .collect_scored_block(docs, scores, top_n_computer);
     }
 
     fn convert_segment_sort_key(&self, segment_sort_key: Self::SegmentSortKey) -> Self::SortKey {

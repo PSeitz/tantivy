@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use common::TinySet;
+
 use crate::collector::sort_key::{Comparator, SegmentSortKeyComputer, SortKeyComputer};
 use crate::collector::{Collector, SegmentCollector, TopNComputer};
 use crate::query::Weight;
@@ -116,6 +118,25 @@ where
         self.segment_sort_key_computer.compute_sort_key_and_collect(
             doc,
             score,
+            &mut self.topn_computer,
+        );
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        self.segment_sort_key_computer
+            .collect_scored_block(docs, scores, &mut self.topn_computer);
+    }
+
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    ) {
+        self.segment_sort_key_computer.collect_scored_window(
+            base_doc,
+            match_tinysets,
+            scores,
             &mut self.topn_computer,
         );
     }

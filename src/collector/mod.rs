@@ -81,6 +81,7 @@
 //!
 //! See the `custom_collector` example.
 
+use common::TinySet;
 use downcast_rs::impl_downcast;
 
 use crate::schema::Schema;
@@ -108,7 +109,8 @@ mod sort_key_top_collector;
 pub use self::sort_key::{SegmentSortKeyComputer, SortKeyComputer};
 mod facet_collector;
 pub use self::facet_collector::{FacetCollector, FacetCounts};
-use crate::query::Weight;
+use crate::fastfield::AliveBitSet;
+use crate::query::{ScoredBatchConsumer, Weight, SCORE_BLOCK_LEN};
 
 mod docset_collector;
 pub use self::docset_collector::DocSetCollector;
@@ -183,39 +185,88 @@ pub trait Collector: Sync + Send {
     }
 }
 
+struct SegmentCollectorScoredBatchConsumer<'a, TSegmentCollector> {
+    segment_collector: &'a mut TSegmentCollector,
+    alive_bitset: Option<&'a AliveBitSet>,
+}
+
+impl<TSegmentCollector: SegmentCollector> ScoredBatchConsumer
+    for SegmentCollectorScoredBatchConsumer<'_, TSegmentCollector>
+{
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        assert_eq!(docs.len(), scores.len());
+        if let Some(alive_bitset) = self.alive_bitset {
+            let mut alive_docs = [0; SCORE_BLOCK_LEN];
+            let mut alive_scores = [0.0; SCORE_BLOCK_LEN];
+            let mut len = 0;
+            for (&doc, &score) in docs.iter().zip(scores) {
+                if alive_bitset.is_alive(doc) {
+                    alive_docs[len] = doc;
+                    alive_scores[len] = score;
+                    len += 1;
+                }
+            }
+            if len > 0 {
+                self.segment_collector
+                    .collect_scored_block(&alive_docs[..len], &alive_scores[..len]);
+            }
+        } else {
+            self.segment_collector.collect_scored_block(docs, scores);
+        }
+    }
+
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    ) {
+        if let Some(alive_bitset) = self.alive_bitset {
+            let mut live_match_tinysets = [TinySet::EMPTY; 64];
+            for (tinyset_idx, &tinyset) in match_tinysets.iter().enumerate() {
+                for bit in tinyset {
+                    let doc = base_doc + (tinyset_idx * 64 + bit as usize) as DocId;
+                    if alive_bitset.is_alive(doc) {
+                        live_match_tinysets[tinyset_idx] =
+                            live_match_tinysets[tinyset_idx].insert(bit);
+                    }
+                }
+            }
+            self.segment_collector
+                .collect_scored_window(base_doc, &live_match_tinysets, scores);
+        } else {
+            self.segment_collector
+                .collect_scored_window(base_doc, match_tinysets, scores);
+        }
+    }
+}
+
 pub(crate) fn default_collect_segment_impl<TSegmentCollector: SegmentCollector>(
     segment_collector: &mut TSegmentCollector,
     weight: &dyn Weight,
     reader: &SegmentReader,
     with_scoring: bool,
 ) -> crate::Result<()> {
-    match (reader.alive_bitset(), with_scoring) {
-        (Some(alive_bitset), true) => {
-            weight.for_each(reader, &mut |doc, score| {
+    if with_scoring {
+        let mut consumer = SegmentCollectorScoredBatchConsumer {
+            segment_collector,
+            alive_bitset: reader.alive_bitset(),
+        };
+        return weight.for_each_scored_batch(reader, &mut consumer);
+    }
+
+    if let Some(alive_bitset) = reader.alive_bitset() {
+        weight.for_each_no_score(reader, &mut |docs| {
+            for doc in docs.iter().cloned() {
                 if alive_bitset.is_alive(doc) {
-                    segment_collector.collect(doc, score);
+                    segment_collector.collect(doc, 0.0);
                 }
-            })?;
-        }
-        (Some(alive_bitset), false) => {
-            weight.for_each_no_score(reader, &mut |docs| {
-                for doc in docs.iter().cloned() {
-                    if alive_bitset.is_alive(doc) {
-                        segment_collector.collect(doc, 0.0);
-                    }
-                }
-            })?;
-        }
-        (None, true) => {
-            weight.for_each(reader, &mut |doc, score| {
-                segment_collector.collect(doc, score);
-            })?;
-        }
-        (None, false) => {
-            weight.for_each_no_score(reader, &mut |docs| {
-                segment_collector.collect_block(docs);
-            })?;
-        }
+            }
+        })?;
+    } else {
+        weight.for_each_no_score(reader, &mut |docs| {
+            segment_collector.collect_block(docs);
+        })?;
     }
     Ok(())
 }
@@ -232,6 +283,23 @@ impl<TSegmentCollector: SegmentCollector> SegmentCollector for Option<TSegmentCo
     fn collect_block(&mut self, docs: &[DocId]) {
         if let Some(segment_collector) = self {
             segment_collector.collect_block(docs);
+        }
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        if let Some(segment_collector) = self {
+            segment_collector.collect_scored_block(docs, scores);
+        }
+    }
+
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    ) {
+        if let Some(segment_collector) = self {
+            segment_collector.collect_scored_window(base_doc, match_tinysets, scores);
         }
     }
 
@@ -312,6 +380,30 @@ pub trait SegmentCollector: 'static {
         }
     }
 
+    /// Collects aligned blocks of document IDs and scores.
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        assert_eq!(docs.len(), scores.len());
+        for (&doc, &score) in docs.iter().zip(scores) {
+            self.collect(doc, score);
+        }
+    }
+
+    /// Collects a dense score window. Only offsets selected by `match_tinysets` are matches;
+    /// scores at all other offsets are unspecified.
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    ) {
+        for (tinyset_idx, &tinyset) in match_tinysets.iter().enumerate() {
+            for bit in tinyset {
+                let score_offset = tinyset_idx * 64 + bit as usize;
+                self.collect(base_doc + score_offset as DocId, scores[score_offset]);
+            }
+        }
+    }
+
     /// Extract the fruit of the collection from the `SegmentCollector`.
     fn harvest(self) -> Self::Fruit;
 }
@@ -379,6 +471,23 @@ where
     fn collect_block(&mut self, docs: &[DocId]) {
         self.0.collect_block(docs);
         self.1.collect_block(docs);
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        self.0.collect_scored_block(docs, scores);
+        self.1.collect_scored_block(docs, scores);
+    }
+
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    ) {
+        self.0
+            .collect_scored_window(base_doc, match_tinysets, scores);
+        self.1
+            .collect_scored_window(base_doc, match_tinysets, scores);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -457,6 +566,26 @@ where
         self.0.collect_block(docs);
         self.1.collect_block(docs);
         self.2.collect_block(docs);
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        self.0.collect_scored_block(docs, scores);
+        self.1.collect_scored_block(docs, scores);
+        self.2.collect_scored_block(docs, scores);
+    }
+
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    ) {
+        self.0
+            .collect_scored_window(base_doc, match_tinysets, scores);
+        self.1
+            .collect_scored_window(base_doc, match_tinysets, scores);
+        self.2
+            .collect_scored_window(base_doc, match_tinysets, scores);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {
@@ -547,6 +676,29 @@ where
         self.1.collect_block(docs);
         self.2.collect_block(docs);
         self.3.collect_block(docs);
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        self.0.collect_scored_block(docs, scores);
+        self.1.collect_scored_block(docs, scores);
+        self.2.collect_scored_block(docs, scores);
+        self.3.collect_scored_block(docs, scores);
+    }
+
+    fn collect_scored_window(
+        &mut self,
+        base_doc: DocId,
+        match_tinysets: &[TinySet; 64],
+        scores: &[Score; 4096],
+    ) {
+        self.0
+            .collect_scored_window(base_doc, match_tinysets, scores);
+        self.1
+            .collect_scored_window(base_doc, match_tinysets, scores);
+        self.2
+            .collect_scored_window(base_doc, match_tinysets, scores);
+        self.3
+            .collect_scored_window(base_doc, match_tinysets, scores);
     }
 
     fn harvest(self) -> <Self as SegmentCollector>::Fruit {

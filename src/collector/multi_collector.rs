@@ -67,6 +67,11 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
         self.as_mut().collect_block(docs);
     }
 
+    #[inline]
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        self.as_mut().collect_scored_block(docs, scores);
+    }
+
     fn harvest(self) -> Box<dyn Fruit> {
         BoxableSegmentCollector::harvest_from_box(self)
     }
@@ -77,6 +82,12 @@ pub trait BoxableSegmentCollector {
     fn collect_block(&mut self, docs: &[DocId]) {
         for &doc in docs {
             self.collect(doc, 0.0);
+        }
+    }
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        assert_eq!(docs.len(), scores.len());
+        for (&doc, &score) in docs.iter().zip(scores) {
+            self.collect(doc, score);
         }
     }
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit>;
@@ -94,6 +105,10 @@ impl<TSegmentCollector: SegmentCollector> BoxableSegmentCollector
     #[inline]
     fn collect_block(&mut self, docs: &[DocId]) {
         self.0.collect_block(docs);
+    }
+    #[inline]
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        self.0.collect_scored_block(docs, scores);
     }
 
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit> {
@@ -265,6 +280,12 @@ impl SegmentCollector for MultiCollectorChild {
     fn collect_block(&mut self, docs: &[DocId]) {
         for child in &mut self.children {
             child.collect_block(docs);
+        }
+    }
+
+    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
+        for child in &mut self.children {
+            child.collect_scored_block(docs, scores);
         }
     }
 
