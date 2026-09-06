@@ -162,16 +162,26 @@ impl IntermediateStats {
 
     #[inline]
     pub(in crate::aggregation::metric) fn collect(&mut self, value: f64) {
+        self.collect_specialized::<STATS_ALL>(value);
+    }
+
+    #[inline]
+    fn collect_specialized<const STATS: u8>(&mut self, value: f64) {
         self.count += 1;
 
-        // kahan algorithm for sum
-        let y = value - self.delta;
-        let t = self.sum + y;
-        self.delta = (t - self.sum) - y;
-        self.sum = t;
-
-        self.min = self.min.min(value);
-        self.max = self.max.max(value);
+        if STATS & STATS_SUM != 0 {
+            // Kahan algorithm for sum.
+            let y = value - self.delta;
+            let t = self.sum + y;
+            self.delta = (t - self.sum) - y;
+            self.sum = t;
+        }
+        if STATS & STATS_MIN != 0 {
+            self.min = self.min.min(value);
+        }
+        if STATS & STATS_MAX != 0 {
+            self.max = self.max.max(value);
+        }
     }
 }
 
@@ -197,10 +207,31 @@ pub enum StatsType {
     Percentiles,
 }
 
+// Count is always maintained, including for empty-result handling in sum/min/max.
+const STATS_COUNT: u8 = 0;
+const STATS_SUM: u8 = 1;
+const STATS_MIN: u8 = 2;
+const STATS_MAX: u8 = 4;
+const STATS_ALL: u8 = STATS_SUM | STATS_MIN | STATS_MAX;
+
 fn create_collector<const TYPE_ID: u8>(
     req: &MetricAggReqData,
 ) -> Box<dyn SegmentAggregationCollector> {
-    Box::new(SegmentStatsCollector::<TYPE_ID> {
+    match req.collecting_for {
+        StatsType::Average | StatsType::Sum => {
+            create_specialized_collector::<TYPE_ID, STATS_SUM>(req)
+        }
+        StatsType::Count => create_specialized_collector::<TYPE_ID, STATS_COUNT>(req),
+        StatsType::Min => create_specialized_collector::<TYPE_ID, STATS_MIN>(req),
+        StatsType::Max => create_specialized_collector::<TYPE_ID, STATS_MAX>(req),
+        _ => create_specialized_collector::<TYPE_ID, STATS_ALL>(req),
+    }
+}
+
+fn create_specialized_collector<const TYPE_ID: u8, const STATS: u8>(
+    req: &MetricAggReqData,
+) -> Box<dyn SegmentAggregationCollector> {
+    Box::new(SegmentStatsCollector::<TYPE_ID, STATS> {
         name: req.name.clone(),
         collecting_for: req.collecting_for,
         is_number_or_date_type: req.is_number_or_date_type,
@@ -210,7 +241,7 @@ fn create_collector<const TYPE_ID: u8>(
     })
 }
 
-/// Build a concrete `SegmentStatsCollector` depending on the column type.
+/// Build a concrete `SegmentStatsCollector` depending on the column and aggregation types.
 pub(crate) fn build_segment_stats_collector(
     req: &MetricAggReqData,
 ) -> crate::Result<Box<dyn SegmentAggregationCollector>> {
@@ -228,7 +259,7 @@ pub(crate) fn build_segment_stats_collector(
 
 #[repr(C)]
 #[derive(Clone, Debug)]
-pub(crate) struct SegmentStatsCollector<const COLUMN_TYPE_ID: u8> {
+pub(crate) struct SegmentStatsCollector<const COLUMN_TYPE_ID: u8, const STATS: u8> {
     pub(crate) missing_u64: Option<u64>,
     pub(crate) accessor: Column<u64>,
     pub(crate) is_number_or_date_type: bool,
@@ -237,8 +268,8 @@ pub(crate) struct SegmentStatsCollector<const COLUMN_TYPE_ID: u8> {
     pub(crate) collecting_for: StatsType,
 }
 
-impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
-    for SegmentStatsCollector<COLUMN_TYPE_ID>
+impl<const COLUMN_TYPE_ID: u8, const STATS: u8> SegmentAggregationCollector
+    for SegmentStatsCollector<COLUMN_TYPE_ID, STATS>
 {
     #[inline]
     fn add_intermediate_aggregation_result(
@@ -292,7 +323,7 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         // value, so the substitute would be silently dropped.
         // TODO: remove once we fetch all values for all bucket ids in one go
         if docs.len() == 1 && self.missing_u64.is_none() {
-            collect_stats::<COLUMN_TYPE_ID>(
+            collect_stats::<COLUMN_TYPE_ID, STATS>(
                 &mut self.buckets[parent_bucket_id as usize],
                 self.accessor.values_for_doc(docs[0]),
                 self.is_number_or_date_type,
@@ -305,7 +336,7 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
             &self.accessor,
             self.missing_u64,
         );
-        collect_stats_slice::<COLUMN_TYPE_ID>(
+        collect_stats_slice::<COLUMN_TYPE_ID, STATS>(
             &mut self.buckets[parent_bucket_id as usize],
             agg_data.column_block_accessor.values(),
             self.is_number_or_date_type,
@@ -362,7 +393,8 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
     }
 }
 
-/// Reduces a contiguous block of raw column values into `stats`.
+/// Reduces a contiguous block of raw column values into the statistics selected by `STATS`.
+/// Count is always maintained; unrequested sum/min/max operations are compiled out.
 ///
 /// Uses `LANES` independent (sum, delta) Kahan accumulators and `LANES` min/max
 /// accumulators so the per-element dependency chain of the serial Kahan sum is broken,
@@ -371,15 +403,19 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
 /// [`IntermediateStats::merge_fruits`], so accuracy is preserved (the summation order
 /// differs, exactly as it already does across segment merges).
 #[inline]
-fn collect_stats_slice<const COLUMN_TYPE_ID: u8>(
+fn collect_stats_slice<const COLUMN_TYPE_ID: u8, const STATS: u8>(
     stats: &mut IntermediateStats,
     vals: &[u64],
     is_number_or_date_type: bool,
 ) {
+    if STATS == STATS_COUNT {
+        stats.count += vals.len() as u64;
+        return;
+    }
     if !is_number_or_date_type {
         // Non-numeric: only the presence of a value matters (preserve existing behavior).
         for _ in 0..vals.len() {
-            stats.collect(0.0);
+            stats.collect_specialized::<STATS>(0.0);
         }
         return;
     }
@@ -394,55 +430,63 @@ fn collect_stats_slice<const COLUMN_TYPE_ID: u8>(
     for chunk in chunks.by_ref() {
         for lane in 0..LANES {
             let val = convert_to_f64::<COLUMN_TYPE_ID>(chunk[lane]);
-            // Per-lane Kahan summation.
-            let y = val - delta[lane];
-            let t = sum[lane] + y;
-            delta[lane] = (t - sum[lane]) - y;
-            sum[lane] = t;
-            min[lane] = min[lane].min(val);
-            max[lane] = max[lane].max(val);
+            if STATS & STATS_SUM != 0 {
+                // Per-lane Kahan summation.
+                let y = val - delta[lane];
+                let t = sum[lane] + y;
+                delta[lane] = (t - sum[lane]) - y;
+                sum[lane] = t;
+            }
+            if STATS & STATS_MIN != 0 {
+                min[lane] = min[lane].min(val);
+            }
+            if STATS & STATS_MAX != 0 {
+                max[lane] = max[lane].max(val);
+            }
         }
     }
 
-    stats.count += vals.len() as u64;
+    stats.count += (vals.len() - chunks.remainder().len()) as u64;
 
-    // Merge the lanes into `stats`.
+    // Merge only the requested statistics; unused lanes are optimized away.
     for lane in 0..LANES {
-        let y = sum[lane] - (stats.delta + delta[lane]);
-        let t = stats.sum + y;
-        stats.delta = (t - stats.sum) - y;
-        stats.sum = t;
-        stats.min = stats.min.min(min[lane]);
-        stats.max = stats.max.max(max[lane]);
+        if STATS & STATS_SUM != 0 {
+            let y = sum[lane] - (stats.delta + delta[lane]);
+            let t = stats.sum + y;
+            stats.delta = (t - stats.sum) - y;
+            stats.sum = t;
+        }
+        if STATS & STATS_MIN != 0 {
+            stats.min = stats.min.min(min[lane]);
+        }
+        if STATS & STATS_MAX != 0 {
+            stats.max = stats.max.max(max[lane]);
+        }
     }
 
-    // Tail (fewer than LANES values) — fold directly into `stats` (count already added).
+    // Tail (fewer than LANES values) — fold directly into `stats`.
     for &raw in chunks.remainder() {
-        let val = convert_to_f64::<COLUMN_TYPE_ID>(raw);
-        let y = val - stats.delta;
-        let t = stats.sum + y;
-        stats.delta = (t - stats.sum) - y;
-        stats.sum = t;
-        stats.min = stats.min.min(val);
-        stats.max = stats.max.max(val);
+        stats.collect_specialized::<STATS>(convert_to_f64::<COLUMN_TYPE_ID>(raw));
     }
 }
 
 #[inline]
-fn collect_stats<const COLUMN_TYPE_ID: u8>(
+fn collect_stats<const COLUMN_TYPE_ID: u8, const STATS: u8>(
     stats: &mut IntermediateStats,
     vals: impl Iterator<Item = u64>,
     is_number_or_date_type: bool,
 ) -> crate::Result<()> {
-    if is_number_or_date_type {
+    if STATS == STATS_COUNT {
+        stats.count += vals.count() as u64;
+    } else if is_number_or_date_type {
         for val in vals {
             let val1 = convert_to_f64::<COLUMN_TYPE_ID>(val);
-            stats.collect(val1);
+            stats.collect_specialized::<STATS>(val1);
         }
     } else {
         for _val in vals {
             // we ignore the value and simply record that we got something
-            stats.collect(0.0);
+            stats.collect_specialized::<STATS>(0.0);
         }
     }
 
