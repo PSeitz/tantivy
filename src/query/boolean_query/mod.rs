@@ -14,8 +14,6 @@ mod tests {
 
     use std::ops::Bound;
 
-    use common::TinySet;
-
     use super::*;
     use crate::collector::tests::TEST_COLLECTOR_WITH_SCORE;
     use crate::collector::{Count, TopDocs};
@@ -24,8 +22,8 @@ mod tests {
     use crate::query::union::SimpleUnion;
     use crate::query::{
         AllScorer, BufferedUnionScorer, EmptyScorer, EnableScoring, Intersection, Occur, Query,
-        QueryParser, RangeQuery, RequiredOptionalScorer, ScoredBatchConsumer, Scorer, SumCombiner,
-        TermQuery,
+        QueryParser, RangeQuery, RequiredOptionalScorer, ScoredBatch, ScoredBatchConsumer, Scorer,
+        SumCombiner, TermQuery,
     };
     use crate::schema::*;
     use crate::{assert_nearly_equals, DocAddress, DocId, Index, IndexWriter, Score};
@@ -35,25 +33,30 @@ mod tests {
         compact_blocks: usize,
         windows: usize,
         docs: Vec<DocId>,
+        scores: Vec<Score>,
     }
 
     impl ScoredBatchConsumer for RecordingScoredBatchConsumer {
-        fn collect_scored_block(&mut self, docs: &[DocId], _scores: &[Score]) {
-            self.compact_blocks += 1;
-            self.docs.extend_from_slice(docs);
-        }
-
-        fn collect_scored_window(
-            &mut self,
-            base_doc: DocId,
-            match_tinysets: &[TinySet; 64],
-            _scores: &[Score; 4096],
-        ) {
-            self.windows += 1;
-            for (tinyset_idx, &tinyset) in match_tinysets.iter().enumerate() {
-                for bit in tinyset {
-                    self.docs
-                        .push(base_doc + (tinyset_idx * 64 + bit as usize) as DocId);
+        fn consume(&mut self, batch: ScoredBatch<'_>) {
+            match batch {
+                ScoredBatch::Sparse { docs, scores } => {
+                    self.compact_blocks += 1;
+                    self.docs.extend_from_slice(docs);
+                    self.scores.extend_from_slice(scores);
+                }
+                ScoredBatch::Dense {
+                    base_doc,
+                    words,
+                    scores,
+                } => {
+                    self.windows += 1;
+                    for (bucket, bits) in words.iter().enumerate() {
+                        for bit in *bits {
+                            let offset = bucket * 64 + bit as usize;
+                            self.docs.push(base_doc + offset as DocId);
+                            self.scores.push(scores[offset]);
+                        }
+                    }
                 }
             }
         }
@@ -91,6 +94,11 @@ mod tests {
         assert_eq!(consumer.compact_blocks, 0);
         assert_eq!(consumer.windows, 1);
         assert_eq!(consumer.docs, vec![0, 1, 2, 3]);
+        let mut scalar_scores = Vec::new();
+        weight.for_each(searcher.segment_reader(0), &mut |_, score| {
+            scalar_scores.push(score)
+        })?;
+        assert_eq!(consumer.scores, scalar_scores);
         Ok(())
     }
 
@@ -136,6 +144,10 @@ mod tests {
         assert!(consumer.compact_blocks > 0);
         assert_eq!(consumer.windows, 0);
         assert_eq!(consumer.docs, [3, 100, 2_049, 4_097, 4_999]);
+        assert_eq!(
+            consumer.scores,
+            scalar.iter().map(|&(_, score)| score).collect::<Vec<_>>()
+        );
 
         let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
         let scorer = weight.scorer(reader, 1.0)?;

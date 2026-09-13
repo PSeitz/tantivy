@@ -441,6 +441,60 @@ fn assert_weight_scalar_block_parity(query: &dyn Query, searcher: &Searcher) -> 
 }
 
 #[test]
+fn test_scored_batch_reuse_and_deletions() {
+    let alive = AliveBitSet::for_test_from_deleted_docs(&[5, 4_159], 4_170);
+    for alive_bitset in [None, Some(&alive)] {
+        let mut sparse = TestSegmentCollector {
+            segment_id: 0,
+            fruit: TestFruit::default(),
+        };
+        let mut dense = TestSegmentCollector {
+            segment_id: 0,
+            fruit: TestFruit::default(),
+        };
+        let mut words = [TinySet::EMPTY; 64];
+        let mut scores = [Score::NAN; 4096];
+        let mut expected_docs = Vec::new();
+        let mut expected_scores = Vec::new();
+        for base_doc in [0, 4096] {
+            words.fill(TinySet::EMPTY);
+            let docs = [base_doc, base_doc + 5, base_doc + 63, base_doc + 73];
+            let packed_scores = [0.0, 1.0, 2.0, 3.0];
+            for (&doc, &score) in docs.iter().zip(&packed_scores) {
+                let offset = (doc - base_doc) as usize;
+                words[offset / 64].insert_mut((offset % 64) as u32);
+                scores[offset] = score;
+                if alive_bitset.is_none_or(|alive| alive.is_alive(doc)) {
+                    expected_docs.push(DocAddress::new(0, doc));
+                    expected_scores.push(score);
+                }
+            }
+            SegmentCollectorScoredBatchConsumer {
+                segment_collector: &mut sparse,
+                alive_bitset,
+            }
+            .consume(ScoredBatch::Sparse {
+                docs: &docs,
+                scores: &packed_scores,
+            });
+            SegmentCollectorScoredBatchConsumer {
+                segment_collector: &mut dense,
+                alive_bitset,
+            }
+            .consume(ScoredBatch::Dense {
+                base_doc,
+                words: &words,
+                scores: &scores,
+            });
+        }
+        for fruit in [sparse.harvest(), dense.harvest()] {
+            assert_eq!(fruit.docs(), expected_docs);
+            assert_eq!(fruit.scores(), expected_scores);
+        }
+    }
+}
+
+#[test]
 fn test_scored_blocks_tuple_and_multi_parity_with_segments_and_deletes() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
     let text = schema_builder.add_text_field("text", TEXT);

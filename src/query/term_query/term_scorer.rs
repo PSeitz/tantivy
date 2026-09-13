@@ -7,7 +7,7 @@ use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
-use crate::query::{Explanation, ScoredBlockOutput, Scorer, SCORE_BLOCK_LEN};
+use crate::query::{Explanation, ScoredBatch, ScoredBlockOutput, Scorer, SCORE_BLOCK_LEN};
 use crate::{DocId, Score};
 
 #[derive(Clone)]
@@ -239,7 +239,7 @@ impl Scorer for TermScorer {
         &mut self,
         min_doc: DocId,
         horizon: DocId,
-        output: &mut dyn ScoredBlockOutput,
+        cb: &mut dyn ScoredBlockOutput,
     ) -> DocId {
         let mut fieldnorm_ids = [0; COMPRESSION_BLOCK_SIZE];
         let fieldnorm_reader = &self.fieldnorm_reader;
@@ -253,7 +253,7 @@ impl Scorer for TermScorer {
                 fieldnorm_reader.fieldnorm_ids(docs, fieldnorm_ids);
                 similarity_weight.score_batch(fieldnorm_ids, term_freqs, scores);
             },
-            |docs, scores| output.update_docs(docs, scores),
+            |docs, scores| cb.update(ScoredBatch::Sparse { docs, scores }),
         )
     }
 

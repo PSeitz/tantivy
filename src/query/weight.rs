@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use common::TinySet;
 use downcast_rs::{impl_downcast, Downcast};
 
-use super::{BufferedUnionScorer, ScoreCombiner, Scorer, SCORE_BLOCK_LEN};
+use super::{BufferedUnionScorer, ScoreCombiner, ScoredBatch, Scorer, SCORE_BLOCK_LEN};
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::query::Explanation;
@@ -116,18 +116,11 @@ pub(crate) fn for_each_pruning_scorer<TScorer: Scorer + ?Sized>(
 /// Receives scored matches in either their conventional compact form or as a dense
 /// 4,096-document window.
 ///
-/// This trait is an internal traversal contract. Its methods deliberately borrow their input only
-/// for the duration of each call, so producers can immediately reuse their buffers afterwards.
+/// This trait is an internal traversal contract. The callback borrows its input only for the
+/// duration of the call. Producers retain ownership of buffer reset and reuse afterwards.
 #[doc(hidden)]
 pub trait ScoredBatchConsumer {
-    fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]);
-
-    fn collect_scored_window(
-        &mut self,
-        base_doc: DocId,
-        match_tinysets: &[TinySet; 64],
-        scores: &[Score; 4096],
-    );
+    fn consume(&mut self, batch: ScoredBatch<'_>);
 }
 
 pub(crate) fn for_each_dense_scored_windows<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
@@ -146,7 +139,11 @@ pub(crate) fn for_each_dense_scored_windows<TScorer: Scorer, TScoreCombiner: Sco
         let end = start.saturating_add(4096).min(max_doc);
         let next = scorer.fill_scored_window(start..end, &mut matches, &mut dense_scores);
         if matches.iter().any(|tinyset| !tinyset.is_empty()) {
-            consumer.collect_scored_window(start, &matches, &dense_scores);
+            consumer.consume(ScoredBatch::Dense {
+                base_doc: start,
+                words: &matches,
+                scores: &dense_scores,
+            });
         }
         if next == TERMINATED {
             break;
@@ -245,7 +242,7 @@ pub trait Weight: Downcast + Send + Sync + 'static {
         consumer: &mut dyn ScoredBatchConsumer,
     ) -> crate::Result<()> {
         self.for_each_scored_block(reader, &mut |docs, scores| {
-            consumer.collect_scored_block(docs, scores);
+            consumer.consume(ScoredBatch::Sparse { docs, scores });
         })
     }
 

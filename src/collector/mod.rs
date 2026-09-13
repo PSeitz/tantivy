@@ -110,7 +110,7 @@ pub use self::sort_key::{SegmentSortKeyComputer, SortKeyComputer};
 mod facet_collector;
 pub use self::facet_collector::{FacetCollector, FacetCounts};
 use crate::fastfield::AliveBitSet;
-use crate::query::{ScoredBatchConsumer, Weight, SCORE_BLOCK_LEN};
+use crate::query::{ScoredBatch, ScoredBatchConsumer, Weight, SCORE_BLOCK_LEN};
 
 mod docset_collector;
 pub use self::docset_collector::DocSetCollector;
@@ -192,6 +192,21 @@ struct SegmentCollectorScoredBatchConsumer<'a, TSegmentCollector> {
 
 impl<TSegmentCollector: SegmentCollector> ScoredBatchConsumer
     for SegmentCollectorScoredBatchConsumer<'_, TSegmentCollector>
+{
+    fn consume(&mut self, batch: ScoredBatch<'_>) {
+        match batch {
+            ScoredBatch::Sparse { docs, scores } => self.collect_scored_block(docs, scores),
+            ScoredBatch::Dense {
+                base_doc,
+                words,
+                scores,
+            } => self.collect_scored_window(base_doc, words, scores),
+        }
+    }
+}
+
+impl<TSegmentCollector: SegmentCollector>
+    SegmentCollectorScoredBatchConsumer<'_, TSegmentCollector>
 {
     fn collect_scored_block(&mut self, docs: &[DocId], scores: &[Score]) {
         assert_eq!(docs.len(), scores.len());

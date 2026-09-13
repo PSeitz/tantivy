@@ -4,7 +4,7 @@ use downcast_rs::impl_downcast;
 
 use crate::docset::{DocSet, TERMINATED};
 use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
-use crate::query::ScoredBlockOutput;
+use crate::query::{ScoredBatch, ScoredBlockOutput};
 use crate::{DocId, Score};
 
 /// Number of documents scored by one scored-buffer operation.
@@ -65,7 +65,7 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
     ///
     /// Like [`DocSet::fill_bitset_block`], this seeks forward to `min_doc` if necessary.
     /// Submits each matching document exactly once, in increasing order, as document-ID or
-    /// bitset batches. Zero-scored matches are included. The output must cover the requested
+    /// bitset batches. Zero-scored matches are included. The callback must cover the requested
     /// interval and owns initialization, combining, and clearing of its accumulators.
     ///
     /// Consumes the entire interval and returns the first remaining document at or beyond
@@ -75,7 +75,7 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
         &mut self,
         min_doc: DocId,
         horizon: DocId,
-        output: &mut dyn ScoredBlockOutput,
+        cb: &mut dyn ScoredBlockOutput,
     ) -> DocId {
         assert!(min_doc <= horizon && horizon <= TERMINATED);
         if self.doc() < min_doc {
@@ -85,7 +85,10 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
         let mut scores = [0.0; COMPRESSION_BLOCK_SIZE];
         while self.doc() < horizon {
             let range = self.fill_scored_buffer_range_up_to(horizon, &mut docs, &mut scores);
-            output.update_docs(&docs[range.clone()], &scores[range]);
+            cb.update(ScoredBatch::Sparse {
+                docs: &docs[range.clone()],
+                scores: &scores[range],
+            });
         }
         self.doc()
     }
@@ -152,10 +155,10 @@ impl Scorer for Box<dyn Scorer> {
         &mut self,
         min_doc: DocId,
         horizon: DocId,
-        output: &mut dyn ScoredBlockOutput,
+        cb: &mut dyn ScoredBlockOutput,
     ) -> DocId {
         self.deref_mut()
-            .fill_scored_bitset_block(min_doc, horizon, output)
+            .fill_scored_bitset_block(min_doc, horizon, cb)
     }
 
     #[inline]

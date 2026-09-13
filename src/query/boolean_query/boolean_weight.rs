@@ -17,7 +17,7 @@ use crate::query::weight::{
 };
 use crate::query::{
     intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
-    RequiredOptionalScorer, ScoredBatchConsumer, Scorer, Weight,
+    RequiredOptionalScorer, ScoredBatch, ScoredBatchConsumer, Scorer, Weight,
 };
 use crate::{DocId, DocSet, Score, TERMINATED};
 
@@ -709,7 +709,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
                     let mut union_scorer =
                         SimpleUnion::build_scored(scorers, &self.score_combiner_fn);
                     for_each_scorer_scored_block(&mut union_scorer, &mut |docs, scores| {
-                        consumer.collect_scored_block(docs, scores)
+                        consumer.consume(ScoredBatch::Sparse { docs, scores })
                     });
                 }
                 UnionStrategy::Buffered => {
@@ -723,12 +723,12 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             },
             SpecializedScorer::TermIntersection(term_scorers) => {
                 for_each_term_intersection_scored(term_scorers, &mut |docs, scores| {
-                    consumer.collect_scored_block(docs, scores)
+                    consumer.consume(ScoredBatch::Sparse { docs, scores })
                 });
             }
             SpecializedScorer::Other(mut scorer) => {
                 for_each_scorer_scored_block(scorer.as_mut(), &mut |docs, scores| {
-                    consumer.collect_scored_block(docs, scores)
+                    consumer.consume(ScoredBatch::Sparse { docs, scores })
                 });
             }
         }
