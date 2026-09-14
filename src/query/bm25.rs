@@ -181,6 +181,7 @@ impl Bm25Weight {
     }
 
     /// Computes BM25 scores for parallel fieldnorm-ID and term-frequency slices.
+    #[inline(never)]
     pub fn score_batch(&self, fieldnorm_ids: &[u8], term_freqs: &[u32], output: &mut [Score]) {
         assert_eq!(fieldnorm_ids.len(), term_freqs.len());
         assert_eq!(fieldnorm_ids.len(), output.len());
