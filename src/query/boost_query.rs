@@ -2,7 +2,10 @@ use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::fastfield::AliveBitSet;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight, SCORE_BLOCK_LEN};
+use crate::query::{
+    EnableScoring, Explanation, Query, ScoredBatch, ScoredBlockOutput, Scorer, Weight,
+    SCORE_BLOCK_LEN,
+};
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
@@ -149,56 +152,95 @@ impl<S: Scorer> Scorer for BoostScorer<S> {
         self.underlying.score() * self.boost
     }
 
-    fn fill_scored_buffer(
+    fn emit_scored_batches(
         &mut self,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        let len = self.underlying.fill_scored_buffer(docs, scores);
-        for score in &mut scores[..len] {
-            *score *= self.boost;
-        }
-        len
-    }
-
-    fn fill_scored_buffer_up_to(
-        &mut self,
+        min_doc: DocId,
         horizon: DocId,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        let len = self
-            .underlying
-            .fill_scored_buffer_up_to(horizon, docs, scores);
-        for score in &mut scores[..len] {
-            *score *= self.boost;
+        cb: &mut dyn ScoredBlockOutput,
+    ) -> DocId {
+        struct BoostOutput<'a> {
+            cb: &'a mut dyn ScoredBlockOutput,
+            boost: Score,
+            sparse_scores: [Score; SCORE_BLOCK_LEN],
+            dense_scores: [Score; 4096],
         }
-        len
+
+        impl ScoredBlockOutput for BoostOutput<'_> {
+            fn update(&mut self, batch: ScoredBatch<'_>) {
+                match batch {
+                    ScoredBatch::Sparse { docs, scores } => {
+                        for (docs, scores) in docs
+                            .chunks(SCORE_BLOCK_LEN)
+                            .zip(scores.chunks(SCORE_BLOCK_LEN))
+                        {
+                            for (boosted, score) in self.sparse_scores.iter_mut().zip(scores) {
+                                *boosted = score * self.boost;
+                            }
+                            self.cb.update(ScoredBatch::Sparse {
+                                docs,
+                                scores: &self.sparse_scores[..scores.len()],
+                            });
+                        }
+                    }
+                    ScoredBatch::Dense {
+                        base_doc,
+                        words,
+                        scores,
+                    } => {
+                        for (boosted, score) in self.dense_scores.iter_mut().zip(scores) {
+                            *boosted = score * self.boost;
+                        }
+                        self.cb.update(ScoredBatch::Dense {
+                            base_doc,
+                            words,
+                            scores: &self.dense_scores,
+                        });
+                    }
+                }
+            }
+
+            fn update_bitset(
+                &mut self,
+                _base_doc: DocId,
+                _matches: &[common::TinySet],
+                _scores: &[Score],
+            ) {
+                unreachable!("scorers emit ScoredBatch values");
+            }
+        }
+
+        self.underlying.emit_scored_batches(
+            min_doc,
+            horizon,
+            &mut BoostOutput {
+                cb,
+                boost: self.boost,
+                sparse_scores: [0.0; SCORE_BLOCK_LEN],
+                dense_scores: [0.0; 4096],
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{BoostQuery, BoostScorer};
-    use crate::query::{AllQuery, AllScorer, Query, Scorer, SCORE_BLOCK_LEN};
+    use crate::query::scorer::collect_scored_batches;
+    use crate::query::{AllQuery, AllScorer, Query};
     use crate::schema::Schema;
     use crate::{DocAddress, Index, IndexWriter, TantivyDocument};
 
     #[test]
-    fn test_boost_scorer_forwards_scored_buffers() {
+    fn test_boost_scorer_forwards_scored_batches() {
         let mut scorer = BoostScorer::new(AllScorer::new(5), 2.5);
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-
         assert_eq!(
-            scorer.fill_scored_buffer_up_to(3, &mut docs, &mut scores),
-            3
+            collect_scored_batches(&mut scorer, 0, 3),
+            vec![(0, 2.5), (1, 2.5), (2, 2.5)]
         );
-        assert_eq!(&docs[..3], &[0, 1, 2]);
-        assert_eq!(&scores[..3], &[2.5; 3]);
-        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 2);
-        assert_eq!(&docs[..2], &[3, 4]);
-        assert_eq!(&scores[..2], &[2.5; 2]);
+        assert_eq!(
+            collect_scored_batches(&mut scorer, 3, crate::TERMINATED),
+            vec![(3, 2.5), (4, 2.5)]
+        );
     }
 
     #[test]

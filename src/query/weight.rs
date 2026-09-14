@@ -3,7 +3,9 @@ use std::cmp::Ordering;
 use common::TinySet;
 use downcast_rs::{impl_downcast, Downcast};
 
-use super::{BufferedUnionScorer, ScoreCombiner, ScoredBatch, Scorer, SCORE_BLOCK_LEN};
+use super::{
+    BufferedUnionScorer, ScoreCombiner, ScoredBatch, ScoredBlockOutput, Scorer, SCORE_BLOCK_LEN,
+};
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
 use crate::query::Explanation;
@@ -27,15 +29,49 @@ pub(crate) fn for_each_scorer_scored_block<TScorer: Scorer + ?Sized>(
     scorer: &mut TScorer,
     callback: &mut dyn FnMut(&[DocId], &[Score]),
 ) {
-    let mut docs = [0; SCORE_BLOCK_LEN];
-    let mut scores = [0.0; SCORE_BLOCK_LEN];
-    loop {
-        let len = scorer.fill_scored_buffer(&mut docs, &mut scores);
-        if len == 0 {
-            break;
-        }
-        callback(&docs[..len], &scores[..len]);
+    struct CompactOutput<'a> {
+        callback: &'a mut dyn FnMut(&[DocId], &[Score]),
+        docs: Vec<DocId>,
+        scores: Vec<Score>,
     }
+
+    impl ScoredBlockOutput for CompactOutput<'_> {
+        fn update(&mut self, batch: ScoredBatch<'_>) {
+            match batch {
+                ScoredBatch::Sparse { docs, scores } => (self.callback)(docs, scores),
+                ScoredBatch::Dense {
+                    base_doc,
+                    words,
+                    scores,
+                } => {
+                    self.docs.clear();
+                    self.scores.clear();
+                    for (bucket, bits) in words.iter().enumerate() {
+                        for bit in *bits {
+                            let offset = bucket * 64 + bit as usize;
+                            self.docs.push(base_doc + offset as DocId);
+                            self.scores.push(scores[offset]);
+                        }
+                    }
+                    (self.callback)(&self.docs, &self.scores);
+                }
+            }
+        }
+
+        fn update_bitset(&mut self, _base_doc: DocId, _matches: &[TinySet], _scores: &[Score]) {
+            unreachable!("scorers emit ScoredBatch values");
+        }
+    }
+
+    scorer.emit_scored_batches(
+        0,
+        TERMINATED,
+        &mut CompactOutput {
+            callback,
+            docs: Vec::new(),
+            scores: Vec::new(),
+        },
+    );
 }
 
 /// Compacts buffered union windows into parallel document and score buffers.

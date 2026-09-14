@@ -1,13 +1,12 @@
-use std::ops::{DerefMut, Range};
+use std::ops::DerefMut;
 
 use downcast_rs::impl_downcast;
 
 use crate::docset::{DocSet, TERMINATED};
-use crate::postings::compression::COMPRESSION_BLOCK_SIZE;
 use crate::query::{ScoredBatch, ScoredBlockOutput};
 use crate::{DocId, Score};
 
-/// Number of documents scored by one scored-buffer operation.
+/// Maximum number of documents in one default sparse scored batch.
 ///
 /// This is intentionally independent from the posting compression block size and boolean-query
 /// window sizes.
@@ -22,46 +21,7 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
     /// This method will perform a bit of computation and is not cached.
     fn score(&mut self) -> Score;
 
-    /// Fills parallel document and score buffers, consuming the returned documents.
-    ///
-    /// The current document is included. Returned documents are strictly increasing and each
-    /// score is aligned with the document at the same index. On return, [`DocSet::doc`] points to
-    /// the first unreturned document, or [`TERMINATED`] if the scorer was exhausted.
-    fn fill_scored_buffer(
-        &mut self,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        self.fill_scored_buffer_up_to(TERMINATED, docs, scores)
-    }
-
-    /// Fills parallel document and score buffers with documents strictly below `horizon`.
-    ///
-    /// `horizon` is exclusive. A document greater than or equal to it is not consumed.
-    fn fill_scored_buffer_up_to(
-        &mut self,
-        horizon: DocId,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        if self.doc() == TERMINATED {
-            return 0;
-        }
-        for i in 0..SCORE_BLOCK_LEN {
-            let doc = self.doc();
-            if doc >= horizon {
-                return i;
-            }
-            docs[i] = doc;
-            scores[i] = self.score();
-            if self.advance() == TERMINATED {
-                return i + 1;
-            }
-        }
-        SCORE_BLOCK_LEN
-    }
-
-    /// Adds matches and score contributions for remaining documents in `[min_doc, horizon)`.
+    /// Emits scored batches for remaining documents in `[min_doc, horizon)`.
     ///
     /// Like [`DocSet::fill_bitset_block`], this seeks forward to `min_doc` if necessary.
     /// Submits each matching document exactly once, in increasing order, as document-ID or
@@ -71,7 +31,7 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
     /// Consumes the entire interval and returns the first remaining document at or beyond
     /// `horizon`, or [`TERMINATED`]. Scalar traversal can resume at that document.
     /// Boxed scorers forward this method to the underlying scorer's implementation.
-    fn fill_scored_bitset_block(
+    fn emit_scored_batches(
         &mut self,
         min_doc: DocId,
         horizon: DocId,
@@ -81,44 +41,22 @@ pub trait Scorer: downcast_rs::Downcast + DocSet + 'static {
         if self.doc() < min_doc {
             self.seek(min_doc);
         }
-        let mut docs = [0; COMPRESSION_BLOCK_SIZE];
-        let mut scores = [0.0; COMPRESSION_BLOCK_SIZE];
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
         while self.doc() < horizon {
-            let range = self.fill_scored_buffer_range_up_to(horizon, &mut docs, &mut scores);
+            let mut len = 0;
+            while len < SCORE_BLOCK_LEN && self.doc() < horizon {
+                docs[len] = self.doc();
+                scores[len] = self.score();
+                len += 1;
+                self.advance();
+            }
             cb.update(ScoredBatch::Sparse {
-                docs: &docs[range.clone()],
-                scores: &scores[range],
+                docs: &docs[..len],
+                scores: &scores[..len],
             });
         }
         self.doc()
-    }
-
-    /// Fills arbitrary-sized document and score buffers through an exclusive horizon.
-    ///
-    /// The returned range identifies the consumed documents. Implementations may decode outside
-    /// that range, but documents at or beyond `horizon` remain unconsumed.
-    fn fill_scored_buffer_range_up_to(
-        &mut self,
-        horizon: DocId,
-        docs: &mut [DocId],
-        scores: &mut [Score],
-    ) -> Range<usize> {
-        assert_eq!(docs.len(), scores.len());
-        if self.doc() == TERMINATED {
-            return 0..0;
-        }
-        for i in 0..docs.len() {
-            let doc = self.doc();
-            if doc >= horizon {
-                return 0..i;
-            }
-            docs[i] = doc;
-            scores[i] = self.score();
-            if self.advance() == TERMINATED {
-                return 0..i + 1;
-            }
-        }
-        0..docs.len()
     }
 }
 
@@ -131,53 +69,66 @@ impl Scorer for Box<dyn Scorer> {
     }
 
     #[inline]
-    fn fill_scored_buffer(
-        &mut self,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        self.deref_mut().fill_scored_buffer(docs, scores)
-    }
-
-    #[inline]
-    fn fill_scored_buffer_up_to(
-        &mut self,
-        horizon: DocId,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        self.deref_mut()
-            .fill_scored_buffer_up_to(horizon, docs, scores)
-    }
-
-    #[inline]
-    fn fill_scored_bitset_block(
+    fn emit_scored_batches(
         &mut self,
         min_doc: DocId,
         horizon: DocId,
         cb: &mut dyn ScoredBlockOutput,
     ) -> DocId {
-        self.deref_mut()
-            .fill_scored_bitset_block(min_doc, horizon, cb)
+        self.deref_mut().emit_scored_batches(min_doc, horizon, cb)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn collect_scored_batches(
+    scorer: &mut dyn Scorer,
+    min_doc: DocId,
+    horizon: DocId,
+) -> Vec<(DocId, Score)> {
+    struct Collector(Vec<(DocId, Score)>);
+
+    impl ScoredBlockOutput for Collector {
+        fn update(&mut self, batch: ScoredBatch<'_>) {
+            match batch {
+                ScoredBatch::Sparse { docs, scores } => {
+                    self.0
+                        .extend(docs.iter().copied().zip(scores.iter().copied()));
+                }
+                ScoredBatch::Dense {
+                    base_doc,
+                    words,
+                    scores,
+                } => {
+                    for (bucket, bits) in words.iter().enumerate() {
+                        for bit in *bits {
+                            let offset = bucket * 64 + bit as usize;
+                            self.0.push((base_doc + offset as DocId, scores[offset]));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn update_bitset(
+            &mut self,
+            _base_doc: DocId,
+            _matches: &[common::TinySet],
+            _scores: &[Score],
+        ) {
+            unreachable!("scorers emit ScoredBatch values");
+        }
     }
 
-    #[inline]
-    fn fill_scored_buffer_range_up_to(
-        &mut self,
-        horizon: DocId,
-        docs: &mut [DocId],
-        scores: &mut [Score],
-    ) -> Range<usize> {
-        self.deref_mut()
-            .fill_scored_buffer_range_up_to(horizon, docs, scores)
-    }
+    let mut collector = Collector(Vec::new());
+    scorer.emit_scored_batches(min_doc, horizon, &mut collector);
+    collector.0
 }
 
 #[cfg(test)]
 mod tests {
     use common::TinySet;
 
-    use super::{Scorer, SCORE_BLOCK_LEN};
+    use super::{collect_scored_batches, Scorer, SCORE_BLOCK_LEN};
     use crate::query::scored_block_output::CombiningOutput;
     use crate::query::AllScorer;
     use crate::{DocId, DocSet, Score, TERMINATED};
@@ -222,7 +173,7 @@ mod tests {
         let mut matches = [TinySet::EMPTY];
         let mut scores = [0.0; 4];
         assert_eq!(
-            scorer.fill_scored_bitset_block(
+            scorer.emit_scored_batches(
                 0,
                 4,
                 &mut CombiningOutput::new(0, &mut matches, &mut scores, |sum, score| *sum += score),
@@ -237,7 +188,7 @@ mod tests {
         matches.fill(TinySet::EMPTY);
         scores.fill(0.0);
         assert_eq!(
-            scorer.fill_scored_bitset_block(
+            scorer.emit_scored_batches(
                 4,
                 8,
                 &mut CombiningOutput::new(4, &mut matches, &mut scores, |sum, score| *sum += score),
@@ -249,62 +200,44 @@ mod tests {
     }
 
     #[test]
-    fn test_default_fill_scored_buffer_consumes_and_aligns() {
+    fn test_default_scored_batches_consume_and_align() {
         let expected_docs: Vec<DocId> = (0..SCORE_BLOCK_LEN as DocId + 3).collect();
         let mut scorer = TestScorer::new(expected_docs.clone());
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-
+        let scored = collect_scored_batches(&mut scorer, 0, TERMINATED);
         assert_eq!(
-            scorer.fill_scored_buffer(&mut docs, &mut scores),
-            SCORE_BLOCK_LEN
+            scored,
+            expected_docs
+                .iter()
+                .map(|&doc| (doc, doc as Score + 0.5))
+                .collect::<Vec<_>>()
         );
-        assert_eq!(&docs[..], &expected_docs[..SCORE_BLOCK_LEN]);
-        for (&doc, &score) in docs.iter().zip(&scores) {
-            assert_eq!(score, doc as Score + 0.5);
-        }
-        assert_eq!(scorer.doc(), SCORE_BLOCK_LEN as DocId);
-
-        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 3);
-        assert_eq!(&docs[..3], &expected_docs[SCORE_BLOCK_LEN..]);
         assert_eq!(scorer.doc(), TERMINATED);
-        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 0);
     }
 
     #[test]
-    fn test_default_fill_scored_buffer_up_to_is_exclusive() {
+    fn test_default_scored_batches_horizon_is_exclusive() {
         let mut scorer = TestScorer::new(vec![1, 3, 5, 8]);
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-
         assert_eq!(
-            scorer.fill_scored_buffer_up_to(5, &mut docs, &mut scores),
-            2
-        );
-        assert_eq!(&docs[..2], &[1, 3]);
-        assert_eq!(&scores[..2], &[1.5, 3.5]);
-        assert_eq!(scorer.doc(), 5);
-        assert_eq!(
-            scorer.fill_scored_buffer_up_to(5, &mut docs, &mut scores),
-            0
+            collect_scored_batches(&mut scorer, 0, 5),
+            vec![(1, 1.5), (3, 3.5)]
         );
         assert_eq!(scorer.doc(), 5);
-        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 2);
-        assert_eq!(&docs[..2], &[5, 8]);
-        assert_eq!(scorer.doc(), TERMINATED);
+        assert!(collect_scored_batches(&mut scorer, 0, 5).is_empty());
+        assert_eq!(
+            collect_scored_batches(&mut scorer, 5, TERMINATED),
+            vec![(5, 5.5), (8, 8.5)]
+        );
     }
 
     #[test]
-    fn test_scalar_and_block_calls_can_be_interleaved_through_box() {
+    fn test_scalar_and_batch_calls_can_be_interleaved_through_box() {
         let mut scorer: Box<dyn Scorer> = Box::new(TestScorer::new(vec![2, 4, 9]));
         assert_eq!(scorer.score(), 2.5);
         assert_eq!(scorer.advance(), 4);
-
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 2);
-        assert_eq!(&docs[..2], &[4, 9]);
-        assert_eq!(&scores[..2], &[4.5, 9.5]);
+        assert_eq!(
+            collect_scored_batches(scorer.as_mut(), 0, TERMINATED),
+            vec![(4, 4.5), (9, 9.5)]
+        );
         assert_eq!(scorer.doc(), TERMINATED);
     }
 }

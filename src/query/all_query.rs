@@ -2,7 +2,10 @@ use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight, SCORE_BLOCK_LEN};
+use crate::query::{
+    EnableScoring, Explanation, Query, ScoredBatch, ScoredBlockOutput, Scorer, Weight,
+    SCORE_BLOCK_LEN,
+};
 use crate::{DocId, Score};
 
 /// Query that matches all of the documents.
@@ -134,13 +137,26 @@ impl Scorer for AllScorer {
         1.0
     }
 
-    fn fill_scored_buffer_up_to(
+    fn emit_scored_batches(
         &mut self,
+        min_doc: DocId,
         horizon: DocId,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        self.fill_compact_scored_buffer_up_to(horizon, docs, scores)
+        cb: &mut dyn ScoredBlockOutput,
+    ) -> DocId {
+        assert!(min_doc <= horizon && horizon <= TERMINATED);
+        if self.doc() < min_doc {
+            self.seek(min_doc);
+        }
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+        while self.doc() < horizon {
+            let len = self.fill_compact_scored_buffer_up_to(horizon, &mut docs, &mut scores);
+            cb.update(ScoredBatch::Sparse {
+                docs: &docs[..len],
+                scores: &scores[..len],
+            });
+        }
+        self.doc()
     }
 }
 
@@ -148,9 +164,10 @@ impl Scorer for AllScorer {
 mod tests {
     use super::AllQuery;
     use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
+    use crate::query::scorer::collect_scored_batches;
     use crate::query::{AllScorer, EnableScoring, Query, Scorer, SCORE_BLOCK_LEN};
     use crate::schema::{Schema, TEXT};
-    use crate::{Index, IndexWriter};
+    use crate::{DocId, Index, IndexWriter};
 
     fn create_test_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();
@@ -210,38 +227,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_scored_buffer_with_horizon_and_partial_block() {
+    fn test_scored_batches_with_horizon_and_partial_block() {
         let mut scorer = AllScorer::new(SCORE_BLOCK_LEN as u32 + 6);
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-
         assert_eq!(
-            scorer.fill_scored_buffer_up_to(3, &mut docs, &mut scores),
-            3
+            collect_scored_batches(&mut scorer, 0, 3),
+            vec![(0, 1.0), (1, 1.0), (2, 1.0)]
         );
-        assert_eq!(&docs[..3], &[0, 1, 2]);
-        assert_eq!(&scores[..3], &[1.0; 3]);
         assert_eq!(scorer.doc(), 3);
-        assert_eq!(
-            scorer.fill_scored_buffer(&mut docs, &mut scores),
-            SCORE_BLOCK_LEN
-        );
-        assert_eq!(docs[0], 3);
-        assert_eq!(docs[SCORE_BLOCK_LEN - 1], SCORE_BLOCK_LEN as u32 + 2);
-        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 3);
-        assert_eq!(
-            &docs[..3],
-            &[
-                SCORE_BLOCK_LEN as u32 + 3,
-                SCORE_BLOCK_LEN as u32 + 4,
-                SCORE_BLOCK_LEN as u32 + 5,
-            ]
-        );
+        let remaining = collect_scored_batches(&mut scorer, 3, TERMINATED);
+        assert_eq!(remaining.len(), SCORE_BLOCK_LEN + 3);
+        assert_eq!(remaining.first(), Some(&(3, 1.0)));
+        assert_eq!(remaining.last(), Some(&(SCORE_BLOCK_LEN as DocId + 5, 1.0)));
         assert_eq!(scorer.doc(), TERMINATED);
 
         let mut empty = AllScorer::new(0);
-        assert_eq!(empty.fill_scored_buffer(&mut docs, &mut scores), 0);
-        assert_eq!(empty.advance(), TERMINATED);
+        assert!(collect_scored_batches(&mut empty, 0, TERMINATED).is_empty());
     }
 
     #[test]

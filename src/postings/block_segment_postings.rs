@@ -255,51 +255,6 @@ impl BlockSegmentPostings {
         self.freq_decoder.output_array()
     }
 
-    /// Copies decoded docs starting at `block_offset`.
-    ///
-    /// Only documents strictly below `horizon` are copied.
-    pub(crate) fn copy_docs(
-        &self,
-        block_offset: usize,
-        horizon: DocId,
-        docs: &mut [DocId],
-    ) -> usize {
-        let block_docs = self.docs();
-        let remaining_docs_in_block = block_docs.len().saturating_sub(block_offset);
-        let max_len = remaining_docs_in_block.min(docs.len());
-        if max_len == 0 {
-            return 0;
-        }
-
-        let source_docs = &block_docs[block_offset..block_offset + max_len];
-        let len = source_docs.partition_point(|&doc| doc < horizon);
-        docs[..len].copy_from_slice(&source_docs[..len]);
-        len
-    }
-
-    /// Copies decoded docs and term frequencies starting at `block_offset`.
-    ///
-    /// Only documents strictly below `horizon` are copied. Fields without decoded frequencies
-    /// produce the implicit frequency `1`.
-    pub(crate) fn copy_docs_and_term_freqs(
-        &self,
-        block_offset: usize,
-        horizon: DocId,
-        docs: &mut [DocId],
-        term_freqs: &mut [u32],
-    ) -> usize {
-        assert_eq!(docs.len(), term_freqs.len());
-        let len = self.copy_docs(block_offset, horizon, docs);
-
-        let block_freqs = self.freq_output_array();
-        if let Some(source_freqs) = block_freqs.get(block_offset..block_offset + len) {
-            term_freqs[..len].copy_from_slice(source_freqs);
-        } else {
-            term_freqs[..len].fill(1);
-        }
-        len
-    }
-
     /// All blocks have a length of `NUM_DOCS_PER_BLOCK`,
     /// except the last block that may have a length
     /// of any number between 1 and `NUM_DOCS_PER_BLOCK - 1`
@@ -480,10 +435,6 @@ impl BlockSegmentPostings {
                 num_docs
             }
         }
-    }
-
-    pub(crate) fn unload_block(&mut self) {
-        self.block_loaded = false;
     }
 
     pub(crate) fn advance_without_loading(&mut self) {

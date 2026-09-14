@@ -6,7 +6,7 @@ use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
 use crate::query::scored_block_output::CombiningOutput;
 use crate::query::size_hint::estimate_union;
-use crate::query::{Scorer, SCORE_BLOCK_LEN};
+use crate::query::{ScoredBatch, ScoredBlockOutput, Scorer, SCORE_BLOCK_LEN};
 use crate::{DocId, Score};
 
 // The buffered union looks ahead within a fixed-size sliding window
@@ -92,7 +92,7 @@ fn populate_window<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
     for scorer in scorers.iter_mut() {
         if TScoreCombiner::REQUIRES_SCORING {
             if TScoreCombiner::ACCUMULATES_IN_DENSE_OUTPUT && dense_scores.is_some() {
-                scorer.fill_scored_bitset_block(
+                scorer.emit_scored_batches(
                     window.start,
                     window.end,
                     &mut CombiningOutput::new(
@@ -103,7 +103,7 @@ fn populate_window<TScorer: Scorer, TScoreCombiner: ScoreCombiner>(
                     ),
                 );
             } else {
-                scorer.fill_scored_bitset_block(
+                scorer.emit_scored_batches(
                     window.start,
                     window.end,
                     &mut CombiningOutput::new(
@@ -258,6 +258,78 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> BufferedUnionScorer<TScorer
             }
         }
         false
+    }
+
+    fn fill_compact_scored_buffer(
+        &mut self,
+        docs: &mut [DocId; SCORE_BLOCK_LEN],
+        scores: &mut [Score; SCORE_BLOCK_LEN],
+    ) -> usize {
+        if self.doc == TERMINATED {
+            return 0;
+        }
+
+        docs[0] = self.doc;
+        scores[0] = self.score;
+        let mut count = 1;
+        loop {
+            while self.bucket_idx < HORIZON_NUM_TINYBITSETS {
+                let chunk = self.bitsets[self.bucket_idx..].chunks(4).next().unwrap();
+                if let &[bits0, bits1, bits2, bits3] = chunk {
+                    let counts = [
+                        bits0.len() as usize,
+                        bits1.len() as usize,
+                        bits2.len() as usize,
+                        bits3.len() as usize,
+                    ];
+                    let group_count = counts.iter().sum::<usize>();
+                    if group_count <= SCORE_BLOCK_LEN - count {
+                        let mut output_start = count;
+                        for (lane, (&bits, bucket_count)) in chunk.iter().zip(counts).enumerate() {
+                            let output_end = output_start + bucket_count;
+                            let score_start = (self.bucket_idx + lane) * 64;
+                            drain_tinyset(
+                                bits,
+                                self.window_start_doc + score_start as DocId,
+                                &mut docs[output_start..output_end],
+                                &mut scores[output_start..output_end],
+                                &mut self.scores[score_start..score_start + 64],
+                            );
+                            output_start = output_end;
+                        }
+                        self.bitsets[self.bucket_idx..self.bucket_idx + 4].fill(TinySet::empty());
+                        self.bucket_idx += 4;
+                        count += group_count;
+                        continue;
+                    }
+                }
+
+                let mut tinyset = self.bitsets[self.bucket_idx];
+                while let Some(val) = tinyset.pop_lowest() {
+                    let delta = val + self.bucket_idx as u32 * 64;
+                    let doc = self.window_start_doc + delta;
+                    let score_combiner = &mut self.scores[delta as usize];
+                    let score = score_combiner.score();
+                    score_combiner.clear();
+                    if count == SCORE_BLOCK_LEN {
+                        self.doc = doc;
+                        self.score = score;
+                        self.bitsets[self.bucket_idx] = tinyset;
+                        return count;
+                    }
+                    docs[count] = doc;
+                    scores[count] = score;
+                    count += 1;
+                }
+                self.bitsets[self.bucket_idx] = TinySet::empty();
+                self.bucket_idx += 1;
+            }
+
+            if !self.refill() {
+                self.doc = TERMINATED;
+                return count;
+            }
+        }
     }
 }
 
@@ -416,94 +488,37 @@ where
         self.score
     }
 
-    fn fill_scored_buffer(
+    fn emit_scored_batches(
         &mut self,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        if self.doc == TERMINATED {
-            return 0;
-        }
-
-        docs[0] = self.doc;
-        scores[0] = self.score;
-        let mut count = 1;
-
-        loop {
-            while self.bucket_idx < HORIZON_NUM_TINYBITSETS {
-                let chunk = self.bitsets[self.bucket_idx..].chunks(4).next().unwrap();
-                if let &[bits0, bits1, bits2, bits3] = chunk {
-                    let counts = [
-                        bits0.len() as usize,
-                        bits1.len() as usize,
-                        bits2.len() as usize,
-                        bits3.len() as usize,
-                    ];
-                    let group_count = counts.iter().sum::<usize>();
-                    if group_count <= SCORE_BLOCK_LEN - count {
-                        let mut output_start = count;
-                        for (lane, (&bits, bucket_count)) in chunk.iter().zip(counts).enumerate() {
-                            let output_end = output_start + bucket_count;
-                            let score_start = (self.bucket_idx + lane) * 64;
-                            drain_tinyset(
-                                bits,
-                                self.window_start_doc + score_start as DocId,
-                                &mut docs[output_start..output_end],
-                                &mut scores[output_start..output_end],
-                                &mut self.scores[score_start..score_start + 64],
-                            );
-                            output_start = output_end;
-                        }
-                        self.bitsets[self.bucket_idx..self.bucket_idx + 4].fill(TinySet::empty());
-                        self.bucket_idx += 4;
-                        count += group_count;
-                        continue;
-                    }
-                }
-
-                let mut tinyset = self.bitsets[self.bucket_idx];
-                while let Some(val) = tinyset.pop_lowest() {
-                    let delta = val + self.bucket_idx as u32 * 64;
-                    let doc = self.window_start_doc + delta;
-                    let score_combiner = &mut self.scores[delta as usize];
-                    let score = score_combiner.score();
-                    score_combiner.clear();
-
-                    if count == SCORE_BLOCK_LEN {
-                        self.doc = doc;
-                        self.score = score;
-                        self.bitsets[self.bucket_idx] = tinyset;
-                        return count;
-                    }
-                    docs[count] = doc;
-                    scores[count] = score;
-                    count += 1;
-                }
-                self.bitsets[self.bucket_idx] = TinySet::empty();
-                self.bucket_idx += 1;
-            }
-
-            if !self.refill() {
-                self.doc = TERMINATED;
-                return count;
-            }
-        }
-    }
-
-    fn fill_scored_buffer_up_to(
-        &mut self,
+        min_doc: DocId,
         horizon: DocId,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        let mut count = 0;
-        while count < SCORE_BLOCK_LEN && self.doc < horizon {
-            docs[count] = self.doc;
-            scores[count] = self.score;
-            count += 1;
-            self.advance();
+        cb: &mut dyn ScoredBlockOutput,
+    ) -> DocId {
+        assert!(min_doc <= horizon && horizon <= TERMINATED);
+        if self.doc() < min_doc {
+            self.seek(min_doc);
         }
-        count
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+        while self.doc() < horizon {
+            let len = if horizon == TERMINATED {
+                self.fill_compact_scored_buffer(&mut docs, &mut scores)
+            } else {
+                let mut len = 0;
+                while len < SCORE_BLOCK_LEN && self.doc() < horizon {
+                    docs[len] = self.doc();
+                    scores[len] = self.score();
+                    len += 1;
+                    self.advance();
+                }
+                len
+            };
+            cb.update(ScoredBatch::Sparse {
+                docs: &docs[..len],
+                scores: &scores[..len],
+            });
+        }
+        self.doc()
     }
 }
 
@@ -516,26 +531,12 @@ mod tests {
     use crate::query::score_combiner::{
         DisjunctionMaxCombiner, DoNothingCombiner, ScoreCombiner, SumCombiner,
     };
-    use crate::query::{ConstScorer, Scorer, VecDocSet, SCORE_BLOCK_LEN};
+    use crate::query::scorer::collect_scored_batches;
+    use crate::query::{ConstScorer, ScoredBlockOutput, Scorer, VecDocSet};
     use crate::{DocId, Score};
 
     fn collect_scored<TScorer: Scorer>(mut scorer: TScorer) -> Vec<(DocId, Score)> {
-        let mut result = Vec::new();
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-        loop {
-            let len = scorer.fill_scored_buffer(&mut docs, &mut scores);
-            if len == 0 {
-                break;
-            }
-            result.extend(
-                docs[..len]
-                    .iter()
-                    .copied()
-                    .zip(scores[..len].iter().copied()),
-            );
-        }
-        result
+        collect_scored_batches(&mut scorer, 0, TERMINATED)
     }
 
     fn assert_eager_block_scores(
@@ -749,18 +750,17 @@ mod tests {
             || DisjunctionMaxCombiner::with_tie_breaker(0.5),
             7,
         );
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-
-        let len = union.fill_scored_buffer_up_to(4, &mut docs, &mut scores);
-        assert_eq!(&docs[..len], &[1, 3]);
-        assert_eq!(&scores[..len], &[1.0, 2.5]);
+        assert_eq!(
+            collect_scored_batches(&mut union, 0, 4),
+            vec![(1, 1.0), (3, 2.5)]
+        );
         assert_eq!(union.doc(), 4);
         assert_eq!(union.score(), 2.0);
 
-        let len = union.fill_scored_buffer(&mut docs, &mut scores);
-        assert_eq!(&docs[..len], &[4, 5, 6]);
-        assert_eq!(&scores[..len], &[2.0, 1.0, 2.0]);
+        assert_eq!(
+            collect_scored_batches(&mut union, 4, TERMINATED),
+            vec![(4, 2.0), (5, 1.0), (6, 2.0)]
+        );
         assert_eq!(union.doc(), TERMINATED);
     }
 
@@ -771,16 +771,15 @@ mod tests {
             3.0,
         )];
         let mut union = BufferedUnionScorer::build(scorers, SumCombiner::default, TERMINATED);
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
         assert_eq!(
-            union.fill_scored_buffer_up_to(TERMINATED - 1, &mut docs, &mut scores),
-            1
+            collect_scored_batches(&mut union, 0, TERMINATED - 1),
+            vec![(TERMINATED - 2, 3.0)]
         );
-        assert_eq!((docs[0], scores[0]), (TERMINATED - 2, 3.0));
         assert_eq!(union.doc(), TERMINATED - 1);
-        assert_eq!(union.fill_scored_buffer(&mut docs, &mut scores), 1);
-        assert_eq!((docs[0], scores[0]), (TERMINATED - 1, 3.0));
+        assert_eq!(
+            collect_scored_batches(&mut union, TERMINATED - 1, TERMINATED),
+            vec![(TERMINATED - 1, 3.0)]
+        );
     }
 
     struct ScorePanics {
@@ -808,20 +807,12 @@ mod tests {
             panic!("no-score union called score")
         }
 
-        fn fill_scored_buffer(
+        fn emit_scored_batches(
             &mut self,
-            _docs: &mut [DocId; SCORE_BLOCK_LEN],
-            _scores: &mut [Score; SCORE_BLOCK_LEN],
-        ) -> usize {
-            panic!("no-score union called scored fill")
-        }
-
-        fn fill_scored_buffer_up_to(
-            &mut self,
+            _min_doc: DocId,
             _horizon: DocId,
-            _docs: &mut [DocId; SCORE_BLOCK_LEN],
-            _scores: &mut [Score; SCORE_BLOCK_LEN],
-        ) -> usize {
+            _cb: &mut dyn ScoredBlockOutput,
+        ) -> DocId {
             panic!("no-score union called scored fill")
         }
     }

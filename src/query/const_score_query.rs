@@ -1,7 +1,10 @@
 use std::fmt;
 
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight, SCORE_BLOCK_LEN};
+use crate::query::{
+    EnableScoring, Explanation, Query, ScoredBatch, ScoredBlockOutput, Scorer, Weight,
+    SCORE_BLOCK_LEN,
+};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term, TERMINATED};
 
 /// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
@@ -181,13 +184,26 @@ impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
         self.score
     }
 
-    fn fill_scored_buffer_up_to(
+    fn emit_scored_batches(
         &mut self,
+        min_doc: DocId,
         horizon: DocId,
-        docs: &mut [DocId; SCORE_BLOCK_LEN],
-        scores: &mut [Score; SCORE_BLOCK_LEN],
-    ) -> usize {
-        self.fill_compact_scored_buffer_up_to(horizon, docs, scores)
+        cb: &mut dyn ScoredBlockOutput,
+    ) -> DocId {
+        assert!(min_doc <= horizon && horizon <= TERMINATED);
+        if self.doc() < min_doc {
+            self.seek(min_doc);
+        }
+        let mut docs = [0; SCORE_BLOCK_LEN];
+        let mut scores = [0.0; SCORE_BLOCK_LEN];
+        while self.doc() < horizon {
+            let len = self.fill_compact_scored_buffer_up_to(horizon, &mut docs, &mut scores);
+            cb.update(ScoredBatch::Sparse {
+                docs: &docs[..len],
+                scores: &scores[..len],
+            });
+        }
+        self.doc()
     }
 }
 
@@ -195,9 +211,9 @@ impl<TDocSet: DocSet + 'static> Scorer for ConstScorer<TDocSet> {
 mod tests {
     use super::{ConstScoreQuery, ConstScorer};
     use crate::collector::TopDocs;
+    use crate::query::scorer::collect_scored_batches;
     use crate::query::{
-        AllScorer, Bm25StatisticsProvider, BoostQuery, EnableScoring, Query, Scorer, TermQuery,
-        SCORE_BLOCK_LEN,
+        AllScorer, Bm25StatisticsProvider, BoostQuery, EnableScoring, Query, TermQuery,
     };
     use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
     use crate::{DocAddress, Index, IndexWriter, TantivyDocument, TantivyError, Term, TERMINATED};
@@ -221,18 +237,14 @@ mod tests {
     #[test]
     fn test_const_scorer_fills_constant_scores_with_horizon() {
         let mut scorer = ConstScorer::new(AllScorer::new(5), 0.42);
-        let mut docs = [0; SCORE_BLOCK_LEN];
-        let mut scores = [0.0; SCORE_BLOCK_LEN];
-
         assert_eq!(
-            scorer.fill_scored_buffer_up_to(2, &mut docs, &mut scores),
-            2
+            collect_scored_batches(&mut scorer, 0, 2),
+            vec![(0, 0.42), (1, 0.42)]
         );
-        assert_eq!(&docs[..2], &[0, 1]);
-        assert_eq!(&scores[..2], &[0.42; 2]);
-        assert_eq!(scorer.fill_scored_buffer(&mut docs, &mut scores), 3);
-        assert_eq!(&docs[..3], &[2, 3, 4]);
-        assert_eq!(&scores[..3], &[0.42; 3]);
+        assert_eq!(
+            collect_scored_batches(&mut scorer, 2, TERMINATED),
+            vec![(2, 0.42), (3, 0.42), (4, 0.42)]
+        );
     }
 
     #[test]
