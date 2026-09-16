@@ -23,10 +23,14 @@ const MERGE_HOLES_UNDER_BYTES: usize = (80 * 1024 * 1024 * 50) / 1000;
 
 #[cfg(feature = "quickwit")]
 #[derive(Clone, Copy)]
-struct AutomatonUnion<'a, A>(&'a [A]);
+/// Traversal state for a batch of independent automata.
+///
+/// This does not merge their DFAs or their results. `is_match` only selects terms that need to be
+/// attributed back to one or more members of the batch.
+struct AutomatonBatch<'a, A>(&'a [A]);
 
 #[cfg(feature = "quickwit")]
-impl<A: Automaton> Automaton for AutomatonUnion<'_, A> {
+impl<A: Automaton> Automaton for AutomatonBatch<'_, A> {
     type State = Vec<A::State>;
 
     fn start(&self) -> Self::State {
@@ -550,10 +554,10 @@ impl InvertedIndexReader {
 
         // Load only term dictionary blocks that can match at least one automaton before traversing
         // them synchronously on the executor.
-        let automaton_union = AutomatonUnion(&automatons);
+        let automaton_batch = AutomatonBatch(&automatons);
         let term_info_stream = self
             .termdict
-            .search(automaton_union)
+            .search(automaton_batch)
             .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES)
             .await?;
         drop(term_info_stream);
@@ -565,8 +569,8 @@ impl InvertedIndexReader {
         let postings_file_slice = self.postings_file_slice.clone();
         let record_option = self.record_option;
         let cpu_bound_task = move || {
-            let automaton_union = AutomatonUnion(&automatons);
-            let mut stream = termdict.search(automaton_union).into_stream()?;
+            let automaton_batch = AutomatonBatch(&automatons);
+            let mut stream = termdict.search(automaton_batch).into_stream()?;
             let mut matching_terms: Vec<(TermInfo, Vec<usize>)> = Vec::new();
             let posting_ranges = std::iter::from_fn(|| {
                 while let Some((term, term_info)) = stream.next() {
