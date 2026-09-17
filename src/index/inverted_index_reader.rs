@@ -9,6 +9,8 @@ use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
 use itertools::Itertools;
 #[cfg(feature = "quickwit")]
+use smallvec::SmallVec;
+#[cfg(feature = "quickwit")]
 use tantivy_fst::automaton::{AlwaysMatch, Automaton};
 
 use crate::directory::FileSlice;
@@ -31,7 +33,7 @@ struct AutomatonBatch<'a, A>(&'a [A]);
 
 #[cfg(feature = "quickwit")]
 impl<A: Automaton> Automaton for AutomatonBatch<'_, A> {
-    type State = Vec<A::State>;
+    type State = SmallVec<[A::State; 4]>;
 
     fn start(&self) -> Self::State {
         self.0.iter().map(Automaton::start).collect()
