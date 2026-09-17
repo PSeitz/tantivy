@@ -1,6 +1,6 @@
 use common::{BitSet, TinySet};
 
-use crate::docset::{DocSet, TERMINATED};
+use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS, BLOCK_WINDOW, TERMINATED};
 use crate::DocId;
 
 /// A `BitSetDocSet` makes it possible to iterate through a bitset as if it was a `DocSet`.
@@ -82,6 +82,24 @@ impl DocSet for BitSetDocSet {
         }
     }
 
+    fn fill_bitset_block(
+        &mut self,
+        min_doc: DocId,
+        mask: &mut [TinySet; BLOCK_NUM_TINYBITSETS],
+    ) -> DocId {
+        let first_doc = self.seek(min_doc);
+        let horizon = min_doc + BLOCK_WINDOW;
+        if first_doc >= horizon {
+            return first_doc;
+        }
+
+        for (bucket, output) in mask.iter_mut().enumerate() {
+            let start = min_doc + bucket as u32 * 64;
+            *output = output.union(self.docs.tinyset_window(start));
+        }
+        self.seek(horizon)
+    }
+
     /// Returns the current document
     fn doc(&self) -> DocId {
         self.doc
@@ -97,10 +115,10 @@ impl DocSet for BitSetDocSet {
 mod tests {
     use std::collections::BTreeSet;
 
-    use common::BitSet;
+    use common::{BitSet, TinySet};
 
     use super::BitSetDocSet;
-    use crate::docset::{DocSet, TERMINATED};
+    use crate::docset::{DocSet, BLOCK_NUM_TINYBITSETS, TERMINATED};
     use crate::tests::generate_nonunique_unsorted;
     use crate::DocId;
 
@@ -164,6 +182,25 @@ mod tests {
         test_go_through_sequential(&[1, 2, 3, 4, 5, 63, 64, 65]);
         test_go_through_sequential(&[63, 64, 65]);
         test_go_through_sequential(&[1, 2, 3, 4, 95, 96, 97, 98, 99]);
+    }
+
+    #[test]
+    fn test_fill_bitset_block() {
+        let mut docset = create_docbitset(&[1, 49, 50, 63, 64, 1_073, 1_074, 2_000], 3_000);
+        let mut mask = [TinySet::EMPTY; BLOCK_NUM_TINYBITSETS];
+
+        assert_eq!(docset.fill_bitset_block(50, &mut mask), 1_074);
+        let docs: Vec<DocId> = mask
+            .into_iter()
+            .enumerate()
+            .flat_map(|(bucket, tinyset)| {
+                tinyset
+                    .into_iter()
+                    .map(move |doc| 50 + bucket as u32 * 64 + doc)
+            })
+            .collect();
+        assert_eq!(docs, [50, 63, 64, 1_073]);
+        assert_eq!(docset.doc(), 1_074);
     }
 
     #[test]

@@ -332,6 +332,24 @@ impl BitSet {
     pub fn tinyset(&self, bucket: u32) -> TinySet {
         self.tinysets[bucket as usize]
     }
+
+    /// Returns the set restricted to `[start, start + 64)`, normalized to start at zero.
+    pub fn tinyset_window(&self, start: u32) -> TinySet {
+        if start >= self.max_value {
+            return TinySet::EMPTY;
+        }
+        let bucket = (start / 64) as usize;
+        let offset = start % 64;
+        if offset == 0 {
+            return self.tinysets[bucket];
+        }
+
+        let mut bits = self.tinysets[bucket].0 >> offset;
+        if let Some(next) = self.tinysets.get(bucket + 1) {
+            bits |= next.0 << (64 - offset);
+        }
+        TinySet(bits)
+    }
 }
 
 /// Serialized BitSet.
@@ -475,6 +493,24 @@ mod tests {
 
         let bitset = ReadOnlyBitSet::open(OwnedBytes::new(out));
         assert_eq!(bitset.len(), 4);
+    }
+
+    #[test]
+    fn test_tinyset_window() {
+        let mut bitset = BitSet::with_max_value(130);
+        for doc in [49, 50, 63, 64, 113, 114, 129] {
+            bitset.insert(doc);
+        }
+
+        assert_eq!(
+            bitset.tinyset_window(50).into_iter().collect::<Vec<_>>(),
+            [0, 13, 14, 63]
+        );
+        assert_eq!(
+            bitset.tinyset_window(114).into_iter().collect::<Vec<_>>(),
+            [0, 15]
+        );
+        assert!(bitset.tinyset_window(130).is_empty());
     }
 
     #[test]
