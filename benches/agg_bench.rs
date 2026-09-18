@@ -106,6 +106,7 @@ fn bench_agg(runner: &mut BenchRunner, index: &Index, execute_filtered: Aggregat
             benchmark_config!(average_u64),
             benchmark_config!(average_f64),
             benchmark_config!(average_f64_u64),
+            benchmark_config!(individual_stats_f64),
             benchmark_config!(stats_f64),
             benchmark_config!(extendedstats_f64),
             benchmark_config!(percentiles_f64),
@@ -145,6 +146,7 @@ fn bench_agg(runner: &mut BenchRunner, index: &Index, execute_filtered: Aggregat
             benchmark_config!(terms_status_with_date_histogram_8_buckets),
             benchmark_config!(terms_status_with_date_histogram_hard_bounds),
             benchmark_config!(terms_status_with_date_histogram_and_sibling_terms),
+            benchmark_config!(terms_status_with_date_histogram_and_equivalent_sibling_terms),
         ],
     ));
     groups.push((
@@ -214,6 +216,15 @@ fn average_f64_u64() -> AggregationRequest {
     json!({
         "average_f64": { "avg": { "field": "score_f64" } },
         "average": { "avg": { "field": "score" } },
+    })
+}
+fn individual_stats_f64() -> AggregationRequest {
+    json!({
+        "average_f64": { "avg": { "field": "score_f64" } },
+        "count_f64": { "value_count": { "field": "score_f64" } },
+        "max_f64": { "max": { "field": "score_f64" } },
+        "min_f64": { "min": { "field": "score_f64" } },
+        "sum_f64": { "sum": { "field": "score_f64" } },
     })
 }
 fn stats_f64() -> AggregationRequest {
@@ -602,6 +613,18 @@ fn terms_status_with_date_histogram_and_sibling_terms() -> AggregationRequest {
             }
         },
         "other_texts": { "terms": { "field": "text_few_terms" } }
+    })
+}
+
+fn terms_status_with_date_histogram_and_equivalent_sibling_terms() -> AggregationRequest {
+    json!({
+        "my_texts": {
+            "terms": { "field": "text_few_terms_status" },
+            "aggs": {
+                "over_time": { "date_histogram": { "field": "timestamp", "fixed_interval": "1h" } }
+            }
+        },
+        "same_texts": { "terms": { "field": "text_few_terms_status" } }
     })
 }
 
