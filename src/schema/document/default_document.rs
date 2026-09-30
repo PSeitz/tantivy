@@ -61,6 +61,13 @@ impl CompactDoc {
         self.field_values.shrink_to_fit();
     }
 
+    /// Returns the memory occupied by the document, including its allocated capacity.
+    pub fn mem_usage(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.node_data.capacity()
+            + self.field_values.capacity() * std::mem::size_of::<FieldValueAddr>()
+    }
+
     /// Returns the length of the document.
     pub fn len(&self) -> usize {
         self.field_values.len()

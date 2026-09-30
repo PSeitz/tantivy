@@ -180,7 +180,7 @@ pub use self::default_document::{
 };
 pub use self::erased::{ErasedDocument, ErasedValue};
 pub use self::owned_value::OwnedValue;
-pub(crate) use self::se::BinaryDocumentSerializer;
+pub(crate) use self::se::{BinaryDocumentSerializer, BinaryValueSerializer};
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
 use super::*;
 
