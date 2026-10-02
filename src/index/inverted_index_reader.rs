@@ -527,11 +527,11 @@ impl InvertedIndexReader {
         Ok(postings_found)
     }
 
-    /// Warms and decodes the postings matching several automatons in one term dictionary scan.
+    /// Warms and decodes postings in batches of up to 64 automatons per term dictionary scan.
     ///
     /// The returned bitsets are in the same order as `automatons`. A posting list matching several
-    /// automatons is decoded only once. Matching automatons are identified from the dictionary
-    /// traversal states, without evaluating each matching term again.
+    /// automatons is decoded only once per batch. Matching automatons are identified from the
+    /// dictionary traversal states, without evaluating each matching term again.
     pub async fn warm_postings_automatons<
         A: Automaton + Send + 'static,
         E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
@@ -551,13 +551,14 @@ impl InvertedIndexReader {
 
         // Load only term dictionary blocks that can match at least one automaton before traversing
         // them synchronously on the executor.
-        let automaton_union = AutomatonUnion(&automatons);
-        let term_info_stream = self
-            .termdict
-            .search(automaton_union)
-            .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES)
-            .await?;
-        drop(term_info_stream);
+        for batch in automatons.chunks(u64::BITS as usize) {
+            let term_info_stream = self
+                .termdict
+                .search(AutomatonUnion(batch))
+                .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES)
+                .await?;
+            drop(term_info_stream);
+        }
 
         let (posting_range_sender, posting_range_receiver) = futures_channel::mpsc::unbounded();
         let (downloads_done_sender, downloads_done_receiver) = std::sync::mpsc::channel();
@@ -566,26 +567,29 @@ impl InvertedIndexReader {
         let postings_file_slice = self.postings_file_slice.clone();
         let record_option = self.record_option;
         let cpu_bound_task = move || {
-            let automaton_union = AutomatonUnion(&automatons);
-            let mut stream = termdict.search(automaton_union).into_stream()?;
-            let mut matching_terms: Vec<(TermInfo, Vec<usize>)> = Vec::new();
-            let posting_ranges = std::iter::from_fn(|| {
-                if !stream.advance() {
-                    return None;
-                }
-                let matching_automaton_ids: Vec<usize> = automatons
-                    .iter()
-                    .zip(stream.automaton_state())
-                    .enumerate()
-                    .filter_map(|(automaton_id, (automaton, state))| {
-                        automaton.is_match(state).then_some(automaton_id)
-                    })
-                    .collect();
-                let term_info = stream.value();
-                matching_terms.push((term_info.clone(), matching_automaton_ids));
-                Some(term_info.postings_range.clone())
-            });
-            send_coalesced_posting_ranges(posting_ranges, posting_range_sender)?;
+            let mut matching_batches = Vec::new();
+            for batch in automatons.chunks(u64::BITS as usize) {
+                let mut stream = termdict.search(AutomatonUnion(batch)).into_stream()?;
+                let mut matching_terms: Vec<(TermInfo, u64)> = Vec::new();
+                let posting_ranges = std::iter::from_fn(|| {
+                    if !stream.advance() {
+                        return None;
+                    }
+                    let matching_automatons = batch
+                        .iter()
+                        .zip(stream.automaton_state())
+                        .enumerate()
+                        .fold(0u64, |mask, (automaton_id, (automaton, state))| {
+                            mask | (u64::from(automaton.is_match(state)) << automaton_id)
+                        });
+                    let term_info = stream.value();
+                    matching_terms.push((term_info.clone(), matching_automatons));
+                    Some(term_info.postings_range.clone())
+                });
+                send_coalesced_posting_ranges(posting_ranges, posting_range_sender.clone())?;
+                matching_batches.push(matching_terms);
+            }
+            drop(posting_range_sender);
 
             downloads_done_receiver
                 .recv()
@@ -594,25 +598,33 @@ impl InvertedIndexReader {
             let mut bitsets: Vec<BitSet> = (0..automatons.len())
                 .map(|_| BitSet::with_max_value(max_doc))
                 .collect();
-            for (term_info, matching_automaton_ids) in matching_terms {
-                let postings_data = postings_file_slice.slice(term_info.postings_range.clone());
-                let mut block_postings = BlockSegmentPostings::open(
-                    term_info.doc_freq,
-                    postings_data,
-                    record_option,
-                    IndexRecordOption::Basic,
-                )?;
-                loop {
-                    let docs = block_postings.docs();
-                    if docs.is_empty() {
-                        break;
-                    }
-                    for &doc in docs {
-                        for &automaton_id in &matching_automaton_ids {
-                            bitsets[automaton_id].insert(doc);
+            for (matching_terms, batch) in matching_batches
+                .into_iter()
+                .zip(bitsets.chunks_mut(u64::BITS as usize))
+            {
+                for (term_info, matching_automatons) in matching_terms {
+                    let postings_data = postings_file_slice.slice(term_info.postings_range.clone());
+                    let mut block_postings = BlockSegmentPostings::open(
+                        term_info.doc_freq,
+                        postings_data,
+                        record_option,
+                        IndexRecordOption::Basic,
+                    )?;
+                    loop {
+                        let docs = block_postings.docs();
+                        if docs.is_empty() {
+                            break;
                         }
+                        for &doc in docs {
+                            let mut remaining = matching_automatons;
+                            while remaining != 0 {
+                                let automaton_id = remaining.trailing_zeros() as usize;
+                                batch[automaton_id].insert(doc);
+                                remaining &= remaining - 1;
+                            }
+                        }
+                        block_postings.advance();
                     }
-                    block_postings.advance();
                 }
             }
             bitsets_sender
@@ -778,6 +790,28 @@ mod tests {
             vec![vec![0, 2], vec![], vec![0, 1], vec![0, 1, 2, 3], vec![0, 2]]
         );
         assert_eq!(transitions.load(Ordering::Relaxed), traversal_transitions);
+
+        // Exercise the highest mask bit, full batches, and a partial final batch.
+        for num_automatons in [64, 65, 128, 129] {
+            let patterns = ["b.*", "z.*", "a.*", ".*a.*", "b.*"]
+                .into_iter()
+                .cycle()
+                .take(num_automatons)
+                .map(|pattern| Regex::new(pattern).unwrap())
+                .collect();
+            let bitsets = futures::executor::block_on(inverted_index.warm_postings_automatons(
+                patterns,
+                segment_reader.max_doc(),
+                execute_on_thread,
+            ))?;
+            assert_eq!(bitsets.len(), num_automatons);
+            for (bitset, expected_docs) in bitsets.iter().zip(docs.iter().cycle()) {
+                let actual_docs: Vec<_> = (0..bitset.max_value())
+                    .filter(|&doc| bitset.contains(doc))
+                    .collect();
+                assert_eq!(&actual_docs, expected_docs);
+            }
+        }
 
         for patterns in [vec![], vec![Regex::new("z.*").unwrap()]] {
             let num_patterns = patterns.len();
