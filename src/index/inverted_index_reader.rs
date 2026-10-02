@@ -571,10 +571,7 @@ impl InvertedIndexReader {
             for batch in automatons.chunks(u64::BITS as usize) {
                 let mut stream = termdict.search(AutomatonUnion(batch)).into_stream()?;
                 let mut matching_terms: Vec<(TermInfo, u64)> = Vec::new();
-                let posting_ranges = std::iter::from_fn(|| {
-                    if !stream.advance() {
-                        return None;
-                    }
+                while stream.advance() {
                     let matching_automatons = batch
                         .iter()
                         .zip(stream.automaton_state())
@@ -584,12 +581,15 @@ impl InvertedIndexReader {
                         });
                     let term_info = stream.value();
                     matching_terms.push((term_info.clone(), matching_automatons));
-                    Some(term_info.postings_range.clone())
-                });
-                send_coalesced_posting_ranges(posting_ranges, posting_range_sender.clone())?;
+                }
                 matching_batches.push(matching_terms);
             }
-            drop(posting_range_sender);
+            let posting_ranges = matching_batches
+                .iter()
+                .flatten()
+                .map(|(term_info, _)| term_info.postings_range.clone())
+                .sorted_unstable_by_key(|range| range.start);
+            send_coalesced_posting_ranges(posting_ranges, posting_range_sender)?;
 
             downloads_done_receiver
                 .recv()
