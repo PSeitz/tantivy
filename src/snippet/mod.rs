@@ -245,15 +245,12 @@ fn search_fragments(
 /// Figures out the best fragment from it and creates a snippet.
 fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str) -> Snippet {
     let best_fragment_opt = fragments.iter().max_by(|left, right| {
-        let cmp_score = left
-            .score
+        left.score
             .partial_cmp(&right.score)
-            .unwrap_or(Ordering::Equal);
-        if cmp_score == Ordering::Equal {
-            (right.start_offset, right.stop_offset).cmp(&(left.start_offset, left.stop_offset))
-        } else {
-            cmp_score
-        }
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                (right.start_offset, right.stop_offset).cmp(&(left.start_offset, left.stop_offset))
+            })
     });
     if let Some(fragment) = best_fragment_opt {
         let fragment_text = &text[fragment.start_offset..fragment.stop_offset];
@@ -274,79 +271,29 @@ fn select_best_fragment_combination(fragments: &[FragmentCandidate], text: &str)
     }
 }
 
-/// Sorts and removes duplicate ranges from the input.
-///
-/// This function first sorts the ranges by their start position,
-/// then by their end position, and finally removes any duplicate ranges.
-///
-/// ## Examples
-/// - [0..3, 3..6, 0..3, 3..6] -> [0..3, 3..6]
-/// - [2..4, 1..3, 2..4, 0..2] -> [0..2, 1..3, 2..4]
-fn sort_and_deduplicate_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
-    let mut sorted_ranges = ranges.to_vec();
-    sorted_ranges.sort_by_key(|range| (range.start, range.end));
-    sorted_ranges.dedup();
-    sorted_ranges
-}
-
-/// Merges overlapping or adjacent ranges into non-overlapping ranges.
-///
-/// This function assumes that the input ranges are already sorted
-/// and deduplicated. Use `sort_and_deduplicate_ranges` before calling
-/// this function if the input might contain unsorted or duplicate ranges.
-///
-/// ## Examples
-/// - [0..1, 2..3] -> [0..1, 2..3]  # no overlap
-/// - [0..1, 1..2] -> [0..2]  # adjacent, merged
-/// - [0..2, 1..3] -> [0..3]  # overlapping, merged
-/// - [0..3, 1..2] -> [0..3]  # second range is completely within the first
-fn merge_overlapping_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
-    debug_assert!(is_sorted(ranges.iter().map(|range| range.start)));
-    let mut result = Vec::<Range<usize>>::new();
-    for range in ranges {
-        if let Some(last) = result.last_mut() {
-            if last.end > range.start {
-                // Only merge when there is a true overlap.
-                last.end = std::cmp::max(last.end, range.end);
-            } else {
-                // Do not overlap or only adjacent, add new scope.
-                result.push(range.clone());
-            }
-        } else {
-            // The first range
-            result.push(range.clone());
-        }
-    }
-    result
-}
-
 /// Collapses ranges into non-overlapped ranges.
 ///
-/// This function first sorts and deduplicates the input ranges,
-/// then merges any overlapping or adjacent ranges.
+/// Sorts the input ranges, removes duplicates, and merges overlapping ranges.
+/// Adjacent ranges remain separate.
 ///
 /// ## Examples
 /// - [0..1, 2..3] -> [0..1, 2..3]  # no overlap
-/// - [0..1, 1..2] -> [0..2]  # adjacent, merged
+/// - [0..1, 1..2] -> [0..1, 1..2]  # adjacent, separate
 /// - [0..2, 1..3] -> [0..3]  # overlapping, merged
 /// - [0..3, 1..2] -> [0..3]  # second range is completely within the first
-/// - [0..3, 3..6, 0..3, 3..6] -> [0..6]  # duplicates removed, then merged
+/// - [0..3, 3..6, 0..3, 3..6] -> [0..3, 3..6]  # duplicates removed
 pub fn collapse_overlapped_ranges(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
-    let prepared = sort_and_deduplicate_ranges(ranges);
-    merge_overlapping_ranges(&prepared)
-}
-
-fn is_sorted(mut it: impl Iterator<Item = usize>) -> bool {
-    if let Some(first) = it.next() {
-        let mut prev = first;
-        for item in it {
-            if item < prev {
-                return false;
-            }
-            prev = item;
+    let mut ranges = ranges.to_vec();
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges.dedup_by(|range, previous| {
+        if range.start < previous.end || range == previous {
+            previous.end = previous.end.max(range.end);
+            true
+        } else {
+            false
         }
-    }
-    true
+    });
+    ranges
 }
 
 /// `SnippetGenerator`
@@ -942,5 +889,12 @@ Survey in 2016, 2017, and 2018."#;
         let ranges = vec![0..0, 1..1, 2..2, 3..3];
         let result = collapse_overlapped_ranges(&ranges);
         assert_eq!(result, vec![0..0, 1..1, 2..2, 3..3]);
+    }
+
+    #[test]
+    fn test_duplicate_zero_length_ranges() {
+        let ranges = vec![1..1, 0..0, 1..1, 0..0];
+        let result = collapse_overlapped_ranges(&ranges);
+        assert_eq!(result, vec![0..0, 1..1]);
     }
 }
