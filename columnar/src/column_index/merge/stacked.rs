@@ -4,7 +4,7 @@ use crate::column_index::SerializableColumnIndex;
 use crate::column_index::multivalued_index::{MultiValueIndex, SerializableMultivalueIndex};
 use crate::column_index::serialize::SerializableOptionalIndex;
 use crate::iterable::Iterable;
-use crate::{Cardinality, ColumnIndex, RowId, StackMergeOrder};
+use crate::{Cardinality, ColumnIndex, StackMergeOrder};
 
 /// Simple case:
 /// The new mapping just consists in stacking the different column indexes.
@@ -17,13 +17,9 @@ pub fn merge_column_index_stacked<'a>(
 ) -> SerializableColumnIndex<'a> {
     match cardinality_after_merge {
         Cardinality::Full => SerializableColumnIndex::Full,
-        Cardinality::Optional => SerializableColumnIndex::Optional(SerializableOptionalIndex {
-            non_null_row_ids: Box::new(StackedOptionalIndex {
-                columns,
-                stack_merge_order,
-            }),
-            num_rows: stack_merge_order.num_rows(),
-        }),
+        Cardinality::Optional => {
+            SerializableColumnIndex::Optional(stack_doc_ids_with_values(columns, stack_merge_order))
+        }
         Cardinality::Multivalued => {
             let serializable_multivalue_index =
                 make_serializable_multivalued_index(columns, stack_merge_order);
@@ -158,36 +154,5 @@ fn make_serializable_multivalued_index<'a>(
     SerializableMultivalueIndex {
         doc_ids_with_values: stack_doc_ids_with_values(columns, stack_merge_order),
         start_offsets: stack_start_offsets(columns, stack_merge_order),
-    }
-}
-
-struct StackedOptionalIndex<'a> {
-    columns: &'a [ColumnIndex],
-    stack_merge_order: &'a StackMergeOrder,
-}
-
-impl<'a> Iterable<RowId> for StackedOptionalIndex<'a> {
-    fn boxed_iter(&self) -> Box<dyn Iterator<Item = RowId> + 'a> {
-        Box::new(
-            self.columns
-                .iter()
-                .enumerate()
-                .flat_map(|(columnar_id, column_index_opt)| {
-                    let columnar_row_range = self.stack_merge_order.columnar_range(columnar_id);
-                    let rows_it: Box<dyn Iterator<Item = RowId>> = match column_index_opt {
-                        ColumnIndex::Full => Box::new(columnar_row_range),
-                        ColumnIndex::Optional(optional_index) => Box::new(
-                            optional_index
-                                .iter_non_null_docs()
-                                .map(move |row_id: RowId| columnar_row_range.start + row_id),
-                        ),
-                        ColumnIndex::Multivalued(_) => {
-                            panic!("No multivalued index is allowed when stacking column index");
-                        }
-                        ColumnIndex::Empty { .. } => Box::new(std::iter::empty()),
-                    };
-                    rows_it
-                }),
-        )
     }
 }
