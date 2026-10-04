@@ -174,10 +174,6 @@ impl ColumnBlockAccessor {
     ///
     /// Skips entirely if no doc_id appears more than once in the block.
     fn dedup_docid_val_pairs(&mut self) {
-        if self.docid_cache.len() <= 1 {
-            return;
-        }
-
         // Quick check: if no consecutive doc_ids are equal, no dedup needed.
         let has_multivalue = self.docid_cache.windows(2).any(|w| w[0] == w[1]);
         if !has_multivalue {
@@ -185,17 +181,13 @@ impl ColumnBlockAccessor {
         }
 
         // Sort values within each doc_id group so duplicates become adjacent.
-        let mut start = 0;
-        while start < self.docid_cache.len() {
-            let doc = self.docid_cache[start];
-            let mut end = start + 1;
-            while end < self.docid_cache.len() && self.docid_cache[end] == doc {
-                end += 1;
+        let mut values = self.val_cache.as_mut_slice();
+        for docids in self.docid_cache.chunk_by(|left, right| left == right) {
+            let (doc_values, remaining_values) = values.split_at_mut(docids.len());
+            if doc_values.len() > 2 {
+                doc_values.sort();
             }
-            if end - start > 2 {
-                self.val_cache[start..end].sort();
-            }
-            start = end;
+            values = remaining_values;
         }
 
         // Now duplicates are adjacent — deduplicate in place.
