@@ -4,11 +4,10 @@ use columnar::column_index::{MultiValueIndex, OptionalIndex};
 use columnar::ColumnIndex;
 use common::BitSet;
 
-use super::{ConstScorer, EmptyScorer};
+use super::ConstScorer;
 use crate::docset::{DocSet, TERMINATED};
 use crate::index::SegmentReader;
-use crate::query::all_query::AllScorer;
-use crate::query::boost_query::BoostScorer;
+use crate::query::all_query::AllWeight;
 use crate::query::explanation::does_not_match;
 use crate::query::{BitSetDocSet, EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::schema::Type;
@@ -119,12 +118,7 @@ impl Weight for FastFieldExistsWeight {
             .iter()
             .any(|column_index| matches!(column_index, ColumnIndex::Full))
         {
-            let all_scorer = AllScorer::new(max_doc);
-            if boost != 1.0f32 {
-                return Ok(Box::new(BoostScorer::new(all_scorer, boost)));
-            } else {
-                return Ok(Box::new(all_scorer));
-            }
+            return AllWeight.scorer(reader, boost);
         }
 
         let mut column_indexes: Vec<ExistsColumnIndex> = column_indexes
@@ -140,10 +134,6 @@ impl Weight for FastFieldExistsWeight {
                 ColumnIndex::Full => unreachable!(),
             })
             .collect();
-        if column_indexes.is_empty() {
-            return Ok(Box::new(EmptyScorer));
-        }
-
         if column_indexes.len() == 1 {
             return Ok(exists_scorer(column_indexes.pop().unwrap(), boost));
         }
@@ -280,7 +270,7 @@ mod tests {
     use crate::collector::Count;
     use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
     use crate::query::exist_query::{ExistsColumnIndex, ExistsDocSet, ExistsQuery};
-    use crate::query::{BooleanQuery, RangeQuery};
+    use crate::query::{BooleanQuery, EnableScoring, Query, RangeQuery};
     use crate::schema::{Facet, FacetOptions, Schema, FAST, INDEXED, STRING, TEXT};
     use crate::{Index, Searcher, Term};
 
@@ -331,6 +321,13 @@ mod tests {
         let searcher = reader.searcher();
 
         assert_eq!(count_existing_fields(&searcher, "all", false)?, 100);
+        let weight = ExistsQuery::new("all".to_string(), false)
+            .weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        for boost in [1.0, 2.5] {
+            let mut scorer = weight.scorer(searcher.segment_reader(0), boost)?;
+            assert_eq!(scorer.doc(), 0);
+            assert_eq!(scorer.score(), boost);
+        }
         assert_eq!(count_existing_fields(&searcher, "odd", false)?, 50);
         assert_eq!(count_existing_fields(&searcher, "even", false)?, 50);
         assert_eq!(count_existing_fields(&searcher, "multi", false)?, 10);

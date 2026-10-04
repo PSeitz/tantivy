@@ -64,7 +64,7 @@ macro_rules! implementations {
 implementations! {
     ("intersection.rs", Intersection, query_seek_danger_intersection),
     ("", BufferedUnion, query_seek_danger_buffered_union),
-    ("boost_query.rs", Boost, query_seek_danger_boost),
+    ("", Boost, query_seek_danger_boost),
     ("const_score_query.rs", ConstScore, query_seek_danger_const_score),
     ("reqopt_scorer.rs", RequiredOptional, query_seek_danger_required_optional),
     ("phrase_query/phrase_scorer.rs", Phrase, query_seek_danger_phrase),

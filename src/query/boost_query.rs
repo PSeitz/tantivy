@@ -1,9 +1,8 @@
 use std::fmt;
 
-use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
-use crate::fastfield::AliveBitSet;
+use crate::docset::SeekDangerResult;
 use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
-use crate::{DocId, DocSet, Score, SegmentReader, Term};
+use crate::{DocId, Score, SegmentReader, Term};
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
 ///
@@ -92,61 +91,6 @@ impl Weight for BoostWeight {
     ) -> crate::Result<(SeekDangerResult, Box<dyn Scorer>)> {
         self.weight
             .scorer_danger(reader, target, boost * self.boost)
-    }
-}
-
-pub(crate) struct BoostScorer<S: Scorer> {
-    underlying: S,
-    boost: Score,
-}
-
-impl<S: Scorer> BoostScorer<S> {
-    pub fn new(underlying: S, boost: Score) -> BoostScorer<S> {
-        BoostScorer { underlying, boost }
-    }
-}
-
-impl<S: Scorer> DocSet for BoostScorer<S> {
-    fn advance(&mut self) -> DocId {
-        self.underlying.advance()
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        self.underlying.seek(target)
-    }
-    fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
-        self.underlying.seek_danger(target)
-    }
-
-    fn fill_buffer(&mut self, buffer: &mut [DocId; COLLECT_BLOCK_BUFFER_LEN]) -> usize {
-        self.underlying.fill_buffer(buffer)
-    }
-
-    fn doc(&self) -> u32 {
-        self.underlying.doc()
-    }
-
-    fn size_hint(&self) -> u32 {
-        self.underlying.size_hint()
-    }
-
-    fn cost(&self) -> u64 {
-        self.underlying.cost()
-    }
-
-    fn count(&mut self, alive_bitset: &AliveBitSet) -> u32 {
-        self.underlying.count(alive_bitset)
-    }
-
-    fn count_including_deleted(&mut self) -> u32 {
-        self.underlying.count_including_deleted()
-    }
-}
-
-impl<S: Scorer> Scorer for BoostScorer<S> {
-    #[inline]
-    fn score(&mut self) -> Score {
-        self.underlying.score() * self.boost
     }
 }
 
