@@ -32,9 +32,6 @@ impl VecCursor {
         self.current_pos = 0;
         &mut self.docs
     }
-    fn last_doc(&self) -> Option<u32> {
-        self.docs.last().cloned()
-    }
     fn is_empty(&self) -> bool {
         self.current().is_none()
     }
@@ -63,26 +60,22 @@ pub(crate) struct RangeDocSet<T> {
 const DEFAULT_FETCH_HORIZON: u32 = 128;
 impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
     pub(crate) fn new(value_range: RangeInclusive<T>, column: Column<T>) -> Self {
-        if *value_range.start() > column.max_value() || *value_range.end() < column.min_value() {
-            return Self {
-                value_range,
-                column,
-                loaded_docs: VecCursor::new(),
-                next_fetch_start: TERMINATED,
-                fetch_horizon: DEFAULT_FETCH_HORIZON,
-                last_seek_pos_opt: None,
-            };
-        }
+        let next_fetch_start = if *value_range.start() > column.max_value()
+            || *value_range.end() < column.min_value()
+        {
+            TERMINATED
+        } else {
+            0
+        };
 
         let mut range_docset = Self {
             value_range,
             column,
             loaded_docs: VecCursor::new(),
-            next_fetch_start: 0,
+            next_fetch_start,
             fetch_horizon: DEFAULT_FETCH_HORIZON,
             last_seek_pos_opt: None,
         };
-        range_docset.reset_fetch_range();
         range_docset.fetch_block();
         range_docset
     }
@@ -118,30 +111,18 @@ impl<T: Send + Sync + PartialOrd + Copy + Debug + 'static> RangeDocSet<T> {
 
     /// Fetches a block for docid range [next_fetch_start .. next_fetch_start + HORIZON]
     fn fetch_horizon(&mut self, horizon: u32) -> bool {
-        let mut finished_to_end = false;
-
         let num_docs = self.column.num_docs();
-        let mut fetch_end = self.next_fetch_start + horizon;
-        if fetch_end >= num_docs {
-            fetch_end = num_docs;
-            finished_to_end = true;
-        }
+        let fetch_end = (self.next_fetch_start + horizon).min(num_docs);
 
-        let last_doc = self.loaded_docs.last_doc();
         let doc_buffer: &mut Vec<DocId> = self.loaded_docs.get_cleared_data();
         self.column.get_docids_for_value_range(
             self.value_range.clone(),
             self.next_fetch_start..fetch_end,
             doc_buffer,
         );
-        if let Some(last_doc) = last_doc {
-            while self.loaded_docs.current() == Some(last_doc) {
-                self.loaded_docs.next();
-            }
-        }
         self.next_fetch_start = fetch_end;
 
-        finished_to_end
+        fetch_end == num_docs
     }
 }
 

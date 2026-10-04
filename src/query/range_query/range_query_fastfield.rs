@@ -159,31 +159,19 @@ impl Weight for FastFieldRangeWeight {
             );
             let docset = RangeDocSet::new(value_range, ip_addr_column);
             Ok(Box::new(ConstScorer::new(docset, boost)))
-        } else if field_type.is_str() {
-            let Some(str_dict_column): Option<StrColumn> = reader.fast_fields().str(&field_name)?
-            else {
-                return Ok(Box::new(EmptyScorer));
-            };
-            let dict = str_dict_column.dictionary();
-
-            let bounds = self.bounds.map_bound(get_value_bytes);
-            // Get term ids for terms
-            let (lower_bound, upper_bound) =
-                dict.term_bounds_to_ord(bounds.lower_bound, bounds.upper_bound)?;
-            let fast_field_reader = reader.fast_fields();
-            let Some((column, _col_type)) =
-                fast_field_reader.u64_lenient_for_type(None, &field_name)?
-            else {
-                return Ok(Box::new(EmptyScorer));
-            };
-            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
-        } else if field_type.is_bytes() {
-            let Some(bytes_column): Option<BytesColumn> =
+        } else if field_type.is_str() || field_type.is_bytes() {
+            let dictionary_column = if field_type.is_str() {
+                reader
+                    .fast_fields()
+                    .str(&field_name)?
+                    .map(BytesColumn::from)
+            } else {
                 reader.fast_fields().bytes(&field_name)?
-            else {
+            };
+            let Some(dictionary_column) = dictionary_column else {
                 return Ok(Box::new(EmptyScorer));
             };
-            let dict = bytes_column.dictionary();
+            let dict = dictionary_column.dictionary();
 
             let bounds = self.bounds.map_bound(get_value_bytes);
             // Get term ids for terms
@@ -423,17 +411,15 @@ fn search_on_u64_ff(
 ) -> crate::Result<Box<dyn Scorer>> {
     let col_min_value = column.min_value();
     let col_max_value = column.max_value();
-    #[expect(clippy::reversed_empty_ranges)]
-    let value_range = bound_to_value_range(
+    let Some(value_range) = bound_to_value_range(
         &bounds.lower_bound,
         &bounds.upper_bound,
         column.min_value(),
         column.max_value(),
     )
-    .unwrap_or(1..=0); // empty range
-    if value_range.is_empty() {
+    .filter(|range| !range.is_empty()) else {
         return Ok(Box::new(EmptyScorer));
-    }
+    };
     if col_min_value >= *value_range.start() && col_max_value <= *value_range.end() {
         // all values in the column are within the range.
         if column.index.get_cardinality() == Cardinality::Full {
