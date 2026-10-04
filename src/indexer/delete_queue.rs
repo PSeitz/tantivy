@@ -1,4 +1,3 @@
-use std::ops::DerefMut;
 use std::sync::{Arc, RwLock, Weak};
 
 use super::operation::DeleteOperation;
@@ -138,28 +137,16 @@ impl NextBlock {
                 return Some(Arc::clone(block));
             }
         }
-        let next_block;
-        {
-            let mut next_write_lock = self
-                .0
-                .write()
-                .expect("Failed to acquire write lock in delete queue");
-            match *next_write_lock {
-                InnerNextBlock::Closed(ref block) => {
-                    return Some(Arc::clone(block));
-                }
-                InnerNextBlock::Writer(ref writer) => match writer.flush() {
-                    Some(flushed_next_block) => {
-                        next_block = flushed_next_block;
-                    }
-                    None => {
-                        return None;
-                    }
-                },
-            }
-            *next_write_lock.deref_mut() = InnerNextBlock::Closed(Arc::clone(&next_block));
-            Some(next_block)
-        }
+        let mut next_write_lock = self
+            .0
+            .write()
+            .expect("Failed to acquire write lock in delete queue");
+        let next_block = match *next_write_lock {
+            InnerNextBlock::Closed(ref block) => return Some(Arc::clone(block)),
+            InnerNextBlock::Writer(ref writer) => writer.flush()?,
+        };
+        *next_write_lock = InnerNextBlock::Closed(Arc::clone(&next_block));
+        Some(next_block)
     }
 }
 
@@ -201,21 +188,15 @@ impl DeleteCursor {
     /// been entirely consumed.
     /// Return `false`, if we have reached the end of the queue.
     fn load_block_if_required(&mut self) -> bool {
-        if self.pos >= self.block.operations.len() {
-            // we have consumed our operations entirely.
-            // let's ask our writer if he has more for us.
-            // self.go_next_block();
-            match self.block.next.next_block() {
-                Some(block) => {
-                    self.block = block;
-                    self.pos = 0;
-                    true
-                }
-                None => false,
-            }
-        } else {
-            true
+        if self.pos < self.block.operations.len() {
+            return true;
         }
+        let Some(block) = self.block.next.next_block() else {
+            return false;
+        };
+        self.block = block;
+        self.pos = 0;
+        true
     }
 
     /// Advance to the next delete operation.
