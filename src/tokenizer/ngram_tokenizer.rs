@@ -210,25 +210,13 @@ where T: Iterator<Item = usize>
     pub fn new(mut underlying: T, min_gram: usize, max_gram: usize) -> StutteringIterator<T> {
         assert!(min_gram > 0);
         let memory: Vec<usize> = (&mut underlying).take(max_gram + 1).collect();
-        if memory.len() <= min_gram {
-            // returns an empty iterator
-            StutteringIterator {
-                underlying,
-                min_gram: 1,
-                max_gram: 0,
-                memory,
-                cursor: 0,
-                gram_len: 0,
-            }
-        } else {
-            StutteringIterator {
-                underlying,
-                min_gram,
-                max_gram: memory.len() - 1,
-                memory,
-                cursor: 0,
-                gram_len: min_gram,
-            }
+        StutteringIterator {
+            underlying,
+            min_gram,
+            max_gram: memory.len().saturating_sub(1),
+            memory,
+            cursor: 0,
+            gram_len: min_gram,
         }
     }
 }
@@ -239,6 +227,9 @@ where T: Iterator<Item = usize>
     type Item = (usize, usize);
 
     fn next(&mut self) -> Option<(usize, usize)> {
+        if self.max_gram < self.min_gram {
+            return None;
+        }
         if self.gram_len > self.max_gram {
             // we have exhausted all options
             // starting at `self.memory[self.cursor]`.
@@ -461,9 +452,11 @@ mod tests {
 
     #[test]
     fn test_stuttering_iterator_empty() {
-        let rg: Vec<usize> = vec![0];
-        let mut it = StutteringIterator::new(rg.into_iter(), 1, 2);
-        assert_eq!(it.next(), None);
+        for len in 0..=2 {
+            let mut it = StutteringIterator::new(0..len, 2, 3);
+            assert_eq!(it.next(), None);
+            assert_eq!(it.next(), None);
+        }
     }
 
     #[test]
@@ -486,6 +479,7 @@ mod tests {
         assert_eq!(it.next(), Some((7, 8)));
         assert_eq!(it.next(), Some((7, 9)));
         assert_eq!(it.next(), Some((8, 9)));
+        assert_eq!(it.next(), None);
         assert_eq!(it.next(), None);
     }
 }
