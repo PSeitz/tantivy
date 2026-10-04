@@ -30,12 +30,7 @@ pub(crate) fn place_bits<const START: u8, const END: u8>(code: u8) -> u8 {
 /// Pop-front one bytes from a slice of bytes.
 #[inline(always)]
 pub fn pop_first_byte(bytes: &mut &[u8]) -> Option<u8> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let first_byte = bytes[0];
-    *bytes = &bytes[1..];
-    Some(first_byte)
+    bytes.split_off_first().copied()
 }
 
 #[cfg(test)]
