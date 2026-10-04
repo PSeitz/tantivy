@@ -10,7 +10,6 @@ pub(crate) mod path_to_unordered_id;
 
 pub mod doc_id_mapping;
 mod doc_opstamp_mapping;
-mod flat_map_with_buffer;
 pub(crate) mod index_writer;
 pub(crate) mod index_writer_status;
 pub(crate) mod indexing_term;
