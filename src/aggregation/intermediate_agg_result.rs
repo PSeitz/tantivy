@@ -297,17 +297,9 @@ impl IntermediateAggregationResults {
     }
 
     /// Merge another intermediate aggregation result into this result.
-    pub fn merge_fruits(&mut self, mut other: IntermediateAggregationResults) -> crate::Result<()> {
-        for (key, left) in self.aggs_res.iter_mut() {
-            if let Some(key) = other.aggs_res.remove(key) {
-                left.merge_fruits(key)?;
-            }
-        }
-        // Move remainder of other aggs_res into self.
-        // Note: Currently we don't expect this to happen, as we create empty intermediate results
-        // via [IntermediateAggregationResults::empty_from_req].
+    pub fn merge_fruits(&mut self, other: IntermediateAggregationResults) -> crate::Result<()> {
         for (key, value) in other.aggs_res {
-            self.aggs_res.insert(key, value);
+            self.push(key, value)?;
         }
         Ok(())
     }
@@ -2034,5 +2026,9 @@ mod tests {
             .unwrap();
 
         assert_range_trees_eq(&tree_left, &orig);
+
+        let mut empty = IntermediateAggregationResults::default();
+        empty.merge_fruits(tree_left).unwrap();
+        assert_range_trees_eq(&empty, &orig);
     }
 }
