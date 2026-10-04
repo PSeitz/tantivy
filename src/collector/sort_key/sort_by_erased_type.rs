@@ -39,23 +39,24 @@ trait ErasedSegmentSortKeyComputer: Send + Sync {
     fn convert_segment_sort_key(&self, sort_key: Option<u64>) -> OwnedValue;
 }
 
-struct ErasedSegmentSortKeyComputerWrapper<C, F> {
+struct ErasedSegmentSortKeyComputerWrapper<C> {
     inner: C,
-    converter: F,
 }
 
-impl<C, F> ErasedSegmentSortKeyComputer for ErasedSegmentSortKeyComputerWrapper<C, F>
+impl<C, T> ErasedSegmentSortKeyComputer for ErasedSegmentSortKeyComputerWrapper<C>
 where
-    C: SegmentSortKeyComputer<SegmentSortKey = Option<u64>> + Send + Sync,
-    F: Fn(C::SortKey) -> OwnedValue + Send + Sync + 'static,
+    C: SegmentSortKeyComputer<SortKey = Option<T>, SegmentSortKey = Option<u64>> + Send + Sync,
+    OwnedValue: From<T>,
 {
     fn segment_sort_key(&mut self, doc: DocId, score: Score) -> Option<u64> {
         self.inner.segment_sort_key(doc, score)
     }
 
     fn convert_segment_sort_key(&self, sort_key: Option<u64>) -> OwnedValue {
-        let val = self.inner.convert_segment_sort_key(sort_key);
-        (self.converter)(val)
+        self.inner
+            .convert_segment_sort_key(sort_key)
+            .map(OwnedValue::from)
+            .unwrap_or(OwnedValue::Null)
     }
 }
 
@@ -107,72 +108,37 @@ impl SortKeyComputer for SortByErasedType {
                     ColumnType::Str => {
                         let computer = SortByString::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
-                        Box::new(ErasedSegmentSortKeyComputerWrapper {
-                            inner,
-                            converter: |val: Option<String>| {
-                                val.map(OwnedValue::Str).unwrap_or(OwnedValue::Null)
-                            },
-                        })
+                        Box::new(ErasedSegmentSortKeyComputerWrapper { inner })
                     }
                     ColumnType::Bytes => {
                         let computer = SortByBytes::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
-                        Box::new(ErasedSegmentSortKeyComputerWrapper {
-                            inner,
-                            converter: |val: Option<Vec<u8>>| {
-                                val.map(OwnedValue::Bytes).unwrap_or(OwnedValue::Null)
-                            },
-                        })
+                        Box::new(ErasedSegmentSortKeyComputerWrapper { inner })
                     }
                     ColumnType::U64 => {
                         let computer = SortByStaticFastValue::<u64>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
-                        Box::new(ErasedSegmentSortKeyComputerWrapper {
-                            inner,
-                            converter: |val: Option<u64>| {
-                                val.map(OwnedValue::U64).unwrap_or(OwnedValue::Null)
-                            },
-                        })
+                        Box::new(ErasedSegmentSortKeyComputerWrapper { inner })
                     }
                     ColumnType::I64 => {
                         let computer = SortByStaticFastValue::<i64>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
-                        Box::new(ErasedSegmentSortKeyComputerWrapper {
-                            inner,
-                            converter: |val: Option<i64>| {
-                                val.map(OwnedValue::I64).unwrap_or(OwnedValue::Null)
-                            },
-                        })
+                        Box::new(ErasedSegmentSortKeyComputerWrapper { inner })
                     }
                     ColumnType::F64 => {
                         let computer = SortByStaticFastValue::<f64>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
-                        Box::new(ErasedSegmentSortKeyComputerWrapper {
-                            inner,
-                            converter: |val: Option<f64>| {
-                                val.map(OwnedValue::F64).unwrap_or(OwnedValue::Null)
-                            },
-                        })
+                        Box::new(ErasedSegmentSortKeyComputerWrapper { inner })
                     }
                     ColumnType::Bool => {
                         let computer = SortByStaticFastValue::<bool>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
-                        Box::new(ErasedSegmentSortKeyComputerWrapper {
-                            inner,
-                            converter: |val: Option<bool>| {
-                                val.map(OwnedValue::Bool).unwrap_or(OwnedValue::Null)
-                            },
-                        })
+                        Box::new(ErasedSegmentSortKeyComputerWrapper { inner })
                     }
                     ColumnType::DateTime => {
                         let computer = SortByStaticFastValue::<DateTime>::for_field(column_name);
                         let inner = computer.segment_sort_key_computer(segment_reader)?;
-                        Box::new(ErasedSegmentSortKeyComputerWrapper {
-                            inner,
-                            converter: |val: Option<DateTime>| {
-                                val.map(OwnedValue::Date).unwrap_or(OwnedValue::Null)
-                            },
-                        })
+                        Box::new(ErasedSegmentSortKeyComputerWrapper { inner })
                     }
                     column_type => {
                         return Err(crate::TantivyError::SchemaError(format!(
