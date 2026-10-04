@@ -91,9 +91,6 @@ impl Facet {
             Idle,
         }
         let path_ref = path.as_ref();
-        if path_ref.is_empty() {
-            return Err(FacetParseError::FacetParseError(path_ref.to_string()));
-        }
         if !path_ref.starts_with('/') {
             return Err(FacetParseError::FacetParseError(path_ref.to_string()));
         }
@@ -150,21 +147,12 @@ impl Facet {
     /// Disclaimer: By strict we mean that the relation is not reflexive.
     /// `/happy` is not a prefix of `/happy`.
     pub fn is_prefix_of(&self, other: &Facet) -> bool {
-        let self_str = self.encoded_str();
-        let other_str = other.encoded_str();
-
-        // Fast path, but also required to ensure that / is not a prefix of /.
-        if other_str.len() <= self_str.len() {
-            return false;
-        }
-
-        // Root is a prefix of every other path.
-        // This is not just an optimisation. It is necessary for correctness.
-        if self.is_root() {
-            return true;
-        }
-
-        other_str.starts_with(self_str) && other_str.as_bytes()[self_str.len()] == FACET_SEP_BYTE
+        other
+            .encoded_str()
+            .strip_prefix(self.encoded_str())
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && (self.is_root() || suffix.starts_with(FACET_SEP_CHAR))
+            })
     }
 
     /// Extract path from the `Facet`.
@@ -306,6 +294,7 @@ mod tests {
 
     #[test]
     fn test_from_text() {
+        assert!(Facet::from_text("").is_err());
         assert_eq!(
             Err(FacetParseError::FacetParseError("INVALID".to_string())),
             Facet::from_text("INVALID")
@@ -317,6 +306,10 @@ mod tests {
         assert!(Facet::from("/foo").is_prefix_of(&Facet::from("/foo/bar")));
 
         assert!(!Facet::from("/foo/bar").is_prefix_of(&Facet::from("/foo/bar")));
+        assert!(!Facet::from("/foo").is_prefix_of(&Facet::from("/foobar/baz")));
+        assert!(!Facet::from("/foo/bar").is_prefix_of(&Facet::from("/foo")));
+        assert!(Facet::from("/☺").is_prefix_of(&Facet::from("/☺/bar")));
+        assert!(!Facet::from("/☺").is_prefix_of(&Facet::from("/☺bar")));
     }
 
     #[test]
