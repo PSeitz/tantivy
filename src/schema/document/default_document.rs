@@ -632,9 +632,6 @@ impl<'a> Iterator for CompactDocObjectIter<'a> {
     type Item = (&'a str, CompactDocValue<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.node_addresses_slice.is_empty() {
-            return None;
-        }
         let key_addr = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
         let key = self.container.extract_str(key_addr.val_addr);
         let value = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
@@ -668,9 +665,6 @@ impl<'a> Iterator for CompactDocArrayIter<'a> {
     type Item = CompactDocValue<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.node_addresses_slice.is_empty() {
-            return None;
-        }
         let value = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
         let value = CompactDocValue {
             container: self.container,
@@ -746,13 +740,23 @@ mod tests {
     fn test_doc() {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("title", TEXT);
+        let body_field = schema_builder.add_text_field("body", TEXT);
         let mut doc = TantivyDocument::default();
+        assert!(doc.get_sorted_field_values().is_empty());
+        doc.add_text(body_field, "Body");
         doc.add_text(text_field, "My title");
-        assert_eq!(doc.field_values().count(), 1);
+        doc.add_text(body_field, "More body");
+        assert_eq!(doc.field_values().count(), 3);
 
+        let groups = doc.get_sorted_field_values();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, text_field);
+        assert_eq!(groups[1].0, body_field);
         let schema = schema_builder.build();
-        let _val = doc.get_first(text_field).unwrap();
-        let _json = doc.to_named_doc(&schema);
+        assert_eq!(
+            doc.to_json(&schema),
+            r#"{"body":["Body","More body"],"title":["My title"]}"#
+        );
     }
 
     #[test]
@@ -776,6 +780,8 @@ mod tests {
             "bool": true,
             "unsigned": 1,
             "signed": -2,
+            "empty_array": [],
+            "empty_object": {},
             "complexobject": {
                 "field.with.dot": 1
             },
