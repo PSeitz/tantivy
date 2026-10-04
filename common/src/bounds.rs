@@ -109,12 +109,7 @@ pub fn map_bound<TFrom, TTo>(
     bound: &Bound<TFrom>,
     transform: impl Fn(&TFrom) -> TTo,
 ) -> Bound<TTo> {
-    use self::Bound::*;
-    match bound {
-        Excluded(from_val) => Bound::Excluded(transform(from_val)),
-        Included(from_val) => Bound::Included(transform(from_val)),
-        Unbounded => Unbounded,
-    }
+    bound.as_ref().map(transform)
 }
 
 pub fn map_bound_res<TFrom, TTo, Err>(
