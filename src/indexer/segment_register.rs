@@ -20,12 +20,7 @@ pub struct SegmentRegister {
 
 impl Debug for SegmentRegister {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "SegmentRegister(")?;
-        for k in self.segment_states.keys() {
-            write!(f, "{}, ", k.short_uuid_string())?;
-        }
-        write!(f, ")")?;
-        Ok(())
+        Display::fmt(self, f)
     }
 }
 impl Display for SegmentRegister {
@@ -120,6 +115,7 @@ mod tests {
         let delete_queue = DeleteQueue::default();
 
         let mut segment_register = SegmentRegister::default();
+        assert_eq!(format!("{segment_register:?}"), "SegmentRegister()");
         let segment_id_a = SegmentId::generate_random();
         let segment_id_b = SegmentId::generate_random();
         let segment_id_merged = SegmentId::generate_random();
@@ -130,6 +126,7 @@ mod tests {
             segment_register.add_segment_entry(segment_entry);
         }
         assert_eq!(segment_ids(&segment_register), vec![segment_id_a]);
+        assert_eq!(format!("{segment_register:?}"), format!("{segment_register}"));
         {
             let segment_meta = inventory.new_segment_meta(segment_id_b, 0u32);
             let segment_entry = SegmentEntry::new(segment_meta, delete_queue.cursor(), None);
