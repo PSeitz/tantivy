@@ -1,8 +1,7 @@
 use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::index::SegmentReader;
-use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{ConstScorer, EnableScoring, Explanation, Query, Scorer, Weight};
 use crate::{DocId, Score};
 
 /// Query that matches all of the documents.
@@ -22,12 +21,10 @@ pub struct AllWeight;
 
 impl Weight for AllWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>> {
-        let all_scorer = AllScorer::new(reader.max_doc());
-        if boost != 1.0 {
-            Ok(Box::new(BoostScorer::new(all_scorer, boost)))
-        } else {
-            Ok(Box::new(all_scorer))
-        }
+        Ok(Box::new(ConstScorer::new(
+            AllScorer::new(reader.max_doc()),
+            boost,
+        )))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
@@ -76,23 +73,15 @@ impl DocSet for AllScorer {
         if self.doc() == TERMINATED {
             return 0;
         }
-        let is_safe_distance = self.doc() + (buffer.len() as u32) < self.max_doc;
-        if is_safe_distance {
-            let num_items = buffer.len();
-            for buffer_val in buffer {
-                *buffer_val = self.doc();
-                self.doc += 1;
-            }
-            num_items
-        } else {
-            for (i, buffer_val) in buffer.iter_mut().enumerate() {
-                *buffer_val = self.doc();
-                if self.advance() == TERMINATED {
-                    return i + 1;
-                }
-            }
-            buffer.len()
+        let num_items = buffer.len().min((self.max_doc - self.doc) as usize);
+        for buffer_val in &mut buffer[..num_items] {
+            *buffer_val = self.doc;
+            self.doc += 1;
         }
+        if self.doc == self.max_doc {
+            self.doc = TERMINATED;
+        }
+        num_items
     }
 
     #[inline(always)]
@@ -143,6 +132,7 @@ mod tests {
         {
             let reader = searcher.segment_reader(0);
             let mut scorer = weight.scorer(reader, 1.0)?;
+            assert_eq!(scorer.score(), 1.0);
             assert_eq!(scorer.doc(), 0u32);
             assert_eq!(scorer.advance(), 1u32);
             assert_eq!(scorer.doc(), 1u32);
@@ -179,19 +169,23 @@ mod tests {
 
     #[test]
     pub fn test_fill_buffer() {
-        let mut postings = AllScorer {
-            doc: 0u32,
-            max_doc: COLLECT_BLOCK_BUFFER_LEN as u32 * 2 + 9,
-        };
-        let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
-        for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
-            assert_eq!(buffer[i as usize], i);
+        let block_len = COLLECT_BLOCK_BUFFER_LEN as u32;
+        for max_doc in [
+            0,
+            1,
+            block_len - 1,
+            block_len,
+            block_len + 1,
+            2 * block_len + 9,
+        ] {
+            let mut postings = AllScorer::new(max_doc);
+            let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+            for docs in (0..max_doc).collect::<Vec<_>>().chunks(buffer.len()) {
+                assert_eq!(postings.fill_buffer(&mut buffer), docs.len());
+                assert_eq!(&buffer[..docs.len()], docs);
+            }
+            assert_eq!(postings.doc(), TERMINATED);
+            assert_eq!(postings.fill_buffer(&mut buffer), 0);
         }
-        assert_eq!(postings.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
-        for i in 0u32..COLLECT_BLOCK_BUFFER_LEN as u32 {
-            assert_eq!(buffer[i as usize], i + COLLECT_BLOCK_BUFFER_LEN as u32);
-        }
-        assert_eq!(postings.fill_buffer(&mut buffer), 9);
     }
 }
