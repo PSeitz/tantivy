@@ -9,18 +9,16 @@ use super::{CompactSpace, RangeMapping};
 
 /// Put the blanks for the sorted values into a binary heap
 fn get_blanks(values_sorted: &BTreeSet<u128>) -> BinaryHeap<BlankRange> {
-    let mut blanks: BinaryHeap<BlankRange> = BinaryHeap::new();
-    for (first, second) in values_sorted.iter().copied().tuple_windows() {
-        // Correctness Overflow: the values are deduped and sorted (BTreeSet property), that means
-        // there's always space between two values.
-        let blank_range = first + 1..=second - 1;
-        let blank_range: Result<BlankRange, _> = blank_range.try_into();
-        if let Ok(blank_range) = blank_range {
-            blanks.push(blank_range);
-        }
-    }
-
-    blanks
+    values_sorted
+        .iter()
+        .copied()
+        .tuple_windows()
+        .filter_map(|(first, second)| {
+            // Correctness Overflow: the values are deduped and sorted (BTreeSet property), that
+            // means there's always space between two values.
+            (first + 1..=second - 1).try_into().ok()
+        })
+        .collect()
 }
 
 struct BlankCollector {
@@ -235,12 +233,10 @@ mod tests {
 
     #[test]
     fn test_binary_heap_pop_order() {
-        let mut blanks: BinaryHeap<BlankRange> = BinaryHeap::new();
-        blanks.push((0..=10).try_into().unwrap());
-        blanks.push((100..=200).try_into().unwrap());
-        blanks.push((100..=110).try_into().unwrap());
+        let mut blanks = get_blanks(&BTreeSet::from([0, 1, 3, 6, 18, 120]));
         assert_eq!(blanks.pop().unwrap().blank_size(), 101);
         assert_eq!(blanks.pop().unwrap().blank_size(), 11);
+        assert!(blanks.is_empty());
     }
 
     #[test]
