@@ -239,20 +239,11 @@ fn compress_mapping(mapping: &[(u64, usize)]) -> (Vec<usize>, Vec<(u64, usize)>)
     let mut compressed_collapse_mapping: Vec<usize> = Vec::with_capacity(mapping.len());
     // collapse facet_id -> facet_ord
     let mut unique_facet_ords: Vec<(u64, usize)> = Vec::new();
-    if mapping.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-    compressed_collapse_mapping.push(0);
-    unique_facet_ords.push(mapping[0]);
-    let mut last_facet_ord = mapping[0];
-    let mut last_facet_id = 0;
-    for &facet_ord in &mapping[1..] {
-        if facet_ord != last_facet_ord {
-            last_facet_id += 1;
-            last_facet_ord = facet_ord;
+    for &facet_ord in mapping {
+        if unique_facet_ords.last() != Some(&facet_ord) {
             unique_facet_ords.push(facet_ord);
         }
-        compressed_collapse_mapping.push(last_facet_id);
+        compressed_collapse_mapping.push(unique_facet_ords.len() - 1);
     }
     (compressed_collapse_mapping, unique_facet_ords)
 }
@@ -297,13 +288,9 @@ impl Collector for FacetCollector {
 }
 
 fn is_child_facet(parent_facet: &[u8], possible_child_facet: &[u8]) -> bool {
-    if !possible_child_facet.starts_with(parent_facet) {
-        return false;
-    }
-    if parent_facet.is_empty() {
-        return true;
-    }
-    possible_child_facet.get(parent_facet.len()).copied() == Some(0u8)
+    possible_child_facet
+        .strip_prefix(parent_facet)
+        .is_some_and(|suffix| parent_facet.is_empty() || suffix.starts_with(&[0u8]))
 }
 
 fn compute_collapse_mapping_one(
@@ -316,24 +303,21 @@ fn compute_collapse_mapping_one(
     let offset = facet_bytes.len() + 1;
     let depth = facet_depth(facet_bytes);
     loop {
-        match facet_terms.key().cmp(facet_bytes) {
-            Ordering::Less | Ordering::Equal => {}
-            Ordering::Greater => {
-                if !is_child_facet(facet_bytes, facet_terms.key()) {
-                    return Ok(true);
-                }
-                let suffix = &facet_terms.key()[offset..];
-                if facet_child.is_empty() || !is_child_facet(&facet_child, suffix) {
-                    facet_child.clear();
-                    term_ord = facet_terms.term_ord();
-                    let end = suffix
-                        .iter()
-                        .position(|b| *b == 0u8)
-                        .unwrap_or(suffix.len());
-                    facet_child.extend(&suffix[..end]);
-                }
-                collapsed[facet_terms.term_ord() as usize] = (term_ord, depth);
+        if facet_terms.key() > facet_bytes {
+            if !is_child_facet(facet_bytes, facet_terms.key()) {
+                return Ok(true);
             }
+            let suffix = &facet_terms.key()[offset..];
+            if facet_child.is_empty() || !is_child_facet(&facet_child, suffix) {
+                facet_child.clear();
+                term_ord = facet_terms.term_ord();
+                let end = suffix
+                    .iter()
+                    .position(|b| *b == 0u8)
+                    .unwrap_or(suffix.len());
+                facet_child.extend(&suffix[..end]);
+            }
+            collapsed[facet_terms.term_ord() as usize] = (term_ord, depth);
         }
         if !facet_terms.advance() {
             return Ok(false);
@@ -353,11 +337,9 @@ fn compute_collapse_mapping(
     if !facet_terms.advance() {
         return Ok(collapsed);
     }
-    let mut facet_bytes = Vec::new();
     for facet in facets {
-        facet_bytes.clear();
-        facet_bytes.extend(facet.encoded_str().as_bytes());
-        if !compute_collapse_mapping_one(&mut facet_terms, &facet_bytes, &mut collapsed[..])? {
+        let facet_bytes = facet.encoded_str().as_bytes();
+        if !compute_collapse_mapping_one(&mut facet_terms, facet_bytes, &mut collapsed[..])? {
             break;
         }
     }
@@ -458,27 +440,15 @@ impl FacetCounts {
     /// See the documentation for [`FacetCollector`] for a usage example.
     pub fn top_k<T>(&self, facet: T, k: usize) -> Vec<(&Facet, u64)>
     where Facet: From<T> {
-        let mut heap = BinaryHeap::with_capacity(k);
         let mut it = self.get(facet);
-
-        // push the first k elements to first bring the heap
-        // to capacity
-        for (facet, count) in (&mut it).take(k) {
-            heap.push(Hit { count, facet });
-        }
-
-        let mut lowest_count: u64 = heap.peek().map(|hit| hit.count).unwrap_or(u64::MIN); //< the `unwrap_or` case may be triggered but the value
-                                                                                          // is never used in that case.
+        let mut heap: BinaryHeap<_> = (&mut it)
+            .take(k)
+            .map(|(facet, count)| Hit { count, facet })
+            .collect();
 
         for (facet, count) in it {
-            if count > lowest_count {
-                if let Some(mut head) = heap.peek_mut() {
-                    *head = Hit { count, facet };
-                }
-                // the heap gets reconstructed at this point
-                if let Some(head) = heap.peek() {
-                    lowest_count = head.count;
-                }
+            if let Some(mut head) = heap.peek_mut().filter(|head| count > head.count) {
+                *head = Hit { count, facet };
             }
         }
         heap.into_sorted_vec()
@@ -805,6 +775,9 @@ mod tests {
         facet_collector.add_facet("/facet");
         let counts: FacetCounts = searcher.search(&AllQuery, &facet_collector)?;
 
+        assert!(counts.top_k("/facet", 0).is_empty());
+        assert!(counts.top_k("/missing", 2).is_empty());
+        assert_eq!(counts.top_k("/facet", 4).len(), 3);
         let facets: Vec<(&Facet, u64)> = counts.top_k("/facet", 2);
         assert_eq!(
             facets,
