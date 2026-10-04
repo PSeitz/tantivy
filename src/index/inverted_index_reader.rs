@@ -9,8 +9,6 @@ use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
 use itertools::Itertools;
 #[cfg(feature = "quickwit")]
-use smallvec::SmallVec;
-#[cfg(feature = "quickwit")]
 use tantivy_fst::automaton::{AlwaysMatch, Automaton};
 
 use crate::directory::FileSlice;
@@ -22,51 +20,6 @@ use crate::termdict::TermDictionary;
 #[cfg(feature = "quickwit")]
 // This is how many bytes we can hope to receive during a TTFB from S3 (~80MiB/s, 50ms).
 const MERGE_HOLES_UNDER_BYTES: usize = (80 * 1024 * 1024 * 50) / 1000;
-
-#[cfg(feature = "quickwit")]
-#[derive(Clone, Copy)]
-struct AutomatonUnion<'a, A>(&'a [A]);
-
-#[cfg(feature = "quickwit")]
-impl<A: Automaton> Automaton for AutomatonUnion<'_, A> {
-    // Batches are bounded by the 64-bit match mask, so transitions and state clones never
-    // need a heap allocation for the union's state storage.
-    type State = SmallVec<[A::State; 64]>;
-
-    fn start(&self) -> Self::State {
-        assert!(self.0.len() <= u64::BITS as usize);
-        self.0.iter().map(Automaton::start).collect()
-    }
-
-    fn is_match(&self, state: &Self::State) -> bool {
-        self.0
-            .iter()
-            .zip(state)
-            .any(|(automaton, state)| automaton.is_match(state))
-    }
-
-    fn can_match(&self, state: &Self::State) -> bool {
-        self.0
-            .iter()
-            .zip(state)
-            .any(|(automaton, state)| automaton.can_match(state))
-    }
-
-    fn will_always_match(&self, state: &Self::State) -> bool {
-        self.0
-            .iter()
-            .zip(state)
-            .any(|(automaton, state)| automaton.will_always_match(state))
-    }
-
-    fn accept(&self, state: &Self::State, byte: u8) -> Self::State {
-        self.0
-            .iter()
-            .zip(state)
-            .map(|(automaton, state)| automaton.accept(state, byte))
-            .collect()
-    }
-}
 
 #[cfg(feature = "quickwit")]
 fn send_coalesced_posting_ranges(
@@ -534,10 +487,10 @@ impl InvertedIndexReader {
 
     /// Warms postings for one automaton and returns its matching documents.
     ///
-    /// Dictionary traversal uses `A::State` directly, without a union or vector-valued batch
-    /// state. Posting lists are decoded after their bytes have been prefetched. As with
-    /// [`Self::warm_postings_automaton`], the directory must cache asynchronous reads for the
-    /// subsequent synchronous reads, and the executor must run independently of this future.
+    /// Dictionary traversal uses `A::State` directly. Posting lists are decoded after their
+    /// bytes have been prefetched. As with [`Self::warm_postings_automaton`], the directory must
+    /// cache asynchronous reads for subsequent synchronous reads, and the executor must run
+    /// independently of this future.
     pub async fn warm_postings_automaton_with_hits<
         A: Automaton + Send + 'static,
         E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
@@ -614,12 +567,13 @@ impl InvertedIndexReader {
             .map_err(|_| io::Error::other("automaton hits task stopped unexpectedly"))
     }
 
-    /// Warms and decodes postings in batches of up to 64 automatons per term dictionary scan.
+    /// Warms postings and collects matching documents for each automaton independently.
     /// A single automaton uses [`Self::warm_postings_automaton_with_hits`] directly.
     ///
-    /// The returned bitsets are in the same order as `automatons`. A posting list matching several
-    /// automatons is decoded only once per batch. Matching automatons are identified from the
-    /// dictionary traversal states, without evaluating each matching term again.
+    /// Each dictionary scan uses the automaton's own state. Posting downloads are coalesced
+    /// across scans, but each automaton's matches are decoded independently. Matching terms
+    /// are not evaluated again during decoding. The returned bitsets are in the same order
+    /// as `automatons`.
     pub async fn warm_postings_automatons<
         A: Automaton + Send + 'static,
         E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
@@ -643,12 +597,12 @@ impl InvertedIndexReader {
             return Ok(vec![hits]);
         }
 
-        // Load only term dictionary blocks that can match at least one automaton before traversing
-        // them synchronously on the executor.
-        for batch in automatons.chunks(u64::BITS as usize) {
+        // Load each automaton's matching dictionary blocks before traversing them synchronously
+        // on the executor. Both passes use the original automaton's state directly.
+        for automaton in &automatons {
             let term_info_stream = self
                 .termdict
-                .search(AutomatonUnion(batch))
+                .search(automaton)
                 .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES)
                 .await?;
             drop(term_info_stream);
@@ -661,26 +615,16 @@ impl InvertedIndexReader {
         let postings_file_slice = self.postings_file_slice.clone();
         let record_option = self.record_option;
         let cpu_bound_task = move || {
-            let mut matching_batches = Vec::new();
-            for batch in automatons.chunks(u64::BITS as usize) {
-                let mut stream = termdict.search(AutomatonUnion(batch)).into_stream()?;
-                let mut matching_terms: Vec<(TermInfo, u64)> = Vec::new();
+            let num_automatons = automatons.len();
+            let mut matching_terms: Vec<(TermInfo, usize)> = Vec::new();
+            for (automaton_id, automaton) in automatons.into_iter().enumerate() {
+                let mut stream = termdict.search(automaton).into_stream()?;
                 while stream.advance() {
-                    let matching_automatons = batch
-                        .iter()
-                        .zip(stream.automaton_state())
-                        .enumerate()
-                        .fold(0u64, |mask, (automaton_id, (automaton, state))| {
-                            mask | (u64::from(automaton.is_match(state)) << automaton_id)
-                        });
-                    let term_info = stream.value();
-                    matching_terms.push((term_info.clone(), matching_automatons));
+                    matching_terms.push((stream.value().clone(), automaton_id));
                 }
-                matching_batches.push(matching_terms);
             }
-            let posting_ranges = matching_batches
+            let posting_ranges = matching_terms
                 .iter()
-                .flatten()
                 .map(|(term_info, _)| term_info.postings_range.clone())
                 .sorted_unstable_by_key(|range| range.start);
             send_coalesced_posting_ranges(posting_ranges, posting_range_sender)?;
@@ -689,36 +633,26 @@ impl InvertedIndexReader {
                 .recv()
                 .map_err(|_| io::Error::other("posting downloader stopped unexpectedly"))??;
 
-            let mut bitsets: Vec<BitSet> = (0..automatons.len())
+            let mut bitsets: Vec<BitSet> = (0..num_automatons)
                 .map(|_| BitSet::with_max_value(max_doc))
                 .collect();
-            for (matching_terms, batch) in matching_batches
-                .into_iter()
-                .zip(bitsets.chunks_mut(u64::BITS as usize))
-            {
-                for (term_info, matching_automatons) in matching_terms {
-                    let postings_data = postings_file_slice.slice(term_info.postings_range.clone());
-                    let mut block_postings = BlockSegmentPostings::open(
-                        term_info.doc_freq,
-                        postings_data,
-                        record_option,
-                        IndexRecordOption::Basic,
-                    )?;
-                    loop {
-                        let docs = block_postings.docs();
-                        if docs.is_empty() {
-                            break;
-                        }
-                        for &doc in docs {
-                            let mut remaining = matching_automatons;
-                            while remaining != 0 {
-                                let automaton_id = remaining.trailing_zeros() as usize;
-                                batch[automaton_id].insert(doc);
-                                remaining &= remaining - 1;
-                            }
-                        }
-                        block_postings.advance();
+            for (term_info, automaton_id) in matching_terms {
+                let postings_data = postings_file_slice.slice(term_info.postings_range);
+                let mut block_postings = BlockSegmentPostings::open(
+                    term_info.doc_freq,
+                    postings_data,
+                    record_option,
+                    IndexRecordOption::Basic,
+                )?;
+                loop {
+                    let docs = block_postings.docs();
+                    if docs.is_empty() {
+                        break;
                     }
+                    for &doc in docs {
+                        bitsets[automaton_id].insert(doc);
+                    }
+                    block_postings.advance();
                 }
             }
             bitsets_sender
@@ -788,7 +722,7 @@ mod tests {
     use futures::channel::oneshot;
     use tantivy_fst::{Automaton, Regex};
 
-    use super::{AutomatonUnion, MERGE_HOLES_UNDER_BYTES};
+    use super::MERGE_HOLES_UNDER_BYTES;
     use crate::schema::{Schema, STRING};
     use crate::{Index, IndexWriter};
 
@@ -834,22 +768,6 @@ mod tests {
             receiver
                 .await
                 .map_err(|_| io::Error::other("executor task panicked"))?
-        }
-    }
-
-    #[test]
-    fn test_automaton_union_states_stay_inline() {
-        for count in [1, 2, 64] {
-            let automatons: Vec<_> = (0..count).map(|_| Regex::new("a.*").unwrap()).collect();
-            let union = AutomatonUnion(&automatons);
-            let mut state = union.start();
-            assert!(!state.spilled());
-            for &byte in b"apple" {
-                state = union.accept(&state, byte);
-                assert!(!state.spilled());
-                assert!(!state.clone().spilled());
-            }
-            assert!(union.is_match(&state));
         }
     }
 
@@ -906,16 +824,14 @@ mod tests {
             assert_eq!(docs, expected);
             assert_eq!(transitions.load(Ordering::Relaxed), expected_transitions);
 
-            let mut bitsets =
-                futures::executor::block_on(inverted_index.warm_postings_automatons(
-                    vec![Regex::new(pattern).unwrap()],
-                    segment_reader.max_doc(),
-                    execute_on_thread,
-                ))?;
+            let bitsets = futures::executor::block_on(inverted_index.warm_postings_automatons(
+                vec![Regex::new(pattern).unwrap()],
+                segment_reader.max_doc(),
+                execute_on_thread,
+            ))?;
             assert_eq!(bitsets.len(), 1);
-            let from_batch = bitsets.pop().unwrap();
             for doc in 0..hits.max_value() {
-                assert_eq!(from_batch.contains(doc), hits.contains(doc));
+                assert_eq!(bitsets[0].contains(doc), hits.contains(doc));
             }
         }
         Ok(())
@@ -946,15 +862,18 @@ mod tests {
             })
             .collect();
 
-        // Count only block selection and dictionary traversal. Collecting hits in the warmup
-        // must not add byte transitions beyond these same operations.
-        let search = || inverted_index.termdict.search(AutomatonUnion(&automatons));
-        drop(futures::executor::block_on(
-            search().into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES),
-        )?);
-        let mut stream = search().into_stream()?;
-        while stream.advance() {}
-        drop(stream);
+        // Count independent block selection and dictionary traversal for each automaton.
+        // Warmup must use those same single-automaton scans without reevaluating matching terms.
+        for automaton in &automatons {
+            drop(futures::executor::block_on(
+                inverted_index
+                    .termdict
+                    .search(automaton)
+                    .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES),
+            )?);
+            let mut stream = inverted_index.termdict.search(automaton).into_stream()?;
+            while stream.advance() {}
+        }
         let traversal_transitions = transitions.swap(0, Ordering::Relaxed);
         assert!(traversal_transitions > 0);
 
@@ -978,8 +897,8 @@ mod tests {
         );
         assert_eq!(transitions.load(Ordering::Relaxed), traversal_transitions);
 
-        // Exercise the highest mask bit, full batches, and a partial final batch.
-        for num_automatons in [64, 65, 128, 129] {
+        // Verify independent traversal and result order with different numbers of automatons.
+        for num_automatons in [2, 5, 17, 100] {
             let patterns = ["b.*", "z.*", "a.*", ".*a.*", "b.*"]
                 .into_iter()
                 .cycle()
