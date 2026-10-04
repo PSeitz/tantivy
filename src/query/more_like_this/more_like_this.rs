@@ -275,24 +275,10 @@ impl MoreLikeThis {
     /// Determines if the term is likely to be of interest based on "more-like-this" settings
     fn is_noise_word(&self, word: String) -> bool {
         let word_length = word.len();
-        if word_length == 0 {
-            return true;
-        }
-        if self
-            .min_word_length
-            .map(|min| word_length < min)
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        if self
-            .max_word_length
-            .map(|max| word_length > max)
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        self.stop_words.contains(&word)
+        word_length == 0
+            || self.min_word_length.is_some_and(|min| word_length < min)
+            || self.max_word_length.is_some_and(|max| word_length > max)
+            || self.stop_words.contains(&word)
     }
 
     /// Computes the score for each term while ignoring not useful terms
@@ -302,59 +288,38 @@ impl MoreLikeThis {
         per_field_term_frequencies: HashMap<Term, usize>,
     ) -> Result<Vec<ScoreTerm>> {
         let mut score_terms: BinaryHeap<Reverse<ScoreTerm>> = BinaryHeap::new();
-        let num_docs = searcher
-            .segment_readers()
-            .iter()
-            .map(|segment_reader| segment_reader.num_docs() as u64)
-            .sum::<u64>();
+        let num_docs = searcher.num_docs();
 
         for (term, term_frequency) in per_field_term_frequencies.iter() {
-            // ignore terms with less than min_term_frequency
             if self
                 .min_term_frequency
-                .map(|min_term_frequency| *term_frequency < min_term_frequency)
-                .unwrap_or(false)
+                .is_some_and(|min_term_frequency| *term_frequency < min_term_frequency)
             {
                 continue;
             }
 
             let doc_freq = searcher.doc_freq(term)?;
-
-            // ignore terms with less than min_doc_frequency
-            if self
-                .min_doc_frequency
-                .map(|min_doc_frequency| doc_freq < min_doc_frequency)
-                .unwrap_or(false)
+            if doc_freq == 0
+                || self
+                    .min_doc_frequency
+                    .is_some_and(|min_doc_frequency| doc_freq < min_doc_frequency)
+                || self
+                    .max_doc_frequency
+                    .is_some_and(|max_doc_frequency| doc_freq > max_doc_frequency)
             {
-                continue;
-            }
-
-            // ignore terms with more than max_doc_frequency
-            if self
-                .max_doc_frequency
-                .map(|max_doc_frequency| doc_freq > max_doc_frequency)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            // ignore terms with zero frequency
-            if doc_freq == 0 {
                 continue;
             }
 
             // compute similarity & score
             let idf = idf(doc_freq, num_docs);
             let score = (*term_frequency as f32) * idf;
-            if let Some(limit) = self.max_query_terms {
-                if score_terms.len() > limit {
-                    // update the least significant term
-                    let least_significant_term_score = score_terms.peek().unwrap().0.score;
-                    if least_significant_term_score < score {
-                        score_terms.peek_mut().unwrap().0 = ScoreTerm::new(term.clone(), score);
-                    }
-                } else {
-                    score_terms.push(Reverse(ScoreTerm::new(term.clone(), score)));
+            if self
+                .max_query_terms
+                .is_some_and(|limit| score_terms.len() > limit)
+            {
+                let mut least_significant_term = score_terms.peek_mut().unwrap();
+                if least_significant_term.0.score < score {
+                    least_significant_term.0 = ScoreTerm::new(term.clone(), score);
                 }
             } else {
                 score_terms.push(Reverse(ScoreTerm::new(term.clone(), score)));
