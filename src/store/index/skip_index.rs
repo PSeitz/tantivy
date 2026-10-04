@@ -16,9 +16,6 @@ impl Iterator for LayerCursor<'_> {
 
     fn next(&mut self) -> Option<Checkpoint> {
         if self.cursor == self.block.len() {
-            if self.remaining.is_empty() {
-                return None;
-            }
             let (block_mut, remaining_mut) = (&mut self.block, &mut self.remaining);
             block_mut.deserialize(remaining_mut).ok()?;
             self.cursor = 0;
@@ -59,14 +56,10 @@ pub struct SkipIndex {
 
 impl SkipIndex {
     pub fn open(mut data: OwnedBytes) -> SkipIndex {
-        let offsets: Vec<u64> = Vec::<VInt>::deserialize(&mut data)
-            .unwrap()
-            .into_iter()
-            .map(|el| el.0)
-            .collect();
+        let offsets = Vec::<VInt>::deserialize(&mut data).unwrap();
         let mut start_offset = 0;
         let mut layers = Vec::new();
-        for end_offset in offsets {
+        for VInt(end_offset) in offsets {
             let layer = Layer {
                 data: data.slice(start_offset as usize..end_offset as usize),
             };

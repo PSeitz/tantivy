@@ -28,20 +28,7 @@ impl CheckpointBlock {
     /// If non-empty returns [start_doc, end_doc)
     /// for the overall block.
     pub fn doc_interval(&self) -> Option<Range<DocId>> {
-        let start_doc_opt = self
-            .checkpoints
-            .first()
-            .cloned()
-            .map(|checkpoint| checkpoint.doc_range.start);
-        let end_doc_opt = self
-            .checkpoints
-            .last()
-            .cloned()
-            .map(|checkpoint| checkpoint.doc_range.end);
-        match (start_doc_opt, end_doc_opt) {
-            (Some(start_doc), Some(end_doc)) => Some(start_doc..end_doc),
-            _ => None,
-        }
+        Some(self.checkpoints.first()?.doc_range.start..self.checkpoints.last()?.doc_range.end)
     }
 
     /// Adding another checkpoint in the block.

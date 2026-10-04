@@ -14,10 +14,6 @@ struct LayerBuilder {
 }
 
 impl LayerBuilder {
-    fn finish(self) -> Vec<u8> {
-        self.buffer
-    }
-
     fn new() -> LayerBuilder {
         LayerBuilder {
             buffer: Vec::new(),
@@ -30,18 +26,15 @@ impl LayerBuilder {
     ///
     /// If the block was empty to begin with, simply return `None`.
     fn flush_block(&mut self) -> Option<Checkpoint> {
-        if let Some(doc_range) = self.block.doc_interval() {
-            let start_offset = self.buffer.len();
-            self.block.serialize(&mut self.buffer);
-            let end_offset = self.buffer.len();
-            self.block.clear();
-            Some(Checkpoint {
-                doc_range,
-                byte_range: start_offset..end_offset,
-            })
-        } else {
-            None
-        }
+        let doc_range = self.block.doc_interval()?;
+        let start_offset = self.buffer.len();
+        self.block.serialize(&mut self.buffer);
+        let end_offset = self.buffer.len();
+        self.block.clear();
+        Some(Checkpoint {
+            doc_range,
+            byte_range: start_offset..end_offset,
+        })
     }
 
     fn push(&mut self, checkpoint: Checkpoint) {
@@ -95,22 +88,15 @@ impl SkipIndexBuilder {
             }
             last_pointer = skip_layer.flush_block();
         }
-        let layer_buffers: Vec<Vec<u8>> = self
-            .layers
-            .into_iter()
-            .rev()
-            .map(|layer| layer.finish())
-            .collect();
-
         let mut layer_offset = 0;
         let mut layer_sizes = Vec::new();
-        for layer_buffer in &layer_buffers {
-            layer_offset += layer_buffer.len() as u64;
+        for layer in self.layers.iter().rev() {
+            layer_offset += layer.buffer.len() as u64;
             layer_sizes.push(VInt(layer_offset));
         }
         layer_sizes.serialize(output)?;
-        for layer_buffer in layer_buffers {
-            output.write_all(&layer_buffer[..])?;
+        for layer in self.layers.into_iter().rev() {
+            output.write_all(&layer.buffer)?;
         }
         Ok(())
     }
