@@ -188,22 +188,11 @@ pub enum DateHistogramParseError {
 }
 
 fn parse_offset_into_milliseconds(input: &str) -> Result<i64, AggregationError> {
-    let is_sign = |byte| &[byte] == b"-" || &[byte] == b"+";
-    if input.is_empty() {
-        return Err(DateHistogramParseError::InvalidOffset(input.to_string()).into());
-    }
-
-    let has_sign = is_sign(input.as_bytes()[0]);
-    if has_sign {
-        let (sign, input) = input.split_at(1);
-        let val = parse_into_milliseconds(input)?;
-        if sign == "-" {
-            Ok(-val)
-        } else {
-            Ok(val)
-        }
-    } else {
-        parse_into_milliseconds(input)
+    match input.as_bytes().first() {
+        None => Err(DateHistogramParseError::InvalidOffset(input.to_string()).into()),
+        Some(b'-') => parse_into_milliseconds(&input[1..]).map(|val| -val),
+        Some(b'+') => parse_into_milliseconds(&input[1..]),
+        _ => parse_into_milliseconds(input),
     }
 }
 
