@@ -52,21 +52,14 @@ impl TokenStream for FacetTokenStream<'_> {
                 true
             }
             State::UpToPosition(cursor) => {
-                let bytes: &[u8] = self.text.as_bytes();
-                if let Some(next_sep_pos) = bytes[cursor + 1..]
+                let next_sep_pos = self.text.as_bytes()[cursor + 1..]
                     .iter()
-                    .cloned()
-                    .position(|b| b == FACET_SEP_BYTE)
-                    .map(|pos| cursor + 1 + pos)
-                {
-                    let facet_part = &self.text[cursor..next_sep_pos];
-                    self.token.text.push_str(facet_part);
-                    self.state = State::UpToPosition(next_sep_pos);
-                } else {
-                    let facet_part = &self.text[cursor..];
-                    self.token.text.push_str(facet_part);
-                    self.state = State::Terminated;
-                }
+                    .position(|&b| b == FACET_SEP_BYTE)
+                    .map(|pos| cursor + 1 + pos);
+                self.token
+                    .text
+                    .push_str(&self.text[cursor..next_sep_pos.unwrap_or(self.text.len())]);
+                self.state = next_sep_pos.map_or(State::Terminated, State::UpToPosition);
                 true
             }
             State::Terminated => false,
