@@ -127,24 +127,10 @@ impl fmt::Debug for FileSlice {
 
 impl FileSlice {
     pub fn stream_file_chunks(&self) -> impl Iterator<Item = io::Result<OwnedBytes>> + '_ {
-        let len = self.range.end;
-        let mut start = self.range.start;
-        std::iter::from_fn(move || {
-            /// Returns chunks of 1MB of data from the FileHandle.
-            const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
-
-            if start < len {
-                let end = (start + CHUNK_SIZE).min(len);
-                let range = start..end;
-                let chunk = self.data.read_bytes(range);
-                start += CHUNK_SIZE;
-                match chunk {
-                    Ok(chunk) => Some(Ok(chunk)),
-                    Err(e) => Some(Err(e)),
-                }
-            } else {
-                None
-            }
+        const CHUNK_SIZE: usize = 1024 * 1024;
+        self.range.clone().step_by(CHUNK_SIZE).map(move |start| {
+            let end = (start + CHUNK_SIZE).min(self.range.end);
+            self.data.read_bytes(start..end)
         })
     }
 }
@@ -239,26 +225,14 @@ impl FileSlice {
     ///
     /// This is equivalent to running `file_slice.slice(from, to).read_bytes()`.
     pub fn read_bytes_slice(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
-        assert!(
-            range.end <= self.len(),
-            "end of requested range exceeds the fileslice length ({} > {})",
-            range.end,
-            self.len()
-        );
         self.data
-            .read_bytes(self.range.start + range.start..self.range.start + range.end)
+            .read_bytes(combine_ranges(self.range.clone(), range))
     }
 
     #[doc(hidden)]
     pub async fn read_bytes_slice_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        assert!(
-            self.range.start + byte_range.end <= self.range.end,
-            "`to` exceeds the fileslice length"
-        );
         self.data
-            .read_bytes_async(
-                self.range.start + byte_range.start..self.range.start + byte_range.end,
-            )
+            .read_bytes_async(combine_ranges(self.range.clone(), byte_range))
             .await
     }
 
@@ -387,6 +361,20 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_file_chunks() -> io::Result<()> {
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 7).map(|i| i as u8).collect();
+        let slice = FileSlice::from(bytes.clone());
+        for range in [0..0, 3..17, 3..1024 * 1024 + 3, 3..bytes.len()] {
+            let slice = slice.slice(range.clone());
+            let chunks = slice.stream_file_chunks().collect::<io::Result<Vec<_>>>()?;
+            let actual: Vec<_> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
+            let expected: Vec<_> = bytes[range].chunks(1024 * 1024).collect();
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_file_slice_trait_slice_len() {
         let blop: &'static [u8] = b"abc";
         let owned_bytes: Box<dyn FileHandle> = Box::new(blop);
@@ -406,11 +394,15 @@ mod tests {
     fn test_slice_read_slice() -> io::Result<()> {
         let slice_deref = FileSlice::new(Arc::new(&b"abcdef"[..]));
         assert_eq!(slice_deref.read_bytes_slice(1..4)?.as_ref(), b"bcd");
+        let slice = slice_deref.slice(1..5);
+        assert_eq!(slice.read_bytes_slice(1..3)?.as_ref(), b"cd");
+        assert_eq!(slice.read_bytes_slice(0..4)?.as_ref(), b"bcde");
+        assert_eq!(slice.read_bytes_slice(4..4)?.as_ref(), b"");
         Ok(())
     }
 
     #[test]
-    #[should_panic(expected = "end of requested range exceeds the fileslice length (10 > 6)")]
+    #[should_panic(expected = "end <= orig_range.end")]
     fn test_slice_read_slice_invalid_range_exceeds() {
         let slice_deref = FileSlice::new(Arc::new(&b"abcdef"[..]));
         assert_eq!(
