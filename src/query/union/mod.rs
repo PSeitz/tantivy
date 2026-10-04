@@ -94,6 +94,7 @@ mod tests {
             count += 1;
         }
         assert_eq!(union_expected.advance(), TERMINATED);
+        assert_eq!(union.count_including_deleted(), 0);
         assert_eq!(count, make_union().count_including_deleted());
     }
 
@@ -149,6 +150,8 @@ mod tests {
 
     #[test]
     fn test_union() {
+        aux_test_union(&[]);
+        aux_test_union(&[vec![]]);
         aux_test_union(&[
             vec![1, 3333, 100000000u32],
             vec![1, 2, 100000000u32],

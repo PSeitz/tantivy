@@ -87,11 +87,7 @@ impl<TScorer: Scorer, TScoreCombiner: ScoreCombiner> BufferedUnionScorer<TScorer
             score: 0.0,
             num_docs,
         };
-        if union.refill() {
-            union.advance();
-        } else {
-            union.doc = TERMINATED;
-        }
+        union.advance();
         union
     }
 
@@ -235,12 +231,7 @@ where
             }
             self.docsets.retain(|docset| docset.doc() != TERMINATED);
 
-            // at this point all of the docsets
-            // are positioned on a doc >= to the target.
-            if !self.refill() {
-                self.doc = TERMINATED;
-                return TERMINATED;
-            }
+            self.bucket_idx = HORIZON_NUM_TINYBITSETS;
             self.advance()
         }
     }
