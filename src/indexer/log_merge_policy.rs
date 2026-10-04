@@ -95,16 +95,11 @@ impl MergePolicy for LogMergePolicy {
         let size_sorted_segments = segments
             .iter()
             .filter(|seg| (seg.num_docs() as usize) <= self.max_docs_before_merge)
-            .sorted_by_key(|seg| std::cmp::Reverse(seg.max_doc()))
-            .collect::<Vec<&SegmentMeta>>();
-
-        if size_sorted_segments.is_empty() {
-            return vec![];
-        }
+            .sorted_by_key(|seg| std::cmp::Reverse(seg.max_doc()));
 
         let mut current_max_log_size = f64::MAX;
-        let mut levels = vec![];
-        for (_, merge_group) in &size_sorted_segments.into_iter().chunk_by(|segment| {
+        let mut candidates = vec![];
+        for (_, merge_group) in &size_sorted_segments.chunk_by(|segment| {
             let segment_log_size = f64::from(self.clip_min_size(segment.num_docs())).log2();
             if segment_log_size < (current_max_log_size - self.level_log_size) {
                 // update current_max_log_size to create a new group
@@ -113,17 +108,14 @@ impl MergePolicy for LogMergePolicy {
             // return current_max_log_size to be grouped to the current group
             current_max_log_size
         }) {
-            levels.push(merge_group.collect::<Vec<&SegmentMeta>>());
+            let level = merge_group.collect::<Vec<&SegmentMeta>>();
+            if level.len() >= self.min_num_segments
+                || self.has_segment_above_deletes_threshold(&level)
+            {
+                candidates.push(MergeCandidate(level.iter().map(|seg| seg.id()).collect()));
+            }
         }
-
-        levels
-            .iter()
-            .filter(|level| {
-                level.len() >= self.min_num_segments
-                    || self.has_segment_above_deletes_threshold(level)
-            })
-            .map(|segments| MergeCandidate(segments.iter().map(|&seg| seg.id()).collect()))
-            .collect()
+        candidates
     }
 }
 
