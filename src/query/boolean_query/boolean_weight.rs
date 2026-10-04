@@ -277,36 +277,26 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         // and the number of should clauses.
         let num_should_weights = per_occur_weights.get(Occur::Should).len();
 
-        match num_should_weights.cmp(&minimum_number_should_match) {
-            Ordering::Greater => {
-                // nothing to do. We will need the minimum should match logic.
-                BooleanWeight {
-                    per_occur_weights,
-                    minimum_number_should_match,
-                    scoring_enabled,
-                    score_combiner_fn,
-                }
-            }
+        let minimum_number_should_match = match num_should_weights.cmp(&minimum_number_should_match)
+        {
+            Ordering::Greater => minimum_number_should_match,
             Ordering::Equal => {
-                // Equal! All should clause will be required. We promote them to Must!
+                // All should clauses are required. Promote them to Must.
                 per_occur_weights.promote_should_to_must();
-                BooleanWeight {
-                    per_occur_weights,
-                    minimum_number_should_match: 0,
-                    scoring_enabled,
-                    score_combiner_fn,
-                }
+                0
             }
             Ordering::Less => {
-                // We will never be able to match the minimum should match threshold.
-                // Let's return the empty weight
-                BooleanWeight {
-                    per_occur_weights: Default::default(),
-                    minimum_number_should_match: 0,
-                    scoring_enabled,
-                    score_combiner_fn,
-                }
+                // Too few should clauses to meet the threshold. Return an empty weight.
+                per_occur_weights = Default::default();
+                0
             }
+        };
+
+        BooleanWeight {
+            per_occur_weights,
+            minimum_number_should_match,
+            scoring_enabled,
+            score_combiner_fn,
         }
     }
 

@@ -178,19 +178,11 @@ impl Query for BooleanQuery {
 impl BooleanQuery {
     /// Creates a new boolean query.
     pub fn new(subqueries: Vec<(Occur, Box<dyn Query>)>) -> BooleanQuery {
-        // If the bool query includes at least one should clause
-        // and no Must or MustNot clauses, the default value is 1. Otherwise, the default value is
-        // 0. Keep compatible with Elasticsearch.
-        let mut minimum_required = 0;
-        for (occur, _) in &subqueries {
-            match occur {
-                Occur::Should => minimum_required = 1,
-                Occur::Must | Occur::MustNot => {
-                    minimum_required = 0;
-                    break;
-                }
-            }
-        }
+        // A nonempty query containing only Should clauses requires one match.
+        // Otherwise the default is zero, matching Elasticsearch.
+        let minimum_required = usize::from(
+            !subqueries.is_empty() && subqueries.iter().all(|(occur, _)| *occur == Occur::Should),
+        );
         Self::with_minimum_required_clauses(subqueries, minimum_required)
     }
 
@@ -325,6 +317,10 @@ mod tests {
                     .collect()
             );
         }
+        assert_eq!(
+            BooleanQuery::new(Vec::new()).get_minimum_number_should_match(),
+            0
+        );
         let index = create_test_index_with(["a b c", "a c e", "d f g", "z z z", "c i b"])?;
         let searcher = index.reader()?.searcher();
         let text = index.schema().get_field("text").unwrap();
@@ -347,6 +343,10 @@ mod tests {
         let q5 = create_boolean_query_with_mr(["a", "b"], text, 0);
         let docs = searcher.search(&q5, &DocSetCollector)?;
         check_doc_id([0, 1, 4], docs, 0);
+        // When the threshold equals the number of clauses, all clauses are required.
+        let q6 = create_boolean_query_with_mr(["a", "b", "c"], text, 3);
+        let docs = searcher.search(&q6, &DocSetCollector)?;
+        check_doc_id([0], docs, 0);
         Ok(())
     }
 
