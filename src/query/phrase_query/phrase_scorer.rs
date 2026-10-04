@@ -57,28 +57,6 @@ pub struct PhraseScorer<TPostings: Postings> {
     slops_buffer: Vec<u8>,
 }
 
-/// Returns true if and only if the two sorted arrays contain a common element
-fn intersection_exists(left: &[u32], right: &[u32]) -> bool {
-    let mut left_index = 0;
-    let mut right_index = 0;
-    while left_index < left.len() && right_index < right.len() {
-        let left_val = left[left_index];
-        let right_val = right[right_index];
-        match left_val.cmp(&right_val) {
-            Ordering::Less => {
-                left_index += 1;
-            }
-            Ordering::Equal => {
-                return true;
-            }
-            Ordering::Greater => {
-                right_index += 1;
-            }
-        }
-    }
-    false
-}
-
 pub(crate) fn intersection_count(left: &[u32], right: &[u32]) -> usize {
     let mut left_index = 0;
     let mut right_index = 0;
@@ -467,15 +445,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
 
     fn phrase_exists(&mut self) -> bool {
         self.compute_phrase_match();
-        if self.has_slop() {
-            intersection_exists_with_slop(
-                &self.left_positions,
-                &self.right_positions[..],
-                self.slop,
-            )
-        } else {
-            intersection_exists(&self.left_positions, &self.right_positions[..])
-        }
+        intersection_exists_with_slop(&self.left_positions, &self.right_positions[..], self.slop)
     }
 
     fn compute_phrase_count(&mut self) -> u32 {
@@ -640,6 +610,10 @@ mod tests {
     }
 
     fn test_intersection_aux(left: &[u32], right: &[u32], expected: &[u32], slop: u32) {
+        assert_eq!(
+            intersection_exists_with_slop(left, right, slop),
+            !expected.is_empty()
+        );
         let mut left_vec = Vec::from(left);
         if slop == 0 {
             assert_eq!(intersection_count(&left_vec, right), expected.len());
