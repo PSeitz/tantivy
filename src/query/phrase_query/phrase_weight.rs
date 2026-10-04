@@ -117,11 +117,9 @@ impl Weight for PhraseWeight {
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
-        let scorer_opt = self.phrase_scorer(reader, 1.0)?;
-        if scorer_opt.is_none() {
-            return Err(does_not_match(doc));
-        }
-        let mut scorer = scorer_opt.unwrap();
+        let mut scorer = self
+            .phrase_scorer(reader, 1.0)?
+            .ok_or_else(|| does_not_match(doc))?;
         if scorer.seek(doc) != doc {
             return Err(does_not_match(doc));
         }
