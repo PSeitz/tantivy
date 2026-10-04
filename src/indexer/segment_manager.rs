@@ -150,31 +150,25 @@ impl SegmentManager {
     /// uncommitted.
     pub fn start_merge(&self, segment_ids: &[SegmentId]) -> crate::Result<Vec<SegmentEntry>> {
         let registers_lock = self.read();
-        let mut segment_entries = vec![];
-        if registers_lock.uncommitted.contains_all(segment_ids) {
-            for segment_id in segment_ids {
-                let segment_entry = registers_lock.uncommitted.get(segment_id).expect(
-                    "Segment id not found {}. Should never happen because of the contains all \
-                     if-block.",
-                );
-                segment_entries.push(segment_entry);
-            }
+        let register = if registers_lock.uncommitted.contains_all(segment_ids) {
+            &registers_lock.uncommitted
         } else if registers_lock.committed.contains_all(segment_ids) {
-            for segment_id in segment_ids {
-                let segment_entry = registers_lock.committed.get(segment_id).expect(
-                    "Segment id not found {}. Should never happen because of the contains all \
-                     if-block.",
-                );
-                segment_entries.push(segment_entry);
-            }
+            &registers_lock.committed
         } else {
             let error_msg = "Merge operation sent for segments that are not all uncommitted or \
                              committed."
                 .to_string();
             return Err(TantivyError::InvalidArgument(error_msg));
-        }
+        };
 
-        Ok(segment_entries)
+        Ok(segment_ids
+            .iter()
+            .map(|segment_id| {
+                register
+                    .get(segment_id)
+                    .expect("Segment id not found. Checked by contains_all.")
+            })
+            .collect())
     }
 
     pub fn add_segment(&self, segment_entry: SegmentEntry) {
