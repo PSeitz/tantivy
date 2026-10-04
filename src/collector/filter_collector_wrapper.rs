@@ -158,14 +158,9 @@ where
 {
     #[inline]
     fn accept_document(&self, doc_id: DocId) -> bool {
-        if let Some(column) = &self.column_opt {
-            for val in column.values_for_doc(doc_id) {
-                if (self.predicate)(val) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.column_opt
+            .as_ref()
+            .is_some_and(|column| column.values_for_doc(doc_id).any(&self.predicate))
     }
 }
 
@@ -231,7 +226,7 @@ where
 /// index_writer.add_document(doc!(title => "The Name of the Wind", barcode => &b"010101"[..]))?;
 /// index_writer.add_document(doc!(title => "The Diary of Muadib", barcode => &b"110011"[..]))?;
 /// index_writer.add_document(doc!(title => "A Dairy Cow", barcode => &b"110111"[..]))?;
-/// index_writer.add_document(doc!(title => "The Diary of a Young Girl", barcode => &b"011101"[..]))?;
+/// index_writer.add_document(doc!(title => "The Diary of a Young Girl", barcode => &b"0010"[..], barcode => &b"011101"[..]))?;
 /// index_writer.add_document(doc!(title => "Bridget Jones's Diary"))?;
 /// index_writer.commit()?;
 ///
@@ -333,18 +328,13 @@ where
 {
     #[inline]
     fn accept_document(&mut self, doc_id: DocId) -> bool {
-        if let Some(column) = &self.column_opt {
-            for ord in column.term_ords(doc_id) {
+        self.column_opt.as_ref().is_some_and(|column| {
+            column.term_ords(doc_id).any(|ord| {
                 self.buffer.clear();
-
-                let found = column.ord_to_bytes(ord, &mut self.buffer).unwrap_or(false);
-
-                if found && (self.predicate)(&self.buffer) {
-                    return true;
-                }
-            }
-        }
-        false
+                column.ord_to_bytes(ord, &mut self.buffer).unwrap_or(false)
+                    && (self.predicate)(&self.buffer)
+            })
+        })
     }
 }
 
