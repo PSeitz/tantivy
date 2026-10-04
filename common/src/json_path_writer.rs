@@ -22,18 +22,13 @@ pub struct JsonPathWriter {
 impl JsonPathWriter {
     pub fn with_expand_dots(expand_dots: bool) -> Self {
         JsonPathWriter {
-            path: String::new(),
-            indices: Vec::new(),
             expand_dots,
+            ..Default::default()
         }
     }
 
     pub fn new() -> Self {
-        JsonPathWriter {
-            path: String::new(),
-            indices: Vec::new(),
-            expand_dots: false,
-        }
+        Default::default()
     }
 
     /// When expand_dots is enabled, json object like
