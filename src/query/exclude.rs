@@ -21,12 +21,7 @@ impl<TDocSet: DocSet> ExclusionSet for TDocSet {
 impl<TDocSet: DocSet> ExclusionSet for Vec<TDocSet> {
     #[inline]
     fn contains(&mut self, doc: DocId) -> bool {
-        for docset in self.iter_mut() {
-            if docset.seek_danger(doc) == SeekDangerResult::Found {
-                return true;
-            }
-        }
-        false
+        self.iter_mut().any(|docset| docset.contains(doc))
     }
 }
 
@@ -45,20 +40,15 @@ where
 {
     /// Creates a new `ExcludeScorer`
     pub fn new(
-        mut underlying_docset: TDocSet,
-        mut exclusion_set: TExclusionSet,
+        underlying_docset: TDocSet,
+        exclusion_set: TExclusionSet,
     ) -> Exclude<TDocSet, TExclusionSet> {
-        while underlying_docset.doc() != TERMINATED {
-            let target = underlying_docset.doc();
-            if !exclusion_set.contains(target) {
-                break;
-            }
-            underlying_docset.advance();
-        }
-        Exclude {
+        let mut exclude = Exclude {
             underlying_docset,
             exclusion_set,
-        }
+        };
+        exclude.seek(exclude.doc());
+        exclude
     }
 }
 
@@ -70,10 +60,7 @@ where
     fn advance(&mut self) -> DocId {
         loop {
             let candidate = self.underlying_docset.advance();
-            if candidate == TERMINATED {
-                return TERMINATED;
-            }
-            if !self.exclusion_set.contains(candidate) {
+            if candidate == TERMINATED || !self.exclusion_set.contains(candidate) {
                 return candidate;
             }
         }
@@ -81,10 +68,7 @@ where
 
     fn seek(&mut self, target: DocId) -> DocId {
         let candidate = self.underlying_docset.seek(target);
-        if candidate == TERMINATED {
-            return TERMINATED;
-        }
-        if !self.exclusion_set.contains(candidate) {
+        if candidate == TERMINATED || !self.exclusion_set.contains(candidate) {
             return candidate;
         }
         self.advance()
