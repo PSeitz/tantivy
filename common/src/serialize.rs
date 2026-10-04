@@ -258,12 +258,7 @@ impl<'a> BinarySerializable for Cow<'a, str> {
     }
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Cow<'a, str>> {
-        let string_length = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
-        let mut result = String::with_capacity(string_length);
-        reader
-            .take(string_length as u64)
-            .read_to_string(&mut result)?;
-        Ok(Cow::Owned(result))
+        String::deserialize(reader).map(Cow::Owned)
     }
 }
 
@@ -277,13 +272,7 @@ impl<'a> BinarySerializable for Cow<'a, [u8]> {
     }
 
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Cow<'a, [u8]>> {
-        let num_items = <VInt as BinarySerializable>::deserialize(reader)?.val();
-        let mut items: Vec<u8> = Vec::with_capacity(num_items as usize);
-        for _ in 0..num_items {
-            let item = <u8 as BinarySerializable>::deserialize(reader)?;
-            items.push(item);
-        }
-        Ok(Cow::Owned(items))
+        Vec::<u8>::deserialize(reader).map(Cow::Owned)
     }
 }
 
@@ -345,12 +334,18 @@ pub mod test {
         assert_eq!(serialize_test(String::from("")), 1);
         assert_eq!(serialize_test(String::from("ぽよぽよ")), 1 + 3 * 4);
         assert_eq!(serialize_test(String::from("富士さん見える。")), 1 + 3 * 8);
+        assert_eq!(serialize_test(Cow::Borrowed("")), 1);
+        assert_eq!(serialize_test(Cow::Borrowed("ぽよぽよ")), 1 + 3 * 4);
+        assert_eq!(serialize_test(Cow::<str>::Owned("é".into())), 3);
     }
 
     #[test]
     fn test_serialize_vec() {
         assert_eq!(serialize_test(Vec::<u8>::new()), 1);
         assert_eq!(serialize_test(vec![1u32, 3u32]), 1 + 4 * 2);
+        assert_eq!(serialize_test(Cow::<[u8]>::Borrowed(&[])), 1);
+        assert_eq!(serialize_test(Cow::Borrowed(&b"\0\xff"[..])), 3);
+        assert_eq!(serialize_test(Cow::from(vec![0u8, 255])), 3);
     }
 
     #[test]
