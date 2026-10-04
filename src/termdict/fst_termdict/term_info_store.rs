@@ -202,11 +202,7 @@ impl TermInfoStoreWriter {
         let mut bit_packer = BitPacker::new();
         let ref_term_info = self.term_infos[0].clone();
 
-        let last_term_info = if let Some(last_term_info) = self.term_infos.last().cloned() {
-            last_term_info
-        } else {
-            return Ok(());
-        };
+        let last_term_info = self.term_infos.last().unwrap();
         let postings_end_offset =
             last_term_info.postings_range.end - ref_term_info.postings_range.start;
         let positions_end_offset =
