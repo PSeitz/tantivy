@@ -281,20 +281,12 @@ impl GroupedColumnsHandle {
     fn open(self, merge_row_order: &MergeRowOrder) -> io::Result<GroupedColumns> {
         let mut columns: Vec<Option<DynamicColumn>> = Vec::new();
         for (columnar_id, column) in self.columns.iter().enumerate() {
-            if let Some(column) = column {
-                let column = column.open()?;
-                // We skip columns that end up with 0 documents.
-                // That way, we make sure they don't end up influencing the merge type or
-                // creating empty columns.
-
-                if is_empty_after_merge(merge_row_order, &column, columnar_id) {
-                    columns.push(None);
-                } else {
-                    columns.push(Some(column));
-                }
-            } else {
-                columns.push(None);
-            }
+            let column = column.as_ref().map(DynamicColumnHandle::open).transpose()?;
+            // Skip columns that end up with 0 documents so they don't influence the merge type
+            // or create empty columns.
+            columns.push(
+                column.filter(|column| !is_empty_after_merge(merge_row_order, column, columnar_id)),
+            );
         }
         Ok(GroupedColumns {
             required_column_type: self.required_column_type,
@@ -367,22 +359,12 @@ fn is_empty_after_merge(
                 match column_index {
                     ColumnIndex::Empty { .. } => true,
                     ColumnIndex::Full => alive_bitset.len() == 0,
-                    ColumnIndex::Optional(optional_index) => {
-                        for doc in optional_index.iter_non_null_docs() {
-                            if alive_bitset.contains(doc) {
-                                return false;
-                            }
-                        }
-                        true
-                    }
-                    ColumnIndex::Multivalued(multivalued_index) => {
-                        for alive_docid in alive_bitset.iter() {
-                            if !multivalued_index.range(alive_docid).is_empty() {
-                                return false;
-                            }
-                        }
-                        true
-                    }
+                    ColumnIndex::Optional(optional_index) => optional_index
+                        .iter_non_null_docs()
+                        .all(|doc| !alive_bitset.contains(doc)),
+                    ColumnIndex::Multivalued(multivalued_index) => alive_bitset
+                        .iter()
+                        .all(|alive_docid| multivalued_index.range(alive_docid).is_empty()),
                 }
             } else {
                 // No document is being deleted.
