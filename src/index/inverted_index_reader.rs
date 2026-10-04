@@ -9,6 +9,8 @@ use futures_util::{FutureExt, StreamExt, TryStreamExt};
 #[cfg(feature = "quickwit")]
 use itertools::Itertools;
 #[cfg(feature = "quickwit")]
+use smallvec::SmallVec;
+#[cfg(feature = "quickwit")]
 use tantivy_fst::automaton::{AlwaysMatch, Automaton};
 
 use crate::directory::FileSlice;
@@ -27,9 +29,12 @@ struct AutomatonUnion<'a, A>(&'a [A]);
 
 #[cfg(feature = "quickwit")]
 impl<A: Automaton> Automaton for AutomatonUnion<'_, A> {
-    type State = Vec<A::State>;
+    // Batches are bounded by the 64-bit match mask, so transitions and state clones never
+    // need a heap allocation for the union's state storage.
+    type State = SmallVec<[A::State; 64]>;
 
     fn start(&self) -> Self::State {
+        assert!(self.0.len() <= u64::BITS as usize);
         self.0.iter().map(Automaton::start).collect()
     }
 
@@ -527,7 +532,90 @@ impl InvertedIndexReader {
         Ok(postings_found)
     }
 
+    /// Warms postings for one automaton and returns its matching documents.
+    ///
+    /// Dictionary traversal uses `A::State` directly, without a union or vector-valued batch
+    /// state. Posting lists are decoded after their bytes have been prefetched. As with
+    /// [`Self::warm_postings_automaton`], the directory must cache asynchronous reads for the
+    /// subsequent synchronous reads, and the executor must run independently of this future.
+    pub async fn warm_postings_automaton_with_hits<
+        A: Automaton + Send + 'static,
+        E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
+        F: std::future::Future<Output = io::Result<()>>,
+    >(
+        &self,
+        automaton: A,
+        max_doc: crate::DocId,
+        executor: E,
+    ) -> io::Result<BitSet>
+    where
+        A::State: Clone,
+    {
+        let term_info_stream = self
+            .termdict
+            .search(&automaton)
+            .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES)
+            .await?;
+        drop(term_info_stream);
+
+        let (posting_range_sender, posting_range_receiver) = futures_channel::mpsc::unbounded();
+        let (downloads_done_sender, downloads_done_receiver) = std::sync::mpsc::channel();
+        let (hits_sender, hits_receiver) = std::sync::mpsc::sync_channel(1);
+        let termdict = self.termdict.clone();
+        let postings_file_slice = self.postings_file_slice.clone();
+        let record_option = self.record_option;
+        let cpu_bound_task = move || {
+            let mut stream = termdict.search(automaton).into_stream()?;
+            let matching_terms: Vec<TermInfo> =
+                std::iter::from_fn(|| stream.next().map(|(_, info)| info.clone())).collect();
+            drop(stream);
+            send_coalesced_posting_ranges(
+                matching_terms
+                    .iter()
+                    .map(|info| info.postings_range.clone()),
+                posting_range_sender,
+            )?;
+            downloads_done_receiver
+                .recv()
+                .map_err(|_| io::Error::other("posting downloader stopped unexpectedly"))??;
+
+            let mut hits = BitSet::with_max_value(max_doc);
+            for term_info in matching_terms {
+                let postings_data = postings_file_slice.slice(term_info.postings_range);
+                let mut block_postings = BlockSegmentPostings::open(
+                    term_info.doc_freq,
+                    postings_data,
+                    record_option,
+                    IndexRecordOption::Basic,
+                )?;
+                loop {
+                    let docs = block_postings.docs();
+                    if docs.is_empty() {
+                        break;
+                    }
+                    for &doc in docs {
+                        hits.insert(doc);
+                    }
+                    block_postings.advance();
+                }
+            }
+            hits_sender
+                .send(hits)
+                .map_err(|_| io::Error::other("failed to send automaton hits"))?;
+            Ok(())
+        };
+        futures_util::future::try_join(
+            executor(Box::new(cpu_bound_task)),
+            self.download_posting_ranges_and_signal(posting_range_receiver, downloads_done_sender),
+        )
+        .await?;
+        hits_receiver
+            .recv()
+            .map_err(|_| io::Error::other("automaton hits task stopped unexpectedly"))
+    }
+
     /// Warms and decodes postings in batches of up to 64 automatons per term dictionary scan.
+    /// A single automaton uses [`Self::warm_postings_automaton_with_hits`] directly.
     ///
     /// The returned bitsets are in the same order as `automatons`. A posting list matching several
     /// automatons is decoded only once per batch. Matching automatons are identified from the
@@ -538,7 +626,7 @@ impl InvertedIndexReader {
         F: std::future::Future<Output = io::Result<()>>,
     >(
         &self,
-        automatons: Vec<A>,
+        mut automatons: Vec<A>,
         max_doc: crate::DocId,
         executor: E,
     ) -> io::Result<Vec<BitSet>>
@@ -547,6 +635,12 @@ impl InvertedIndexReader {
     {
         if automatons.is_empty() {
             return Ok(Vec::new());
+        }
+        if automatons.len() == 1 {
+            let hits = self
+                .warm_postings_automaton_with_hits(automatons.pop().unwrap(), max_doc, executor)
+                .await?;
+            return Ok(vec![hits]);
         }
 
         // Load only term dictionary blocks that can match at least one automaton before traversing
@@ -634,23 +728,32 @@ impl InvertedIndexReader {
         };
         let task_handle = executor(Box::new(cpu_bound_task));
 
-        let posting_downloader = async move {
-            let result = self
-                .download_posting_ranges(posting_range_receiver)
-                .await
-                .map(|_| ());
-            let task_result = result
-                .as_ref()
-                .map(|_| ())
-                .map_err(|error| io::Error::new(error.kind(), error.to_string()));
-            let _ = downloads_done_sender.send(task_result);
-            result
-        };
+        let posting_downloader =
+            self.download_posting_ranges_and_signal(posting_range_receiver, downloads_done_sender);
 
         futures_util::future::try_join(task_handle, posting_downloader).await?;
         bitsets_receiver
             .recv()
             .map_err(|_| io::Error::other("automaton bitset task stopped unexpectedly"))
+    }
+
+    // Always signal the waiting decoder, including on download errors, so it cannot remain
+    // blocked while the executor and downloader are being joined.
+    async fn download_posting_ranges_and_signal(
+        &self,
+        posting_ranges: futures_channel::mpsc::UnboundedReceiver<std::ops::Range<usize>>,
+        done: std::sync::mpsc::Sender<io::Result<()>>,
+    ) -> io::Result<()> {
+        let result = self
+            .download_posting_ranges(posting_ranges)
+            .await
+            .map(|_| ());
+        let task_result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()));
+        let _ = done.send(task_result);
+        result
     }
 
     /// Warmup the block postings for all terms.
@@ -732,6 +835,90 @@ mod tests {
                 .await
                 .map_err(|_| io::Error::other("executor task panicked"))?
         }
+    }
+
+    #[test]
+    fn test_automaton_union_states_stay_inline() {
+        for count in [1, 2, 64] {
+            let automatons: Vec<_> = (0..count).map(|_| Regex::new("a.*").unwrap()).collect();
+            let union = AutomatonUnion(&automatons);
+            let mut state = union.start();
+            assert!(!state.spilled());
+            for &byte in b"apple" {
+                state = union.accept(&state, byte);
+                assert!(!state.spilled());
+                assert!(!state.clone().spilled());
+            }
+            assert!(union.is_match(&state));
+        }
+    }
+
+    #[test]
+    fn test_warm_postings_automaton_with_hits() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("field", STRING);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.add_document(doc!(field => "apple", field => "banana"))?;
+        writer.add_document(doc!(field => "apricot"))?;
+        writer.add_document(doc!(field => "banana", field => "berry"))?;
+        writer.add_document(doc!(field => "carrot"))?;
+        // Exercise full postings blocks as well as short lists and duplicate matches.
+        for _ in 0..260 {
+            writer.add_document(doc!(field => "apple", field => "apricot"))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let segment_reader = searcher.segment_reader(0);
+        let inverted_index = segment_reader.inverted_index(field)?;
+        for (pattern, expected) in [
+            ("b.*", vec![0, 2]),
+            ("z.*", vec![]),
+            ("a.*", [vec![0, 1], (4..264).collect()].concat()),
+            (".*", (0..264).collect()),
+        ] {
+            let transitions = Arc::new(AtomicUsize::new(0));
+            let automaton = CountingAutomaton {
+                regex: Regex::new(pattern).unwrap(),
+                transitions: transitions.clone(),
+            };
+            // Single-automaton warmup performs only block selection and one term scan, using
+            // the original automaton state in both. Decoding must not evaluate terms again.
+            drop(futures::executor::block_on(
+                inverted_index
+                    .termdict
+                    .search(&automaton)
+                    .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES),
+            )?);
+            let mut stream = inverted_index.termdict.search(&automaton).into_stream()?;
+            while stream.advance() {}
+            drop(stream);
+            let expected_transitions = transitions.swap(0, Ordering::Relaxed);
+            let hits =
+                futures::executor::block_on(inverted_index.warm_postings_automaton_with_hits(
+                    automaton,
+                    segment_reader.max_doc(),
+                    execute_on_thread,
+                ))?;
+            let docs: Vec<_> = (0..hits.max_value())
+                .filter(|&doc| hits.contains(doc))
+                .collect();
+            assert_eq!(docs, expected);
+            assert_eq!(transitions.load(Ordering::Relaxed), expected_transitions);
+
+            let mut bitsets =
+                futures::executor::block_on(inverted_index.warm_postings_automatons(
+                    vec![Regex::new(pattern).unwrap()],
+                    segment_reader.max_doc(),
+                    execute_on_thread,
+                ))?;
+            assert_eq!(bitsets.len(), 1);
+            let from_batch = bitsets.pop().unwrap();
+            for doc in 0..hits.max_value() {
+                assert_eq!(from_batch.contains(doc), hits.contains(doc));
+            }
+        }
+        Ok(())
     }
 
     #[test]
