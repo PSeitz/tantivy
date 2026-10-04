@@ -7,17 +7,10 @@ pub use phrase_prefix_scorer::PhrasePrefixScorer;
 pub use phrase_prefix_weight::PhrasePrefixWeight;
 
 pub(crate) fn prefix_end(prefix_start: &[u8]) -> Option<Vec<u8>> {
-    let mut res = prefix_start.to_owned();
-    while !res.is_empty() {
-        let end = res.len() - 1;
-        if res[end] == u8::MAX {
-            res.pop();
-        } else {
-            res[end] += 1;
-            return Some(res);
-        }
-    }
-    None
+    let end = prefix_start.iter().rposition(|&byte| byte != u8::MAX)?;
+    let mut res = prefix_start[..=end].to_vec();
+    res[end] += 1;
+    Some(res)
 }
 
 #[cfg(test)]
@@ -26,6 +19,8 @@ mod tests {
 
     #[test]
     fn test_prefix_end() {
+        assert_eq!(prefix_end(b""), None);
+        assert_eq!(prefix_end(b"\xfe\xff"), Some(b"\xff".to_vec()));
         assert_eq!(prefix_end(b"aaa"), Some(b"aab".to_vec()));
         assert_eq!(prefix_end(b"aa\xff"), Some(b"ab".to_vec()));
         assert_eq!(prefix_end(b"a\xff\xff"), Some(b"b".to_vec()));
