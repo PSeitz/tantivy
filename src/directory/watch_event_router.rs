@@ -60,16 +60,13 @@ impl WatchCallbackList {
 
     fn list_callback(&self) -> Vec<WatchCallback> {
         let mut callbacks: Vec<WatchCallback> = vec![];
-        let mut router_wlock = self.router.write().unwrap();
-        let mut i = 0;
-        while i < router_wlock.len() {
-            if let Some(watch) = router_wlock[i].upgrade() {
-                callbacks.push(watch.as_ref().clone());
-                i += 1;
-            } else {
-                router_wlock.swap_remove(i);
-            }
-        }
+        self.router.write().unwrap().retain(|watch| {
+            let Some(watch) = watch.upgrade() else {
+                return false;
+            };
+            callbacks.push(watch.as_ref().clone());
+            true
+        });
         callbacks
     }
 
