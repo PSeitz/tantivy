@@ -174,31 +174,21 @@ impl SegmentCollector for AggregationSegmentCollector {
             return;
         }
         self.agg_collector.push(0, doc);
-        match self
+        self.error = self
             .agg_collector
             .check_flush_local(&mut self.aggs_with_accessor)
-        {
-            Ok(_) => {}
-            Err(e) => {
-                self.error = Some(e);
-            }
-        }
+            .err();
     }
     fn collect_block(&mut self, docs: &[DocId]) {
         if self.error.is_some() {
             return;
         }
 
-        match self.agg_collector.get_sub_agg_collector().collect(
-            0,
-            docs,
-            &mut self.aggs_with_accessor,
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                self.error = Some(e);
-            }
-        }
+        self.error = self
+            .agg_collector
+            .get_sub_agg_collector()
+            .collect(0, docs, &mut self.aggs_with_accessor)
+            .err();
     }
 
     fn harvest(mut self) -> Self::Fruit {
