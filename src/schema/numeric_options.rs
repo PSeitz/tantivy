@@ -139,49 +139,25 @@ impl From<()> for NumericOptions {
 
 impl From<CoerceFlag> for NumericOptions {
     fn from(_: CoerceFlag) -> NumericOptions {
-        NumericOptions {
-            indexed: false,
-            fieldnorms: false,
-            stored: false,
-            fast: false,
-            coerce: true,
-        }
+        NumericOptions::default().set_coerce()
     }
 }
 
 impl From<FastFlag> for NumericOptions {
     fn from(_: FastFlag) -> Self {
-        NumericOptions {
-            indexed: false,
-            fieldnorms: false,
-            stored: false,
-            fast: true,
-            coerce: false,
-        }
+        NumericOptions::default().set_fast()
     }
 }
 
 impl From<StoredFlag> for NumericOptions {
     fn from(_: StoredFlag) -> Self {
-        NumericOptions {
-            indexed: false,
-            fieldnorms: false,
-            stored: true,
-            fast: false,
-            coerce: false,
-        }
+        NumericOptions::default().set_stored()
     }
 }
 
 impl From<IndexedFlag> for NumericOptions {
     fn from(_: IndexedFlag) -> Self {
-        NumericOptions {
-            indexed: true,
-            fieldnorms: true,
-            stored: false,
-            fast: false,
-            coerce: false,
-        }
+        NumericOptions::default().set_indexed().set_fieldnorm()
     }
 }
 
@@ -214,6 +190,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{COERCE, FAST, INDEXED, STORED};
+
+    #[test]
+    fn test_flags_match_builders() {
+        assert_eq!(NumericOptions::default().set_coerce(), COERCE.into());
+        assert_eq!(NumericOptions::default().set_fast(), FAST.into());
+        assert_eq!(NumericOptions::default().set_stored(), STORED.into());
+        assert_eq!(
+            NumericOptions::default().set_indexed().set_fieldnorm(),
+            INDEXED.into()
+        );
+    }
 
     #[test]
     fn test_int_options_deser_if_fieldnorm_missing_indexed_true() {
