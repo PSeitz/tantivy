@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::{io, iter};
 
 use super::{fieldnorm_to_id, FieldNormsSerializer};
@@ -77,16 +76,11 @@ impl FieldNormsWriter {
             .get_mut(field.field_id() as usize)
             .and_then(Option::as_mut)
         {
-            match fieldnorm_buffer.len().cmp(&(doc as usize)) {
-                Ordering::Less => {
-                    // we fill intermediary `DocId` as  having a fieldnorm of 0.
-                    fieldnorm_buffer.resize(doc as usize, 0u8);
-                }
-                Ordering::Equal => {}
-                Ordering::Greater => {
-                    panic!("Cannot register a given fieldnorm twice")
-                }
-            }
+            assert!(
+                fieldnorm_buffer.len() <= doc as usize,
+                "Cannot register a given fieldnorm twice"
+            );
+            fieldnorm_buffer.resize(doc as usize, 0u8);
             fieldnorm_buffer.push(fieldnorm_to_id(fieldnorm));
         }
     }
