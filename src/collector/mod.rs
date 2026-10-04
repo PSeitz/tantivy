@@ -82,6 +82,7 @@
 //! See the `custom_collector` example.
 
 use downcast_rs::impl_downcast;
+use itertools::multiunzip;
 
 use crate::schema::Schema;
 use crate::{DocId, Score, SegmentOrdinal, SegmentReader};
@@ -246,10 +247,8 @@ impl<TCollector: Collector> Collector for Option<TCollector> {
     type Child = Option<<TCollector as Collector>::Child>;
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
-        if let Some(underlying_collector) = self {
-            underlying_collector.check_schema(schema)?;
-        }
-        Ok(())
+        self.as_ref()
+            .map_or(Ok(()), |inner| inner.check_schema(schema))
     }
 
     fn for_segment(
@@ -257,34 +256,22 @@ impl<TCollector: Collector> Collector for Option<TCollector> {
         segment_local_id: SegmentOrdinal,
         segment: &SegmentReader,
     ) -> crate::Result<Self::Child> {
-        Ok(if let Some(inner) = self {
-            let inner_segment_collector = inner.for_segment(segment_local_id, segment)?;
-            Some(inner_segment_collector)
-        } else {
-            None
-        })
+        self.as_ref()
+            .map(|inner| inner.for_segment(segment_local_id, segment))
+            .transpose()
     }
 
     fn requires_scoring(&self) -> bool {
-        self.as_ref()
-            .map(|inner| inner.requires_scoring())
-            .unwrap_or(false)
+        self.as_ref().is_some_and(Collector::requires_scoring)
     }
 
     fn merge_fruits(
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit> {
-        if let Some(inner) = self.as_ref() {
-            let inner_segment_fruits: Vec<_> = segment_fruits
-                .into_iter()
-                .flat_map(|fruit_opt| fruit_opt.into_iter())
-                .collect();
-            let fruit = inner.merge_fruits(inner_segment_fruits)?;
-            Ok(Some(fruit))
-        } else {
-            Ok(None)
-        }
+        self.as_ref()
+            .map(|inner| inner.merge_fruits(segment_fruits.into_iter().flatten().collect()))
+            .transpose()
     }
 }
 
@@ -351,12 +338,7 @@ where
         &self,
         segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<(Left::Fruit, Right::Fruit)> {
-        let mut left_fruits = vec![];
-        let mut right_fruits = vec![];
-        for (left_fruit, right_fruit) in segment_fruits {
-            left_fruits.push(left_fruit);
-            right_fruits.push(right_fruit);
-        }
+        let (left_fruits, right_fruits): (Vec<_>, Vec<_>) = multiunzip(segment_fruits);
         Ok((
             self.0.merge_fruits(left_fruits)?,
             self.1.merge_fruits(right_fruits)?,
@@ -423,14 +405,7 @@ where
         &self,
         children: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit> {
-        let mut one_fruits = vec![];
-        let mut two_fruits = vec![];
-        let mut three_fruits = vec![];
-        for (one_fruit, two_fruit, three_fruit) in children {
-            one_fruits.push(one_fruit);
-            two_fruits.push(two_fruit);
-            three_fruits.push(three_fruit);
-        }
+        let (one_fruits, two_fruits, three_fruits): (Vec<_>, Vec<_>, Vec<_>) = multiunzip(children);
         Ok((
             self.0.merge_fruits(one_fruits)?,
             self.1.merge_fruits(two_fruits)?,
@@ -507,16 +482,8 @@ where
         &self,
         children: Vec<<Self::Child as SegmentCollector>::Fruit>,
     ) -> crate::Result<Self::Fruit> {
-        let mut one_fruits = vec![];
-        let mut two_fruits = vec![];
-        let mut three_fruits = vec![];
-        let mut four_fruits = vec![];
-        for (one_fruit, two_fruit, three_fruit, four_fruit) in children {
-            one_fruits.push(one_fruit);
-            two_fruits.push(two_fruit);
-            three_fruits.push(three_fruit);
-            four_fruits.push(four_fruit);
-        }
+        let (one_fruits, two_fruits, three_fruits, four_fruits): (Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
+            multiunzip(children);
         Ok((
             self.0.merge_fruits(one_fruits)?,
             self.1.merge_fruits(two_fruits)?,
