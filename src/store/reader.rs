@@ -13,7 +13,6 @@ use super::footer::DocStoreFooter;
 use super::index::SkipIndex;
 use super::Decompressor;
 use crate::directory::FileSlice;
-use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize};
 use crate::space_usage::StoreSpaceUsage;
@@ -295,59 +294,19 @@ impl StoreReader {
         &'b self,
         alive_bitset: Option<&'a AliveBitSet>,
     ) -> impl Iterator<Item = crate::Result<OwnedBytes>> + 'b {
-        let last_doc_id = self
-            .block_checkpoints()
-            .last()
-            .map(|checkpoint| checkpoint.doc_range.end)
-            .unwrap_or(0);
-        let mut checkpoint_block_iter = self.block_checkpoints();
-        let mut curr_checkpoint = checkpoint_block_iter.next();
-        let mut curr_block = curr_checkpoint
-            .as_ref()
-            .map(|checkpoint| self.read_block(checkpoint).map_err(|e| e.kind())); // map error in
-                                                                                  // order to enable
-                                                                                  // cloning
-        let mut doc_pos = 0;
-        (0..last_doc_id)
-            .filter_map(move |doc_id| {
-                // filter_map is only used to resolve lifetime issues between the two closures on
-                // the outer variables
-
-                // check move to next checkpoint
-                if doc_id >= curr_checkpoint.as_ref().unwrap().doc_range.end {
-                    curr_checkpoint = checkpoint_block_iter.next();
-                    curr_block = curr_checkpoint
-                        .as_ref()
-                        .map(|checkpoint| self.read_block(checkpoint).map_err(|e| e.kind()));
-                    doc_pos = 0;
-                }
-
-                let alive = alive_bitset
-                    .map(|bitset| bitset.is_alive(doc_id))
-                    .unwrap_or(true);
-                let res = if alive {
-                    Some((curr_block.clone(), doc_pos))
-                } else {
-                    None
-                };
-                doc_pos += 1;
-                res
-            })
-            .map(move |(block, doc_pos)| {
-                let block = block
-                    .ok_or_else(|| {
-                        DataCorruption::comment_only(
-                            "the current checkpoint in the doc store iterator is none, this \
-                             should never happen",
-                        )
-                    })?
-                    .map_err(|error_kind| {
-                        std::io::Error::new(error_kind, "error when reading block in doc store")
+        self.block_checkpoints().flat_map(move |checkpoint| {
+            let block = self.read_block(&checkpoint).map_err(|error| error.kind());
+            checkpoint
+                .doc_range
+                .clone()
+                .filter(move |&doc_id| alive_bitset.is_none_or(|bitset| bitset.is_alive(doc_id)))
+                .map(move |doc_id| {
+                    let block = block.clone().map_err(|error_kind| {
+                        io::Error::new(error_kind, "error when reading block in doc store")
                     })?;
-
-                let range = block_read_index(&block, doc_pos)?;
-                Ok(block.slice(range))
-            })
+                    Self::get_document_bytes_from_block(block, doc_id, &checkpoint)
+                })
+        })
     }
 
     /// Summarize total space usage of this store reader.

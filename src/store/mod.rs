@@ -133,29 +133,39 @@ pub(crate) mod tests {
             );
         }
 
-        for doc in store.iter::<TantivyDocument>(Some(&alive_bitset)) {
-            let doc = doc?;
-            let title_content = doc
-                .get_first(field_title)
-                .unwrap()
-                .as_value()
-                .as_str()
-                .unwrap()
-                .to_string();
-            if !title_content.starts_with("Doc ") {
-                panic!("unexpected title_content {title_content}");
-            }
+        let titles = store
+            .iter::<TantivyDocument>(Some(&alive_bitset))
+            .map(|doc| {
+                Ok(doc?
+                    .get_first(field_title)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string())
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let expected_titles = (0..NUM_DOCS as u32)
+            .filter(|&id| alive_bitset.is_alive(id))
+            .map(|id| format!("Doc {id}"))
+            .collect::<Vec<_>>();
+        assert_eq!(titles, expected_titles);
 
-            let id = title_content
-                .strip_prefix("Doc ")
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
-            if alive_bitset.is_deleted(id) {
-                panic!("unexpected deleted document {id}");
-            }
-        }
+        Ok(())
+    }
 
+    #[test]
+    fn test_doc_store_iter_empty() -> crate::Result<()> {
+        let path = Path::new("store");
+        let directory = RamDirectory::create();
+        write_lorem_ipsum_store(
+            directory.open_write(path)?,
+            0,
+            Compressor::None,
+            BLOCK_SIZE,
+            false,
+        );
+        let store = StoreReader::open(directory.open_read(path)?, 10)?;
+        assert!(store.iter_raw(None).next().is_none());
         Ok(())
     }
 
