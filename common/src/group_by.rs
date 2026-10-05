@@ -28,7 +28,6 @@ pub trait GroupByIteratorExtended: Iterator {
         Self: Sized,
         F: FnMut(&Self::Item) -> K,
         K: PartialEq + Clone,
-        Self::Item: Clone,
     {
         GroupByIterator::new(self, key)
     }
@@ -80,16 +79,14 @@ where
 impl<I, F, K> Iterator for GroupByIterator<I, F, K>
 where
     I: Iterator,
-    I::Item: Clone,
     F: FnMut(&I::Item) -> K,
     K: Clone,
 {
     type Item = (K, GroupIterator<I, F, K>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut inner = self.inner.borrow_mut();
-        let value = inner.iter.peek()?.clone();
-        let key = (inner.group_by_fn)(&value);
+        let GroupByShared { iter, group_by_fn } = &mut *self.inner.borrow_mut();
+        let key = group_by_fn(iter.peek()?);
 
         let inner = self.inner.clone();
 
@@ -113,20 +110,13 @@ where
 impl<I, F, K: PartialEq + Clone> Iterator for GroupIterator<I, F, K>
 where
     I: Iterator,
-    I::Item: Clone,
     F: FnMut(&I::Item) -> K,
 {
     type Item = I::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut inner = self.inner.borrow_mut();
-        // peek if next value is in group
-        let peek_val = inner.iter.peek()?.clone();
-        if (inner.group_by_fn)(&peek_val) == self.group_key {
-            inner.iter.next()
-        } else {
-            None
-        }
+        let GroupByShared { iter, group_by_fn } = &mut *self.inner.borrow_mut();
+        iter.next_if(|value| group_by_fn(value) == self.group_key)
     }
 }
 
@@ -142,8 +132,13 @@ mod tests {
 
     #[test]
     fn group_by_two_groups() {
-        let vals = vec![1u32, 4, 15];
-        let grouped_vals = group_by_collect(vals.into_iter());
+        struct Item(u32);
+        let vals = [Item(1), Item(4), Item(15)];
+        let grouped_vals = vals
+            .into_iter()
+            .group_by(|val| val.0 / 10)
+            .map(|(key, group)| (key, group.map(|val| val.0).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
         assert_eq!(grouped_vals, vec![(0, vec![1, 4]), (1, vec![15])]);
     }
 
