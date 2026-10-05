@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "quickwit")]
 use futures_util::{future::Either, FutureExt};
-
-use crate::TantivyError;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 /// Executor makes it possible to run tasks in single thread or
 /// in a thread pool.
@@ -59,44 +58,8 @@ impl Executor {
             }
             Executor::ThreadPool(pool) => {
                 let args: Vec<A> = args.collect();
-                let num_fruits = args.len();
-                let fruit_receiver = {
-                    let (fruit_sender, fruit_receiver) = crossbeam_channel::unbounded();
-                    pool.scope(|scope| {
-                        for (idx, arg) in args.into_iter().enumerate() {
-                            // We name references for f and fruit_sender_ref because we do not
-                            // want these two to be moved into the closure.
-                            let f_ref = &f;
-                            let fruit_sender_ref = &fruit_sender;
-                            scope.spawn(move |_| {
-                                let fruit = f_ref(arg);
-                                if let Err(err) = fruit_sender_ref.send((idx, fruit)) {
-                                    error!(
-                                        "Failed to send search task. It probably means all search \
-                                         threads have panicked. {err:?}"
-                                    );
-                                }
-                            });
-                        }
-                    });
-                    fruit_receiver
-                    // This ends the scope of fruit_sender.
-                    // This is important as it makes it possible for the fruit_receiver iteration to
-                    // terminate.
-                };
-                let mut result_placeholders: Vec<Option<R>> =
-                    std::iter::repeat_with(|| None).take(num_fruits).collect();
-                for (pos, fruit_res) in fruit_receiver {
-                    let fruit = fruit_res?;
-                    result_placeholders[pos] = Some(fruit);
-                }
-                let results: Vec<R> = result_placeholders.into_iter().flatten().collect();
-                if results.len() != num_fruits {
-                    return Err(TantivyError::InternalError(
-                        "One of the mapped execution failed.".to_string(),
-                    ));
-                }
-                Ok(results)
+                let results: Vec<_> = pool.install(|| args.into_par_iter().map(&f).collect());
+                results.into_iter().collect()
             }
         }
     }
@@ -147,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic] //< unfortunately the panic message is not propagated
+    #[should_panic(expected = "panic should propagate")]
     fn test_panic_propagates_multi_thread() {
         let _result: Vec<usize> = Executor::multi_thread(1, "search-test")
             .unwrap()
@@ -181,6 +144,25 @@ mod tests {
         for i in 0..10 {
             assert_eq!(result[i], i * 2);
         }
+    }
+
+    #[test]
+    fn test_map_multithread_error() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = Executor::multi_thread(3, "search-test").unwrap().map(
+            |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err::<(), _>(crate::TantivyError::InvalidArgument(
+                    "task failed".to_string(),
+                ))
+            },
+            0..10,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::TantivyError::InvalidArgument(_))
+        ));
+        assert_eq!(calls.into_inner(), 10);
     }
 
     #[cfg(feature = "quickwit")]
