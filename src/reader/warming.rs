@@ -110,11 +110,7 @@ impl WarmingStateInner {
             .iter()
             .map(|searcher_generation| searcher_generation.generation_id())
             .collect();
-        let gc_not_required = self
-            .warmed_generation_ids
-            .iter()
-            .all(|warmed_up_generation| live_generation_ids.contains(warmed_up_generation));
-        if gc_not_required {
+        if self.warmed_generation_ids.is_subset(&live_generation_ids) {
             return false;
         }
         let live_generation_refs = live_generations
