@@ -125,16 +125,13 @@ fn compute_term_bitset(column: &BytesColumn, row_bitset: &ReadOnlyBitSet) -> Bit
 }
 
 fn is_term_present(bitsets: &[Option<BitSet>], term_merger: &TermMerger) -> bool {
-    for (segment_ord, from_term_ord) in term_merger.matching_segments() {
-        if let Some(bitset) = bitsets[segment_ord].as_ref() {
-            if bitset.contains(from_term_ord as u32) {
-                return true;
-            }
-        } else {
-            return true;
-        }
-    }
-    false
+    term_merger
+        .matching_segments()
+        .any(|(segment_ord, from_term_ord)| {
+            bitsets[segment_ord]
+                .as_ref()
+                .is_none_or(|bitset| bitset.contains(from_term_ord as u32))
+        })
 }
 
 fn merge_dict_and_compute_term_ord_mapping(
