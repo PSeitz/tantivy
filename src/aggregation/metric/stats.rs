@@ -137,27 +137,13 @@ impl IntermediateStats {
 
     /// Computes the final stats value.
     pub fn finalize(&self) -> Stats {
-        let min = if self.count == 0 {
-            None
-        } else {
-            Some(self.min)
-        };
-        let max = if self.count == 0 {
-            None
-        } else {
-            Some(self.max)
-        };
-        let avg = if self.count == 0 {
-            None
-        } else {
-            Some(self.sum / (self.count as f64))
-        };
+        let has_values = self.count != 0;
         Stats {
             count: self.count,
             sum: self.sum,
-            min,
-            max,
-            avg,
+            min: has_values.then_some(self.min),
+            max: has_values.then_some(self.max),
+            avg: has_values.then(|| self.sum / self.count as f64),
         }
     }
 
