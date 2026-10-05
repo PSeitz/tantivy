@@ -27,22 +27,10 @@ pub(super) mod num_cmp {
         // well-defined (truncation toward 0)
         let right_as_i = right_f as i64;
 
-        let result = match left_i.cmp(&right_as_i) {
-            Ordering::Less => Ordering::Less,
-            Ordering::Greater => Ordering::Greater,
-            Ordering::Equal => {
-                // they have the same integer part, compare the fraction
-                let rem = right_f - (right_as_i as f64);
-                if rem == 0.0 {
-                    Ordering::Equal
-                } else if right_f > 0.0 {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-        };
-        Ok(result)
+        // Only compare as floats when the integer parts match, preserving integer precision.
+        Ok(left_i
+            .cmp(&right_as_i)
+            .then_with(|| (right_as_i as f64).partial_cmp(&right_f).unwrap()))
     }
 
     pub fn cmp_u64_f64(left_u: u64, right_f: f64) -> crate::Result<Ordering> {
@@ -67,20 +55,10 @@ pub(super) mod num_cmp {
         // (truncation toward 0)
         let right_as_u = right_f as u64;
 
-        let result = match left_u.cmp(&right_as_u) {
-            Ordering::Less => Ordering::Less,
-            Ordering::Greater => Ordering::Greater,
-            Ordering::Equal => {
-                // they have the same integer part, compare the fraction
-                let rem = right_f - (right_as_u as f64);
-                if rem == 0.0 {
-                    Ordering::Equal
-                } else {
-                    Ordering::Less
-                }
-            }
-        };
-        Ok(result)
+        // Only compare as floats when the integer parts match, preserving integer precision.
+        Ok(left_u
+            .cmp(&right_as_u)
+            .then_with(|| (right_as_u as f64).partial_cmp(&right_f).unwrap()))
     }
 
     pub fn cmp_i64_u64(left_i: i64, right_u: u64) -> Ordering {
@@ -195,6 +173,8 @@ mod num_cmp_tests {
         assert_eq!(cmp_u64_f64(6, 5.0).unwrap(), Ordering::Greater);
         assert_eq!(cmp_u64_f64(0, 0.0).unwrap(), Ordering::Equal);
         assert_eq!(cmp_u64_f64(0, 0.1).unwrap(), Ordering::Less);
+        assert_eq!(cmp_u64_f64(5, 5.5).unwrap(), Ordering::Less);
+        assert_eq!(cmp_u64_f64(0, -0.0).unwrap(), Ordering::Equal);
 
         // Negative float values should always be less than any u64
         assert_eq!(cmp_u64_f64(0, -0.1).unwrap(), Ordering::Greater);
@@ -248,6 +228,9 @@ mod num_cmp_tests {
         assert_eq!(cmp_i64_f64(-1, -0.5).unwrap(), Ordering::Less);
         assert_eq!(cmp_i64_f64(-1, 0.0).unwrap(), Ordering::Less);
         assert_eq!(cmp_i64_f64(0, 0.0).unwrap(), Ordering::Equal);
+        assert_eq!(cmp_i64_f64(5, 5.5).unwrap(), Ordering::Less);
+        assert_eq!(cmp_i64_f64(-5, -5.5).unwrap(), Ordering::Greater);
+        assert_eq!(cmp_i64_f64(0, -0.0).unwrap(), Ordering::Equal);
 
         // Tests with extreme values
         assert_eq!(cmp_i64_f64(i64::MAX, 1e20).unwrap(), Ordering::Less);
