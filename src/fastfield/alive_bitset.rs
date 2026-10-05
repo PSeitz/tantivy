@@ -25,13 +25,7 @@ pub struct AliveBitSet {
 /// Intersects two AliveBitSets in a new one.
 /// The two bitsets need to have the same max_value.
 pub fn intersect_alive_bitsets(left: AliveBitSet, right: AliveBitSet) -> AliveBitSet {
-    assert_eq!(left.bitset().max_value(), right.bitset().max_value());
-    let bitset = intersect_bitsets(left.bitset(), right.bitset());
-    let num_alive_docs = bitset.len();
-    AliveBitSet {
-        num_alive_docs,
-        bitset,
-    }
+    AliveBitSet::from(intersect_bitsets(left.bitset(), right.bitset()))
 }
 
 impl AliveBitSet {
