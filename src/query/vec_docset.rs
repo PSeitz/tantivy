@@ -26,19 +26,12 @@ impl From<Vec<DocId>> for VecDocSet {
 
 impl DocSet for VecDocSet {
     fn advance(&mut self) -> DocId {
-        self.cursor += 1;
-        if self.cursor >= self.doc_ids.len() {
-            self.cursor = self.doc_ids.len();
-            return TERMINATED;
-        }
+        self.cursor = (self.cursor + 1).min(self.doc_ids.len());
         self.doc()
     }
 
     fn doc(&self) -> DocId {
-        if self.cursor == self.doc_ids.len() {
-            return TERMINATED;
-        }
-        self.doc_ids[self.cursor]
+        self.doc_ids.get(self.cursor).copied().unwrap_or(TERMINATED)
     }
 
     fn size_hint(&self) -> u32 {
@@ -60,6 +53,7 @@ pub(crate) mod tests {
 
     #[test]
     pub fn test_vec_postings() {
+        assert_eq!(VecDocSet::from(Vec::new()).advance(), TERMINATED);
         let doc_ids: Vec<DocId> = (0u32..1024u32).map(|e| e * 3).collect();
         let mut postings = VecDocSet::from(doc_ids);
         assert_eq!(postings.doc(), 0u32);
@@ -70,6 +64,9 @@ pub(crate) mod tests {
         assert_eq!(postings.seek(300u32), 300u32);
         assert_eq!(postings.doc(), 300u32);
         assert_eq!(postings.seek(6000u32), TERMINATED);
+        assert_eq!(postings.doc(), TERMINATED);
+        assert_eq!(postings.advance(), TERMINATED);
+        assert_eq!(postings.doc(), TERMINATED);
     }
 
     #[test]
