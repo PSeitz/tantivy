@@ -109,15 +109,8 @@ impl MmapCache {
     }
 
     fn remove_weak_ref(&mut self) {
-        let keys_to_remove: Vec<PathBuf> = self
-            .cache
-            .iter()
-            .filter(|(_, mmap_weakref)| mmap_weakref.upgrade().is_none())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in keys_to_remove {
-            self.cache.remove(&key);
-        }
+        self.cache
+            .retain(|_, mmap_weakref| mmap_weakref.upgrade().is_some());
     }
 
     fn open_mmap_impl(&self, full_path: &Path) -> Result<Option<Mmap>, OpenReadError> {
