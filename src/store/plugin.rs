@@ -15,7 +15,7 @@ use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, Segme
 use crate::schema::document::Document;
 use crate::schema::Schema;
 use crate::space_usage::{ComponentSpaceUsage, STORE};
-use crate::store::{StoreReader, StoreWriter};
+use crate::store::{Compressor, StoreReader, StoreWriter};
 use crate::Segment;
 
 /// Built-in segment plugin that stores and merges stored documents.
@@ -120,28 +120,24 @@ impl StorePluginWriter {
         let directory = ctx.segment.index().directory();
         let remapping_required = settings.sort_by_field.is_some() || settings.manual_doc_id_mapping;
 
-        let store_writer = if remapping_required {
-            let path = ctx.segment.relative_path(SegmentComponent::TempStore);
-            let store_write = directory.open_write(&path)?;
-            StoreWriter::new(
-                store_write,
-                crate::store::Compressor::None,
-                // We want fast random access on the docs, so we choose a small block size.
-                // If this is zero, the skip index will contain too many checkpoints and
-                // therefore will be relatively slow.
-                16000,
-                settings.docstore_compress_dedicated_thread,
-            )?
+        let (component, compressor, blocksize) = if remapping_required {
+            // Use small, uncompressed blocks for fast random access during remapping.
+            (SegmentComponent::TempStore, Compressor::None, 16000)
         } else {
-            let path = ctx.segment.relative_path(SegmentComponent::Store);
-            let store_write = directory.open_write(&path)?;
-            StoreWriter::new(
-                store_write,
+            (
+                SegmentComponent::Store,
                 settings.docstore_compression,
                 settings.docstore_blocksize,
-                settings.docstore_compress_dedicated_thread,
-            )?
+            )
         };
+        let path = ctx.segment.relative_path(component);
+        let store_write = directory.open_write(&path)?;
+        let store_writer = StoreWriter::new(
+            store_write,
+            compressor,
+            blocksize,
+            settings.docstore_compress_dedicated_thread,
+        )?;
 
         Ok(StorePluginWriter {
             store_writer: Some(store_writer),
