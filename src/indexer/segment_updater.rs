@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use itertools::Itertools;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use super::segment_manager::SegmentManager;
@@ -250,11 +251,8 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         "Segments Merge: [{}]",
         segments
             .iter()
-            .fold(String::new(), |sum, current| format!(
-                "{sum}{} ",
-                current.meta().id().uuid_string()
-            ))
-            .trim_end()
+            .map(|segment| segment.meta().id().uuid_string())
+            .join(" ")
     );
 
     let index_meta = IndexMeta {
