@@ -102,16 +102,7 @@ impl RegexPhraseWeight {
     ) -> crate::Result<()> {
         let mut block_segment_postings = inverted_index
             .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
-        loop {
-            let docs = block_segment_postings.docs();
-            if docs.is_empty() {
-                break;
-            }
-            for &doc in docs {
-                doc_bitset.insert(doc);
-            }
-            block_segment_postings.advance();
-        }
+        block_segment_postings.insert_into_bitset(doc_bitset);
         Ok(())
     }
 

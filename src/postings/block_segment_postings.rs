@@ -1,6 +1,6 @@
 use std::io;
 
-use common::VInt;
+use common::{BitSet, VInt};
 
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
@@ -215,6 +215,16 @@ impl BlockSegmentPostings {
     /// length, and it does not take in account deleted documents.
     pub fn doc_freq(&self) -> u32 {
         self.doc_freq
+    }
+
+    /// Inserts all document IDs from the remaining blocks into the bitset.
+    pub(crate) fn insert_into_bitset(&mut self, bitset: &mut BitSet) {
+        while !self.docs().is_empty() {
+            for &doc in self.docs() {
+                bitset.insert(doc);
+            }
+            self.advance();
+        }
     }
 
     /// Returns the array of docs in the current block.
