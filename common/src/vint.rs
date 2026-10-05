@@ -34,23 +34,17 @@ impl BinarySerializable for VIntU128 {
         let mut bytes = reader.bytes();
         let mut result = 0u128;
         let mut shift = 0u64;
-        loop {
-            match bytes.next() {
-                Some(Ok(b)) => {
-                    result |= u128::from(b % 128u8) << shift;
-                    if b >= STOP_BIT {
-                        return Ok(VIntU128(result));
-                    }
-                    shift += 7;
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Reach end of buffer while reading VInt",
-                    ));
-                }
+        while let Some(Ok(b)) = bytes.next() {
+            result |= u128::from(b % 128u8) << shift;
+            if b >= STOP_BIT {
+                return Ok(VIntU128(result));
             }
+            shift += 7;
         }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Reach end of buffer while reading VInt",
+        ))
     }
 }
 
@@ -203,23 +197,17 @@ impl BinarySerializable for VInt {
         let mut bytes = reader.bytes();
         let mut result = 0u64;
         let mut shift = 0u64;
-        loop {
-            match bytes.next() {
-                Some(Ok(b)) => {
-                    result |= u64::from(b % 128u8) << shift;
-                    if b >= STOP_BIT {
-                        return Ok(VInt(result));
-                    }
-                    shift += 7;
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Reach end of buffer while reading VInt",
-                    ));
-                }
+        while let Some(Ok(b)) = bytes.next() {
+            result |= u64::from(b % 128u8) << shift;
+            if b >= STOP_BIT {
+                return Ok(VInt(result));
             }
+            shift += 7;
         }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Reach end of buffer while reading VInt",
+        ))
     }
 }
 
