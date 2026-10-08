@@ -25,8 +25,16 @@ pub trait FileHandle: 'static + Send + Sync + HasLen + fmt::Debug {
     /// This method may panic if the range requested is invalid.
     fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes>;
 
+    /// Reads a slice of bytes asynchronously.
+    ///
+    /// `name` identifies the data being read (see [`FileSlice::with_name`]). It
+    /// is only meant for instrumentation and must not change the bytes read.
     #[doc(hidden)]
-    async fn read_bytes_async(&self, _byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_async(
+        &self,
+        _byte_range: Range<usize>,
+        _name: Option<&str>,
+    ) -> io::Result<OwnedBytes> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Async read is not supported.",
@@ -97,7 +105,11 @@ impl FileHandle for &'static [u8] {
         Ok(OwnedBytes::new(bytes))
     }
 
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_async(
+        &self,
+        byte_range: Range<usize>,
+        _name: Option<&str>,
+    ) -> io::Result<OwnedBytes> {
         Ok(self.read_bytes(byte_range)?)
     }
 }
@@ -117,11 +129,18 @@ where B: StableDeref + Deref<Target = [u8]> + 'static + Send + Sync
 pub struct FileSlice {
     data: Arc<dyn FileHandle>,
     range: Range<usize>,
+    /// Identifies the data of the slice, e.g. the field it belongs to. Kept by
+    /// sub-slices and passed to [`FileHandle::read_bytes_async`].
+    name: Option<Arc<str>>,
 }
 
 impl fmt::Debug for FileSlice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "FileSlice({:?}, {:?})", self.data, self.range)
+        write!(
+            f,
+            "FileSlice({:?}, {:?}, {:?})",
+            self.data, self.range, self.name
+        )
     }
 }
 
@@ -197,7 +216,24 @@ impl FileSlice {
         FileSlice {
             data: file_handle,
             range: 0..num_bytes,
+            name: None,
         }
+    }
+
+    /// Names the slice, e.g. after the field it belongs to.
+    ///
+    /// The name is kept by sub-slices and passed to the [`FileHandle`] on async
+    /// reads, so a `Directory` can attribute its reads. It does not change the
+    /// bytes read.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<Arc<str>>) -> FileSlice {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Returns the name set by [`FileSlice::with_name`], if any.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Creates a fileslice that is just a view over a slice of the data.
@@ -211,6 +247,7 @@ impl FileSlice {
         FileSlice {
             data: self.data.clone(),
             range: combine_ranges(self.range.clone(), byte_range),
+            name: self.name.clone(),
         }
     }
 
@@ -232,7 +269,9 @@ impl FileSlice {
 
     #[doc(hidden)]
     pub async fn read_bytes_async(&self) -> io::Result<OwnedBytes> {
-        self.data.read_bytes_async(self.range.clone()).await
+        self.data
+            .read_bytes_async(self.range.clone(), self.name())
+            .await
     }
 
     /// Reads a specific slice of data.
@@ -251,15 +290,7 @@ impl FileSlice {
 
     #[doc(hidden)]
     pub async fn read_bytes_slice_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        assert!(
-            self.range.start + byte_range.end <= self.range.end,
-            "`to` exceeds the fileslice length"
-        );
-        self.data
-            .read_bytes_async(
-                self.range.start + byte_range.start..self.range.start + byte_range.end,
-            )
-            .await
+        FileHandle::read_bytes_async(self, byte_range, None).await
     }
 
     /// Splits the FileSlice at the given offset and return two file slices.
@@ -317,8 +348,23 @@ impl FileHandle for FileSlice {
         self.read_bytes_slice(range)
     }
 
-    async fn read_bytes_async(&self, byte_range: Range<usize>) -> io::Result<OwnedBytes> {
-        self.read_bytes_slice_async(byte_range).await
+    /// `name` is the name of the outer slice, so it takes precedence over the
+    /// name of this slice.
+    async fn read_bytes_async(
+        &self,
+        byte_range: Range<usize>,
+        name: Option<&str>,
+    ) -> io::Result<OwnedBytes> {
+        assert!(
+            self.range.start + byte_range.end <= self.range.end,
+            "`to` exceeds the fileslice length"
+        );
+        self.data
+            .read_bytes_async(
+                self.range.start + byte_range.start..self.range.start + byte_range.end,
+                name.or(self.name()),
+            )
+            .await
     }
 }
 
@@ -334,7 +380,11 @@ impl FileHandle for OwnedBytes {
         Ok(self.slice(range))
     }
 
-    async fn read_bytes_async(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+    async fn read_bytes_async(
+        &self,
+        range: Range<usize>,
+        _name: Option<&str>,
+    ) -> io::Result<OwnedBytes> {
         self.read_bytes(range)
     }
 }
@@ -342,12 +392,70 @@ impl FileHandle for OwnedBytes {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::ops::Bound;
-    use std::sync::Arc;
+    use std::ops::{Bound, Range};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use futures::executor::block_on;
+    use ownedbytes::OwnedBytes;
 
     use super::{FileHandle, FileSlice};
     use crate::HasLen;
     use crate::file_slice::combine_ranges;
+
+    /// Records the name passed to each async read.
+    #[derive(Debug, Default)]
+    struct NameRecordingHandle {
+        names: Mutex<Vec<Option<String>>>,
+    }
+
+    impl HasLen for NameRecordingHandle {
+        fn len(&self) -> usize {
+            10
+        }
+    }
+
+    #[async_trait]
+    impl FileHandle for NameRecordingHandle {
+        fn read_bytes(&self, range: Range<usize>) -> io::Result<OwnedBytes> {
+            Ok(OwnedBytes::new(vec![0u8; range.len()]))
+        }
+
+        async fn read_bytes_async(
+            &self,
+            range: Range<usize>,
+            name: Option<&str>,
+        ) -> io::Result<OwnedBytes> {
+            self.names.lock().unwrap().push(name.map(str::to_string));
+            self.read_bytes(range)
+        }
+    }
+
+    #[test]
+    fn test_file_slice_name_is_passed_to_async_reads() -> io::Result<()> {
+        let handle = Arc::new(NameRecordingHandle::default());
+        let file_slice = FileSlice::new(handle.clone());
+        block_on(file_slice.read_bytes_async())?;
+        let named_slice = file_slice.slice(2..8).with_name("body");
+        assert_eq!(named_slice.name(), Some("body"));
+        block_on(named_slice.slice_from(1).read_bytes_async())?;
+        block_on(named_slice.read_bytes_slice_async(0..2))?;
+        // The name of the outer slice takes precedence.
+        let outer_slice = FileSlice::new(Arc::new(named_slice.clone()));
+        block_on(outer_slice.read_bytes_async())?;
+        block_on(outer_slice.with_name("title").read_bytes_async())?;
+        assert_eq!(
+            *handle.names.lock().unwrap(),
+            [
+                None,
+                Some("body".to_string()),
+                Some("body".to_string()),
+                Some("body".to_string()),
+                Some("title".to_string()),
+            ]
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_file_slice() -> io::Result<()> {

@@ -275,10 +275,13 @@ impl SegmentReader {
             DataCorruption::comment_only(error_msg)
         })?;
 
+        // Names the slices after the field, so that a `Directory` can attribute
+        // the async reads of the inverted index.
+        let field_name: Arc<str> = Arc::from(field_entry.name());
         let inv_idx_reader = Arc::new(InvertedIndexReader::new(
-            TermDictionary::open(termdict_file)?,
-            postings_file,
-            positions_file,
+            TermDictionary::open(termdict_file.with_name(field_name.clone()))?,
+            postings_file.with_name(field_name.clone()),
+            positions_file.with_name(field_name),
             record_option,
         )?);
 

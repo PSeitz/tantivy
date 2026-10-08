@@ -492,3 +492,24 @@ impl InvertedIndexReader {
             .unwrap_or(0u32))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::schema::{Schema, TEXT};
+    use crate::{Index, IndexWriter};
+
+    #[test]
+    fn test_inverted_index_file_slices_are_named_after_field() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let body = schema_builder.add_text_field("body", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(doc!(body => "hello world"))?;
+        index_writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let inverted_index = searcher.segment_reader(0).inverted_index(body)?;
+        assert_eq!(inverted_index.postings_file_slice.name(), Some("body"));
+        assert_eq!(inverted_index.positions_file_slice.name(), Some("body"));
+        Ok(())
+    }
+}
