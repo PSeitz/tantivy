@@ -103,4 +103,34 @@ fn main() {
     });
 
     group.run();
+
+    // Prepare range-query-sized batches outside the timed loop.
+    let mut group = InputGroup::new_with_inputs(
+        [0.01, 0.1, 0.5, 0.9]
+            .into_iter()
+            .flat_map(|fill_ratio| {
+                let codec = gen_optional_index(fill_ratio);
+                [1, 4, 64].into_iter().map(move |step| {
+                    let start = codec.num_non_nulls() / 2;
+                    let ranks: Vec<u32> = (start..codec.num_non_nulls())
+                        .step_by(step)
+                        .take(512)
+                        .collect();
+                    (
+                        format!("fill={fill_ratio}, step={step}"),
+                        (codec.clone(), ranks),
+                    )
+                })
+            })
+            .collect(),
+    );
+    group.register(
+        "select_batch_up_to_512",
+        |(codec, ranks): &(OptionalIndex, Vec<u32>)| {
+            let mut output = ranks.clone();
+            codec.select_batch(black_box(&mut output));
+            black_box(output);
+        },
+    );
+    group.run();
 }

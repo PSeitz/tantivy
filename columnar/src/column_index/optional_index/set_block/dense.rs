@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use common::BinarySerializable;
 
 use crate::column_index::optional_index::{ELEMENTS_PER_BLOCK, SelectCursor, Set, SetCodec};
+use crate::{DocId, RowId};
 
 #[inline(always)]
 fn get_bit_at(input: u64, n: u16) -> bool {
@@ -106,6 +107,46 @@ pub struct DenseBlock<'a>(&'a [u8]);
 pub struct DenseBlockSelectCursor<'a> {
     block_id: u16,
     dense_block: DenseBlock<'a>,
+}
+
+impl DenseBlockSelectCursor<'_> {
+    /// Selects sorted ranks with one lookup per miniblock and one clear per skipped bit.
+    #[inline]
+    pub(crate) fn select_batch(
+        &mut self,
+        mut ranks: &mut [RowId],
+        rank_offset: RowId,
+        doc_offset: DocId,
+    ) {
+        while let Some(&rank) = ranks.first() {
+            self.block_id = self
+                .dense_block
+                .find_miniblock_containing_rank((rank - rank_offset) as u16, self.block_id)
+                .unwrap();
+            let block = self.dense_block.mini_block(self.block_id);
+            let block_rank = rank_offset + block.rank as RowId;
+            let end_rank = block_rank + block.bitvec.count_ones();
+            assert!(
+                rank < end_rank,
+                "rank exceeds the number of values in the block"
+            );
+            let mut bitvec = block.bitvec;
+            let mut bitvec_rank = block_rank;
+            let doc_start = doc_offset + self.block_id as DocId * ELEMENTS_PER_MINI_BLOCK as DocId;
+            while let Some(&rank) = ranks.first() {
+                if rank >= end_rank {
+                    break;
+                }
+                // Leave the selected bit set so duplicate ranks return the same doc id.
+                for _ in bitvec_rank..rank {
+                    bitvec &= bitvec - 1;
+                }
+                bitvec_rank = rank;
+                ranks[0] = doc_start + bitvec.trailing_zeros();
+                ranks = &mut ranks[1..];
+            }
+        }
+    }
 }
 
 impl SelectCursor<u16> for DenseBlockSelectCursor<'_> {

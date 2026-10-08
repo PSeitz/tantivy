@@ -130,6 +130,20 @@ impl BlockSelectCursor<'_> {
             BlockSelectCursor::Sparse(sparse_select_cursor) => sparse_select_cursor.select(rank),
         }
     }
+
+    #[inline]
+    fn select_batch(&mut self, ranks: &mut [RowId], rank_offset: RowId, doc_offset: DocId) {
+        match self {
+            BlockSelectCursor::Dense(cursor) => {
+                cursor.select_batch(ranks, rank_offset, doc_offset);
+            }
+            BlockSelectCursor::Sparse(cursor) => {
+                for rank in ranks {
+                    *rank = doc_offset + cursor.select((*rank - rank_offset) as u16) as DocId;
+                }
+            }
+        }
+    }
 }
 pub struct OptionalIndexSelectCursor<'a> {
     current_block_cursor: BlockSelectCursor<'a>,
@@ -336,10 +350,20 @@ impl OptionalIndex {
         let mut select_batch = self.select_cursor();
         (0..self.num_non_null_docs).map(move |rank| select_batch.select(rank))
     }
-    pub fn select_batch(&self, ranks: &mut [RowId]) {
-        let mut select_cursor = self.select_cursor();
-        for rank in ranks.iter_mut() {
-            *rank = select_cursor.select(*rank);
+    /// Replaces sorted ranks with their corresponding doc ids, preserving duplicates.
+    pub fn select_batch(&self, mut ranks: &mut [RowId]) {
+        debug_assert!(ranks.is_sorted());
+        let mut cursor = self.select_cursor();
+        while let Some(&rank) = ranks.first() {
+            cursor.search_and_load_block(rank);
+            let end = ranks.partition_point(|&rank| rank < cursor.current_block_end_rank);
+            let (batch, remaining) = ranks.split_at_mut(end);
+            cursor.current_block_cursor.select_batch(
+                batch,
+                cursor.num_null_rows_before_block,
+                cursor.block_doc_idx_start,
+            );
+            ranks = remaining;
         }
     }
 

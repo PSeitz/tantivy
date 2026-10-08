@@ -116,7 +116,16 @@ fn test_null_index(data: &[bool]) {
         assert_eq!(select_iter.select(i as u32), *expected);
     }
 
+    let mut ranks: Vec<RowId> = (0..orig_idx_with_value.len() as RowId).collect();
+    null_index.select_batch(&mut ranks);
+    assert_eq!(ranks, orig_idx_with_value);
+
     let step_size = (orig_idx_with_value.len() / 100).max(1);
+    let sampled_ranks: Vec<RowId> = (0..orig_idx_with_value.len() as RowId)
+        .step_by(step_size)
+        .flat_map(|rank| [rank, rank])
+        .collect();
+    assert_select_batch_matches_scalar(&null_index, &sampled_ranks);
     for (dense_idx, orig_idx) in orig_idx_with_value.iter().enumerate().step_by(step_size) {
         assert_eq!(null_index.rank_if_exists(*orig_idx), Some(dense_idx as u32));
     }
@@ -238,6 +247,71 @@ fn test_optional_index_rank_if_exists_batch_dense_and_sparse_blocks() {
         2 * ELEMENTS_PER_BLOCK + 7,
     ];
     assert_rank_if_exists_batch_matches_scalar(&optional_index, &doc_ids);
+}
+
+fn assert_select_batch_matches_scalar(optional_index: &OptionalIndex, ranks: &[RowId]) {
+    let expected: Vec<DocId> = ranks
+        .iter()
+        .map(|&rank| optional_index.select(rank))
+        .collect();
+    let mut actual = ranks.to_vec();
+    optional_index.select_batch(&mut actual);
+    assert_eq!(actual, expected);
+
+    let mut actual = ranks.to_vec();
+    ColumnIndex::Optional(optional_index.clone()).select_batch_in_place(0, &mut actual);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_optional_index_select_batch_empty() {
+    assert_select_batch_matches_scalar(&OptionalIndex::for_test(0, &[]), &[]);
+    assert_select_batch_matches_scalar(&OptionalIndex::for_test(1, &[0]), &[]);
+}
+
+#[test]
+fn test_optional_index_select_batch_sparse_and_dense_blocks() {
+    let mut row_ids = vec![1, 63, 127];
+    // Skip an empty block and leave empty miniblocks at either end of a dense block.
+    row_ids.extend(
+        (128..32_768)
+            .step_by(2)
+            .map(|doc| 2 * ELEMENTS_PER_BLOCK + doc),
+    );
+    let full_block_rank = row_ids.len() as RowId;
+    row_ids.extend(3 * ELEMENTS_PER_BLOCK..4 * ELEMENTS_PER_BLOCK);
+    let sparse_block_rank = row_ids.len() as RowId;
+    row_ids.extend([5 * ELEMENTS_PER_BLOCK + 1, 6 * ELEMENTS_PER_BLOCK - 1]);
+    let optional_index = OptionalIndex::for_test(6 * ELEMENTS_PER_BLOCK, &row_ids);
+
+    let ranks = [
+        0,
+        0,
+        1,
+        2,
+        3,
+        3,
+        4,
+        34,
+        35,
+        full_block_rank - 1,
+        full_block_rank,
+        full_block_rank,
+        full_block_rank + 63,
+        full_block_rank + 64,
+        sparse_block_rank - 1,
+        sparse_block_rank,
+        sparse_block_rank,
+        sparse_block_rank + 1,
+    ];
+    assert_select_batch_matches_scalar(&optional_index, &ranks);
+
+    let mut ranks: Vec<RowId> = (0..row_ids.len() as RowId).collect();
+    // Independent batches may start or end in the middle of a miniblock or encoded block.
+    for batch in ranks.chunks_mut(512) {
+        optional_index.select_batch(batch);
+    }
+    assert_eq!(ranks, row_ids);
 }
 
 #[test]
