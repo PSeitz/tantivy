@@ -5,9 +5,11 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use columnar::{
-    ColumnType, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
+    ColumnType, ColumnarReader, ColumnarWriter, MergeRowOrder, RowAddr, ShuffleMergeOrder,
+    StackMergeOrder,
 };
 use common::TerminatingWrite;
 use measure_time::debug_time;
@@ -20,7 +22,7 @@ use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, Segme
 use crate::schema::document::Document;
 use crate::schema::{value_type_to_column_type, Schema};
 use crate::space_usage::{ComponentSpaceUsage, FAST_FIELDS};
-use crate::Segment;
+use crate::{ByteDeduplicator, Segment};
 
 /// Built-in segment plugin that stores and merges fast-field columns.
 pub struct FastFieldsPlugin;
@@ -87,12 +89,20 @@ pub struct FastFieldsPluginWriter {
 }
 
 impl FastFieldsPluginWriter {
-    pub(crate) fn new(ctx: &PluginWriterContext) -> crate::Result<Self> {
+    pub(crate) fn new(
+        ctx: &PluginWriterContext,
+        byte_deduplicator: Option<Arc<ByteDeduplicator>>,
+    ) -> crate::Result<Self> {
         let index = ctx.segment.index();
         let tokenizer_manager = index.fast_field_tokenizer().clone();
-        let writer = FastFieldsWriter::from_schema_and_tokenizer_manager(
+        let columnar_writer = match byte_deduplicator {
+            Some(byte_deduplicator) => ColumnarWriter::with_byte_deduplicator(byte_deduplicator),
+            None => ColumnarWriter::default(),
+        };
+        let writer = FastFieldsWriter::with_columnar_writer(
             &ctx.segment.schema(),
             tokenizer_manager,
+            columnar_writer,
         )?;
 
         let path = ctx.segment.relative_path(SegmentComponent::FastFields);

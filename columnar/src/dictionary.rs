@@ -1,7 +1,8 @@
 use std::io;
+use std::sync::Arc;
 
 use sstable::SSTable;
-use stacker::{MemoryArena, SharedArenaHashMap};
+use stacker::{ByteDeduplicator, MemoryArena, SharedArenaHashMap};
 
 pub(crate) struct TermIdMapping {
     unordered_to_ord: Vec<OrderedId>,
@@ -35,6 +36,13 @@ pub(crate) struct DictionaryBuilder {
 }
 
 impl DictionaryBuilder {
+    /// Shares term bytes with other owners while assigning dictionary-local ids.
+    pub fn with_byte_deduplicator(byte_deduplicator: Arc<ByteDeduplicator>) -> Self {
+        Self {
+            dict: SharedArenaHashMap::with_byte_deduplicator(4, byte_deduplicator),
+        }
+    }
+
     /// Get or allocate an unordered id.
     /// (This ID is simply an auto-incremented id.)
     pub fn get_or_allocate_id(&mut self, term: &[u8], arena: &mut MemoryArena) -> UnorderedId {
@@ -91,6 +99,8 @@ impl DictionaryBuilder {
         TermIdMapping { unordered_to_ord }
     }
 
+    /// Counts shared term bytes for this owner, excluding shared pool metadata.
+    /// Summing owners can therefore count the same bytes more than once.
     pub(crate) fn mem_usage(&self) -> usize {
         self.dict.mem_usage()
     }
@@ -99,6 +109,51 @@ impl DictionaryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dictionary_builder_with_byte_deduplicator() {
+        let byte_deduplicator = Arc::new(ByteDeduplicator::default());
+        let mut first = DictionaryBuilder::with_byte_deduplicator(byte_deduplicator.clone());
+        let mut second = DictionaryBuilder::with_byte_deduplicator(byte_deduplicator);
+        let mut first_arena = MemoryArena::default();
+        let mut second_arena = MemoryArena::default();
+        first.get_or_allocate_id(b"zebra", &mut first_arena);
+        let first_shared = first.get_or_allocate_id(b"shared", &mut first_arena);
+        let second_shared = second.get_or_allocate_id(b"shared", &mut second_arena);
+        second.get_or_allocate_id(b"apple", &mut second_arena);
+        assert_eq!(first_shared, UnorderedId(1));
+        assert_eq!(second_shared, UnorderedId(0));
+        assert_eq!(
+            first.get_or_allocate_id(b"shared", &mut first_arena),
+            first_shared
+        );
+        let first_terms = first.build_sorted_terms(&first_arena);
+        let second_terms = second.build_sorted_terms(&second_arena);
+        assert!(std::ptr::eq(first_terms[0].0, second_terms[1].0));
+
+        let mut first_bytes = Vec::new();
+        let first_mapping = first.serialize(&first_arena, &mut first_bytes).unwrap();
+        assert_eq!(first_mapping.to_ord(first_shared), OrderedId(0));
+        drop(first);
+        drop(first_arena);
+        let mut second_bytes = Vec::new();
+        let second_mapping = second.serialize(&second_arena, &mut second_bytes).unwrap();
+        assert_eq!(second_mapping.to_ord(second_shared), OrderedId(1));
+
+        for (terms, expected) in [
+            ([b"zebra".as_slice(), b"shared".as_slice()], first_bytes),
+            ([b"shared".as_slice(), b"apple".as_slice()], second_bytes),
+        ] {
+            let mut dictionary = DictionaryBuilder::default();
+            let mut arena = MemoryArena::default();
+            for term in terms {
+                dictionary.get_or_allocate_id(term, &mut arena);
+            }
+            let mut bytes = Vec::new();
+            dictionary.serialize(&arena, &mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+        }
+    }
 
     #[test]
     fn test_dictionary_builder() {

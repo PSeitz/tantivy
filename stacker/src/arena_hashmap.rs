@@ -1,19 +1,22 @@
-use super::{Addr, MemoryArena};
+use std::sync::Arc;
+
+use super::{Addr, ByteDeduplicator, MemoryArena};
 use crate::shared_arena_hashmap::SharedArenaHashMap;
 
 /// Customized `HashMap` with `&[u8]` keys
 ///
 /// Its main particularity is that rather than storing its
-/// keys in the heap, keys are stored in a memory arena
-/// inline with the values.
+/// keys in separate heap allocations, keys are stored in a memory arena
+/// inline with the values by default. A [`ByteDeduplicator`] can share key allocations
+/// with other maps instead.
 ///
 /// The quirky API has the benefit of avoiding
 /// the computation of the hash of the key twice,
 /// or copying the key as long as there is no insert.
 ///
 /// ArenaHashMap is like SharedArenaHashMap but takes ownership
-/// of the memory arena. The memory arena stores the serialized
-/// keys and values.
+/// of the memory arena. The memory arena stores values and either inline keys
+/// or indices into the map's shared keys.
 pub struct ArenaHashMap {
     shared_arena_hashmap: SharedArenaHashMap,
     pub memory_arena: MemoryArena,
@@ -35,11 +38,27 @@ impl ArenaHashMap {
         }
     }
 
+    /// Creates a map whose keys share allocations through the given weak byte pool.
+    pub fn with_byte_deduplicator(
+        table_size: usize,
+        byte_deduplicator: Arc<ByteDeduplicator>,
+    ) -> ArenaHashMap {
+        ArenaHashMap {
+            shared_arena_hashmap: SharedArenaHashMap::with_byte_deduplicator(
+                table_size,
+                byte_deduplicator,
+            ),
+            memory_arena: MemoryArena::default(),
+        }
+    }
+
     #[inline]
     pub fn read<Item: Copy + 'static>(&self, addr: Addr) -> Item {
         self.memory_arena.read(addr)
     }
 
+    /// Includes the arena and conservatively charges shared key payloads and Arc metadata
+    /// to this map. Shared pool metadata is excluded; see [`SharedArenaHashMap::mem_usage`].
     #[inline]
     pub fn mem_usage(&self) -> usize {
         self.shared_arena_hashmap.mem_usage() + self.memory_arena.mem_usage()
@@ -90,7 +109,29 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use super::ArenaHashMap;
+    use super::{Arc, ArenaHashMap, ByteDeduplicator};
+
+    #[test]
+    fn deduplicated_arena_maps() {
+        let pool = Arc::new(ByteDeduplicator::new());
+        let mut first = ArenaHashMap::with_byte_deduplicator(4, pool.clone());
+        let mut second = ArenaHashMap::with_byte_deduplicator(4, pool.clone());
+        let key = vec![255; u16::MAX as usize];
+        let allocation = pool.get_or_allocate(&key);
+        first.mutate_or_create(&key, |_: Option<u32>| 3);
+        second.mutate_or_create(&key, |_: Option<u32>| 7);
+        assert_eq!(Arc::strong_count(&allocation), 3);
+        assert_eq!(first.get::<u32>(&key), Some(3));
+        assert_eq!(second.get::<u32>(&key), Some(7));
+        let (stored_key, addr) = first.iter().next().unwrap();
+        assert_eq!(stored_key.as_ptr(), allocation.as_ptr());
+        assert_eq!(first.read::<u32>(addr), 3);
+        assert!(first.mem_usage() >= first.memory_arena.mem_usage() + key.len());
+        drop(first);
+        assert_eq!(Arc::strong_count(&allocation), 2);
+        drop(second);
+        assert_eq!(Arc::strong_count(&allocation), 1);
+    }
 
     #[test]
     fn test_hash_map() {

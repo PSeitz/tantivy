@@ -22,7 +22,7 @@ use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
 use crate::schema::document::Document;
 use crate::schema::{IndexRecordOption, TantivyDocument, Term};
-use crate::{FutureResult, Opstamp};
+use crate::{ByteDeduplicator, FutureResult, Opstamp};
 
 // Size of the margin for the `memory_arena`. A segment is closed when the remaining memory
 // in the `memory_arena` goes below MARGIN_IN_BYTES.
@@ -47,6 +47,21 @@ fn error_in_index_worker_thread(context: &str) -> TantivyError {
 
 #[derive(Clone, bon::Builder)]
 /// A builder for creating a new [IndexWriter] for an index.
+///
+/// To share term keys and fast-field dictionary bytes across writers, pass the same
+/// [`ByteDeduplicator`] to each writer's options:
+///
+/// ```
+/// use std::sync::Arc;
+/// use tantivy::ByteDeduplicator;
+/// use tantivy::indexer::IndexWriterOptions;
+///
+/// let byte_deduplicator = Arc::new(ByteDeduplicator::default());
+/// let options = IndexWriterOptions::builder()
+///     .byte_deduplicator(byte_deduplicator.clone())
+///     .build();
+/// // Pass options.clone() to each index's writer_with_options method.
+/// ```
 pub struct IndexWriterOptions {
     #[builder(default = MEMORY_BUDGET_NUM_BYTES_MIN)]
     /// The memory budget per indexer thread.
@@ -60,6 +75,13 @@ pub struct IndexWriterOptions {
     #[builder(default = 4)]
     /// Defines the number of merger threads to use.
     num_merge_threads: usize,
+    /// Deduplicates term keys and fast-field dictionary bytes across writers.
+    ///
+    /// Pass the same `Arc` to each writer that should share allocations. The deduplicator
+    /// holds weak references; each segment retains its keys until it is dropped.
+    /// Memory budgets conservatively charge shared bytes to every dictionary using them,
+    /// and exclude the deduplicator's lookup tables.
+    byte_deduplicator: Option<Arc<ByteDeduplicator>>,
 }
 
 /// `IndexWriter` is the user entry-point to add document to an index.
@@ -185,8 +207,13 @@ fn index_documents<D: Document>(
     grouped_document_iterator: &mut dyn Iterator<Item = AddBatch<D>>,
     segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
+    byte_deduplicator: Option<Arc<ByteDeduplicator>>,
 ) -> crate::Result<()> {
-    let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
+    let mut segment_writer = SegmentWriter::for_segment_with_byte_deduplicator(
+        memory_budget,
+        segment.clone(),
+        byte_deduplicator,
+    )?;
     for document_group in grouped_document_iterator {
         for doc in document_group {
             segment_writer.add_document(doc)?;
@@ -421,6 +448,7 @@ impl<D: Document> IndexWriter<D> {
         let mut delete_cursor = self.delete_queue.cursor();
 
         let mem_budget = self.options.memory_budget_per_thread;
+        let byte_deduplicator = self.options.byte_deduplicator.clone();
         let index = self.index.clone();
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
@@ -454,6 +482,7 @@ impl<D: Document> IndexWriter<D> {
                         &mut document_iterator,
                         &segment_updater,
                         delete_cursor.clone(),
+                        byte_deduplicator.clone(),
                     )?;
                 }
             })?;

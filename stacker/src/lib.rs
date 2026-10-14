@@ -4,6 +4,7 @@
 extern crate test;
 
 mod arena_hashmap;
+mod byte_deduplicator;
 mod expull;
 #[cfg(not(feature = "compare_hash_only"))]
 mod fastcmp;
@@ -12,6 +13,7 @@ mod memory_arena;
 mod shared_arena_hashmap;
 
 pub use self::arena_hashmap::ArenaHashMap;
+pub use self::byte_deduplicator::ByteDeduplicator;
 pub use self::expull::ExpUnrolledLinkedList;
 pub use self::memory_arena::{Addr, MemoryArena};
 pub use self::shared_arena_hashmap::{SharedArenaHashMap, compute_table_memory_size};

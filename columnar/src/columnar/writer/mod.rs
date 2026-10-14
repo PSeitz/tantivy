@@ -6,13 +6,14 @@ mod value_index;
 use std::collections::HashSet;
 use std::io;
 use std::net::Ipv6Addr;
+use std::sync::Arc;
 
 use column_operation::ColumnOperation;
 pub(crate) use column_writers::CompatibleNumericalTypes;
 use common::CountingWriter;
 use common::json_path_writer::JSON_END_OF_PATH;
 pub(crate) use serializer::ColumnarSerializer;
-use stacker::{Addr, ArenaHashMap, MemoryArena};
+use stacker::{Addr, ArenaHashMap, ByteDeduplicator, MemoryArena};
 
 use crate::column_index::{SerializableColumnIndex, SerializableOptionalIndex};
 use crate::column_values::{MonotonicallyMappableToU64, MonotonicallyMappableToU128};
@@ -59,10 +60,34 @@ pub struct ColumnarWriter {
     arena: MemoryArena,
     // Dictionaries used to store dictionary-encoded values.
     dictionaries: Vec<DictionaryBuilder>,
+    byte_deduplicator: Option<Arc<ByteDeduplicator>>,
     buffers: SpareBuffers,
 }
 
 impl ColumnarWriter {
+    /// Shares field-name and dictionary bytes with other writers using the same pool.
+    /// Dictionary ids remain local to each column.
+    pub fn with_byte_deduplicator(byte_deduplicator: Arc<ByteDeduplicator>) -> Self {
+        // Create a field-name map that shares its key bytes with other writers.
+        let create_field_name_map =
+            || ArenaHashMap::with_byte_deduplicator(4, byte_deduplicator.clone());
+        Self {
+            numerical_field_hash_map: create_field_name_map(),
+            datetime_field_hash_map: create_field_name_map(),
+            bool_field_hash_map: create_field_name_map(),
+            ip_addr_field_hash_map: create_field_name_map(),
+            bytes_field_hash_map: create_field_name_map(),
+            str_field_hash_map: create_field_name_map(),
+            byte_deduplicator: Some(byte_deduplicator),
+            generated_tie_breaker_columns: HashSet::new(),
+            arena: MemoryArena::default(),
+            dictionaries: Vec::new(),
+            buffers: SpareBuffers::default(),
+        }
+    }
+
+    /// Estimates owned memory, conservatively charging shared bytes to each owner.
+    /// Summing writers can count these bytes more than once. Shared pool metadata is excluded.
     pub fn mem_usage(&self) -> usize {
         self.arena.mem_usage()
             + self.numerical_field_hash_map.mem_usage()
@@ -174,6 +199,7 @@ impl ColumnarWriter {
                     },
                     &mut self.dictionaries,
                 );
+                let byte_deduplicator = &self.byte_deduplicator;
                 hash_map.mutate_or_create(
                     column_name.as_bytes(),
                     |column_opt: Option<StrOrBytesColumnWriter>| {
@@ -181,7 +207,16 @@ impl ColumnarWriter {
                             column_writer
                         } else {
                             let dictionary_id = dictionaries.len() as u32;
-                            dictionaries.push(DictionaryBuilder::default());
+                            dictionaries.push(
+                                byte_deduplicator
+                                    .as_ref()
+                                    .map(|byte_deduplicator| {
+                                        DictionaryBuilder::with_byte_deduplicator(
+                                            byte_deduplicator.clone(),
+                                        )
+                                    })
+                                    .unwrap_or_default(),
+                            );
                             StrOrBytesColumnWriter::with_dictionary_id(dictionary_id)
                         };
                         column_writer.sort_values_within_row = sort_values_within_row;
@@ -284,6 +319,7 @@ impl ColumnarWriter {
     }
 
     pub fn record_str(&mut self, doc: RowId, column_name: &str, value: &str) {
+        let byte_deduplicator = &self.byte_deduplicator;
         let (hash_map, arena, dictionaries) = (
             &mut self.str_field_hash_map,
             &mut self.arena,
@@ -295,7 +331,14 @@ impl ColumnarWriter {
                 let mut column: StrOrBytesColumnWriter = column_opt.unwrap_or_else(|| {
                     // Each column has its own dictionary
                     let dictionary_id = dictionaries.len() as u32;
-                    dictionaries.push(DictionaryBuilder::default());
+                    dictionaries.push(
+                        byte_deduplicator
+                            .as_ref()
+                            .map(|byte_deduplicator| {
+                                DictionaryBuilder::with_byte_deduplicator(byte_deduplicator.clone())
+                            })
+                            .unwrap_or_default(),
+                    );
                     StrOrBytesColumnWriter::with_dictionary_id(dictionary_id)
                 });
                 column.record_bytes(doc, value.as_bytes(), dictionaries, arena);
@@ -305,6 +348,7 @@ impl ColumnarWriter {
     }
 
     pub fn record_bytes(&mut self, doc: RowId, column_name: &str, value: &[u8]) {
+        let byte_deduplicator = &self.byte_deduplicator;
         let (hash_map, arena, dictionaries) = (
             &mut self.bytes_field_hash_map,
             &mut self.arena,
@@ -316,7 +360,14 @@ impl ColumnarWriter {
                 let mut column: StrOrBytesColumnWriter = column_opt.unwrap_or_else(|| {
                     // Each column has its own dictionary
                     let dictionary_id = dictionaries.len() as u32;
-                    dictionaries.push(DictionaryBuilder::default());
+                    dictionaries.push(
+                        byte_deduplicator
+                            .as_ref()
+                            .map(|byte_deduplicator| {
+                                DictionaryBuilder::with_byte_deduplicator(byte_deduplicator.clone())
+                            })
+                            .unwrap_or_default(),
+                    );
                     StrOrBytesColumnWriter::with_dictionary_id(dictionary_id)
                 });
                 column.record_bytes(doc, value, dictionaries, arena);
@@ -804,7 +855,9 @@ fn sort_values_within_row_in_place(
 fn coerce_numerical_symbol<T>(
     operation_iterator: impl Iterator<Item = ColumnOperation<NumericalValue>>,
 ) -> impl Iterator<Item = ColumnOperation<u64>>
-where T: Coerce + MonotonicallyMappableToU64 {
+where
+    T: Coerce + MonotonicallyMappableToU64,
+{
     operation_iterator.map(|symbol| match symbol {
         ColumnOperation::NewDoc(doc) => ColumnOperation::NewDoc(doc),
         ColumnOperation::Value(numerical_value) => {
@@ -833,10 +886,103 @@ fn consume_operation_iterator<T: Ord, TIndexBuilder: IndexBuilder>(
 
 #[cfg(test)]
 mod tests {
-    use stacker::MemoryArena;
+    use std::sync::Arc;
 
+    use stacker::{ByteDeduplicator, MemoryArena};
+
+    use super::ColumnarWriter;
     use crate::columnar::writer::column_operation::ColumnOperation;
-    use crate::{Cardinality, NumericalValue};
+    use crate::{Cardinality, ColumnType, NumericalValue};
+
+    #[test]
+    fn test_columnar_writers_with_byte_deduplicator() {
+        let byte_deduplicator = Arc::new(ByteDeduplicator::default());
+        let mut first = ColumnarWriter::with_byte_deduplicator(byte_deduplicator.clone());
+        let mut second = ColumnarWriter::with_byte_deduplicator(byte_deduplicator.clone());
+        let mut first_default = ColumnarWriter::default();
+        let mut second_default = ColumnarWriter::default();
+        // Write string and byte values to declared and inferred columns.
+        let write_column_values =
+            |writer: &mut ColumnarWriter, terms: [&str; 2], bytes: [&[u8]; 2]| {
+                writer.record_column_type("declared_str", ColumnType::Str, true);
+                writer.record_column_type("declared_bytes", ColumnType::Bytes, true);
+                for doc in 0..2 {
+                    for name in ["declared_str", "shared"] {
+                        writer.record_str(doc, name, terms[doc as usize]);
+                    }
+                    for name in ["declared_bytes", "shared"] {
+                        writer.record_bytes(doc, name, bytes[doc as usize]);
+                    }
+                }
+            };
+        for writer in [&mut first, &mut first_default] {
+            write_column_values(writer, ["zebra", "shared"], [b"\xff", b"shared"]);
+        }
+        for writer in [&mut second, &mut second_default] {
+            write_column_values(writer, ["shared", "apple"], [b"shared", b"\0"]);
+        }
+        assert_eq!(first.sort_order("shared", 2, false), vec![1, 0]);
+        assert_eq!(second.sort_order("shared", 2, false), vec![1, 0]);
+        assert_eq!(first.sort_order("declared_bytes", 2, false), vec![1, 0]);
+        assert_eq!(second.sort_order("declared_bytes", 2, false), vec![1, 0]);
+        for name in ["shared", "declared_str", "declared_bytes"] {
+            let bytes = byte_deduplicator.get_or_allocate(name.as_bytes());
+            if name == "shared" {
+                // Eight dictionaries, four field-name maps, and this lookup own the same bytes.
+                assert!(Arc::strong_count(&bytes) >= 13);
+            }
+            for writer in [&first, &second] {
+                let map = if name == "declared_bytes" {
+                    &writer.bytes_field_hash_map
+                } else {
+                    &writer.str_field_hash_map
+                };
+                let key = map
+                    .iter()
+                    .find(|(key, _)| *key == name.as_bytes())
+                    .unwrap()
+                    .0;
+                assert!(std::ptr::eq(key, bytes.as_slice()));
+            }
+        }
+        // Drop each writer after serialization; the other must retain its own values and ids.
+        for (mut writer, mut default_writer) in [(first, first_default), (second, second_default)] {
+            let mut bytes = Vec::new();
+            let mut default_bytes = Vec::new();
+            writer.serialize(2, None, &mut bytes).unwrap();
+            default_writer
+                .serialize(2, None, &mut default_bytes)
+                .unwrap();
+            assert_eq!(bytes, default_bytes);
+        }
+    }
+
+    #[test]
+    fn test_columnar_writer_shares_all_field_names() {
+        let byte_deduplicator = Arc::new(ByteDeduplicator::default());
+        let mut writer = ColumnarWriter::with_byte_deduplicator(byte_deduplicator.clone());
+        for column_type in [
+            ColumnType::U64,
+            ColumnType::DateTime,
+            ColumnType::Bool,
+            ColumnType::IpAddr,
+            ColumnType::Bytes,
+            ColumnType::Str,
+        ] {
+            writer.record_column_type("shared", column_type, false);
+        }
+        let bytes = byte_deduplicator.get_or_allocate(b"shared");
+        for map in [
+            &writer.numerical_field_hash_map,
+            &writer.datetime_field_hash_map,
+            &writer.bool_field_hash_map,
+            &writer.ip_addr_field_hash_map,
+            &writer.bytes_field_hash_map,
+            &writer.str_field_hash_map,
+        ] {
+            assert!(std::ptr::eq(map.iter().next().unwrap().0, bytes.as_slice()));
+        }
+    }
 
     #[test]
     fn test_column_writer_required_simple() {

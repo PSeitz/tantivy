@@ -172,6 +172,7 @@ mod future_result;
 pub use columnar;
 pub use common::{ByteCount, DateTime};
 pub use query_grammar;
+pub use stacker::ByteDeduplicator;
 pub use time;
 
 pub use crate::error::TantivyError;

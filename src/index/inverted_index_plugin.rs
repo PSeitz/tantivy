@@ -35,7 +35,7 @@ use crate::schema::{Field, FieldType, Schema, DATE_TIME_PRECISION_INDEXED};
 use crate::space_usage::{ComponentSpaceUsage, FIELDNORMS, POSITIONS, POSTINGS, TERMDICT};
 use crate::termdict::{TermMerger, TermOrdinal};
 use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::{DocId, InvertedIndexReader, TantivyError};
+use crate::{ByteDeduplicator, DocId, InvertedIndexReader, TantivyError};
 
 /// Built-in segment plugin that stores and merges the inverted index.
 pub struct InvertedIndexPlugin;
@@ -147,7 +147,10 @@ pub struct InvertedIndexPluginWriter {
 }
 
 impl InvertedIndexPluginWriter {
-    pub(crate) fn new(ctx: &PluginWriterContext) -> crate::Result<Self> {
+    pub(crate) fn new(
+        ctx: &PluginWriterContext,
+        byte_deduplicator: Option<Arc<ByteDeduplicator>>,
+    ) -> crate::Result<Self> {
         let segment = ctx.segment;
         let schema = segment.schema();
         let tokenizer_manager = segment.index().tokenizers().clone();
@@ -185,7 +188,7 @@ impl InvertedIndexPluginWriter {
             term_buffer: IndexingTerm::with_capacity(16),
             json_path_writer: JsonPathWriter::default(),
             json_positions_per_path: IndexingPositionsPerPath::default(),
-            ctx: IndexingContext::new(table_size),
+            ctx: IndexingContext::new(table_size, byte_deduplicator),
             postings_serializer: InvertedIndexSerializer::open(segment)?,
             fieldnorm_serializer: FieldNormsSerializer::from_write(fieldnorm_write)?,
             schema,

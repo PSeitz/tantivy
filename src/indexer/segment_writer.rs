@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::fastfield::FastFieldsPluginWriter;
@@ -6,7 +8,7 @@ use crate::plugin::{PluginWriter, PluginWriterContext};
 use crate::schema::document::{Document, ErasedDocument};
 use crate::schema::Schema;
 use crate::store::StorePluginWriter;
-use crate::{DocId, Opstamp, TantivyError};
+use crate::{ByteDeduplicator, DocId, Opstamp, TantivyError};
 
 fn remap_doc_opstamps(
     opstamps: Vec<Opstamp>,
@@ -49,13 +51,22 @@ impl SegmentWriter {
     /// - segment: The segment being written
     /// - schema
     pub fn for_segment(memory_budget_in_bytes: usize, segment: Segment) -> crate::Result<Self> {
+        Self::for_segment_with_byte_deduplicator(memory_budget_in_bytes, segment, None)
+    }
+
+    /// Creates a segment writer that optionally deduplicates bytes with other writers.
+    pub(crate) fn for_segment_with_byte_deduplicator(
+        memory_budget_in_bytes: usize,
+        segment: Segment,
+        byte_deduplicator: Option<Arc<ByteDeduplicator>>,
+    ) -> crate::Result<Self> {
         let schema = segment.schema();
         let ctx = PluginWriterContext {
             segment: &segment,
             memory_budget_in_bytes,
         };
-        let inverted_index = InvertedIndexPluginWriter::new(&ctx)?;
-        let fast_fields = FastFieldsPluginWriter::new(&ctx)?;
+        let inverted_index = InvertedIndexPluginWriter::new(&ctx, byte_deduplicator.clone())?;
+        let fast_fields = FastFieldsPluginWriter::new(&ctx, byte_deduplicator)?;
         let store_writer = StorePluginWriter::new(&ctx)?;
         let custom_plugins = segment
             .index()

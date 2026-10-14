@@ -38,8 +38,15 @@ impl FastFieldsWriter {
         schema: &Schema,
         tokenizer_manager: TokenizerManager,
     ) -> crate::Result<FastFieldsWriter> {
-        let mut columnar_writer = ColumnarWriter::default();
+        Self::with_columnar_writer(schema, tokenizer_manager, ColumnarWriter::default())
+    }
 
+    /// Creates the schema's fast fields using the supplied columnar writer.
+    pub(crate) fn with_columnar_writer(
+        schema: &Schema,
+        tokenizer_manager: TokenizerManager,
+        mut columnar_writer: ColumnarWriter,
+    ) -> crate::Result<FastFieldsWriter> {
         let mut fast_field_names: Vec<Option<String>> = vec![None; schema.num_fields()];
         let mut date_precisions: Vec<DateTimePrecision> =
             std::iter::repeat_with(DateTimePrecision::default)

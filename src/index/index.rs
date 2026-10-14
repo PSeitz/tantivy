@@ -33,7 +33,7 @@ use crate::schema::document::Document;
 use crate::schema::{Field, FieldType, Schema, Type};
 use crate::store::StorePlugin;
 use crate::tokenizer::{TextAnalyzer, TokenizerManager};
-use crate::SegmentReader;
+use crate::{ByteDeduplicator, SegmentReader};
 
 fn load_metas(
     directory: &dyn Directory,
@@ -258,8 +258,27 @@ impl IndexBuilder {
         mem_budget: usize,
     ) -> crate::Result<SingleSegmentIndexWriter<D>> {
         let index = self.create(dir)?;
-        let index_simple_writer = SingleSegmentIndexWriter::new(index, mem_budget)?;
+        let index_simple_writer = SingleSegmentIndexWriter::new(index, mem_budget, None)?;
         Ok(index_simple_writer)
+    }
+
+    /// Creates a single-segment writer that deduplicates bytes with other writers.
+    ///
+    /// Like [`Self::single_segment_index_writer`], this requires an empty directory
+    /// and does not start indexing threads or run garbage collection.
+    /// Pass the same deduplicator to other single-segment writers or through
+    /// [`IndexWriterOptions::builder`] to share term keys and fast-field dictionary bytes.
+    /// Memory usage conservatively counts shared bytes for every dictionary using them,
+    /// excluding the deduplicator's lookup tables.
+    #[doc(hidden)]
+    pub fn single_segment_index_writer_with_byte_deduplicator<D: Document>(
+        self,
+        dir: impl Into<Box<dyn Directory>>,
+        mem_budget: usize,
+        byte_deduplicator: Arc<ByteDeduplicator>,
+    ) -> crate::Result<SingleSegmentIndexWriter<D>> {
+        let index = self.create(dir)?;
+        SingleSegmentIndexWriter::new(index, mem_budget, Some(byte_deduplicator))
     }
 
     /// Creates a new index in a temp directory.

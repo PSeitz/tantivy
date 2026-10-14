@@ -1,4 +1,6 @@
-use stacker::{ArenaHashMap, MemoryArena};
+use std::sync::Arc;
+
+use stacker::{ArenaHashMap, ByteDeduplicator, MemoryArena};
 
 use crate::indexer::path_to_unordered_id::PathToUnorderedId;
 
@@ -15,8 +17,16 @@ pub(crate) struct IndexingContext {
 
 impl IndexingContext {
     /// Create a new IndexingContext given the size of the term hash map.
-    pub(crate) fn new(table_size: usize) -> IndexingContext {
-        let term_index = ArenaHashMap::with_capacity(table_size);
+    pub(crate) fn new(
+        table_size: usize,
+        byte_deduplicator: Option<Arc<ByteDeduplicator>>,
+    ) -> IndexingContext {
+        let term_index = match byte_deduplicator {
+            Some(byte_deduplicator) => {
+                ArenaHashMap::with_byte_deduplicator(table_size, byte_deduplicator)
+            }
+            None => ArenaHashMap::with_capacity(table_size),
+        };
         IndexingContext {
             arena: MemoryArena::default(),
             term_index,

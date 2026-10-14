@@ -1,11 +1,12 @@
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::index::list_segment_files;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::{DocIdMapping, SegmentWriter};
 use crate::schema::document::Document;
-use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument};
+use crate::{ByteDeduplicator, Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument};
 
 #[doc(hidden)]
 pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
@@ -16,9 +17,17 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
 }
 
 impl<D: Document> SingleSegmentIndexWriter<D> {
-    pub(crate) fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
+    pub(crate) fn new(
+        index: Index,
+        mem_budget: usize,
+        byte_deduplicator: Option<Arc<ByteDeduplicator>>,
+    ) -> crate::Result<Self> {
         let segment = index.new_segment();
-        let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
+        let segment_writer = SegmentWriter::for_segment_with_byte_deduplicator(
+            mem_budget,
+            segment.clone(),
+            byte_deduplicator,
+        )?;
         Ok(Self {
             segment_writer,
             segment,

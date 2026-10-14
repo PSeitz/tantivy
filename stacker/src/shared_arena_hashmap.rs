@@ -1,7 +1,9 @@
 use std::iter::{Cloned, Filter};
 use std::mem;
+use std::sync::Arc;
 
 use super::{Addr, MemoryArena};
+use crate::ByteDeduplicator;
 use crate::fastcpy::fast_short_slice_copy;
 use crate::memory_arena::store;
 
@@ -19,8 +21,8 @@ type HashType = u32;
 type HashType = u64;
 
 /// `KeyValue` is the item stored in the hash table.
-/// The key is actually a `BytesRef` object stored in an external memory arena.
-/// The `value_addr` also points to an address in the memory arena.
+/// The address points to a key followed by its value in an external memory arena.
+/// With shared keys, a key index replaces the inline key bytes.
 #[derive(Copy, Clone)]
 struct KeyValue {
     key_value_addr: Addr,
@@ -50,8 +52,9 @@ impl KeyValue {
 /// Customized `HashMap` with `&[u8]` keys
 ///
 /// Its main particularity is that rather than storing its
-/// keys in the heap, keys are stored in a memory arena
-/// inline with the values.
+/// keys in separate heap allocations, keys are stored in a memory arena
+/// inline with the values by default. With a [`ByteDeduplicator`], strong references
+/// retain shared key allocations outside the arena.
 ///
 /// The quirky API has the benefit of avoiding
 /// the computation of the hash of the key twice,
@@ -64,6 +67,15 @@ pub struct SharedArenaHashMap {
     table: Vec<KeyValue>,
     mask: usize,
     len: usize,
+    shared_keys: Option<SharedKeys>,
+}
+
+// Owns the shared keys used by this map; the arena stores only their indices and Copy values.
+struct SharedKeys {
+    byte_deduplicator: Arc<ByteDeduplicator>,
+    keys: Vec<Arc<Vec<u8>>>,
+    // Charge each payload and its Arc allocation to every map that uses it.
+    allocation_bytes: usize,
 }
 
 struct LinearProbing {
@@ -134,7 +146,22 @@ impl SharedArenaHashMap {
             table,
             mask: table_size_power_of_2 - 1,
             len: 0,
+            shared_keys: None,
         }
+    }
+
+    /// Creates a map whose keys share allocations through the given weak byte pool.
+    pub fn with_byte_deduplicator(
+        table_size: usize,
+        byte_deduplicator: Arc<ByteDeduplicator>,
+    ) -> SharedArenaHashMap {
+        let mut map = Self::with_capacity(table_size);
+        map.shared_keys = Some(SharedKeys {
+            byte_deduplicator,
+            keys: Vec::new(),
+            allocation_bytes: 0,
+        });
+        map
     }
 
     #[inline]
@@ -158,9 +185,16 @@ impl SharedArenaHashMap {
         LinearProbing::compute(hash, self.mask)
     }
 
+    /// Table and key allocation usage, excluding the externally owned arena.
+    /// Shared payloads, Vec headers, Arc counters and local handle capacity are charged
+    /// to each map, so shared allocations may be counted more than once. The byte pool's
+    /// separate shard/hash-table/weak-handle metadata is not included.
     #[inline]
     pub fn mem_usage(&self) -> usize {
         self.table.len() * mem::size_of::<KeyValue>()
+            + self.shared_keys.as_ref().map_or(0, |keys| {
+                keys.allocation_bytes + keys.keys.capacity() * mem::size_of::<Arc<Vec<u8>>>()
+            })
     }
 
     #[inline]
@@ -171,6 +205,10 @@ impl SharedArenaHashMap {
     #[inline]
     fn get_key_value<'a>(&'a self, addr: Addr, memory_arena: &'a MemoryArena) -> (&'a [u8], Addr) {
         let data = memory_arena.slice_from(addr);
+        if let Some(keys) = &self.shared_keys {
+            let index = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+            return (keys.keys[index].as_slice(), addr.offset(4));
+        }
         let key_bytes_len_bytes = unsafe { data.get_unchecked(..2) };
         let key_bytes_len = u16::from_le_bytes(key_bytes_len_bytes.try_into().unwrap());
         let key_bytes: &[u8] = unsafe { data.get_unchecked(2..2 + key_bytes_len as usize) };
@@ -202,6 +240,9 @@ impl SharedArenaHashMap {
         addr: Addr,
         memory_arena: &MemoryArena,
     ) -> Option<Addr> {
+        if self.shared_keys.is_some() {
+            return Some(addr.offset(4));
+        }
         // For the compare_hash_only feature, it would make sense to store the keys at a different
         // memory location. Here they will just pollute the cache.
         let data = memory_arena.slice_from(addr);
@@ -309,7 +350,7 @@ impl SharedArenaHashMap {
         if self.is_saturated() {
             self.resize();
         }
-        // Limit the key size to u16::MAX
+        // Limit the key size to u16::MAX in both storage modes.
         let key = &key[..std::cmp::min(key.len(), u16::MAX as usize)];
         let hash = self.get_hash(key);
         let mut probe = self.probe(hash);
@@ -319,16 +360,30 @@ impl SharedArenaHashMap {
             if kv.is_empty() {
                 // The key does not exist yet.
                 let val = updater(None);
-                let num_bytes = std::mem::size_of::<u16>() + key.len() + std::mem::size_of::<V>();
-                let key_addr = memory_arena.allocate_space(num_bytes);
-                {
+                let key_addr = if let Some(keys) = &mut self.shared_keys {
+                    let index = u32::try_from(keys.keys.len()).expect("too many deduplicated keys");
+                    let allocation = keys.byte_deduplicator.get_or_allocate(key);
+                    keys.allocation_bytes += allocation.capacity()
+                        + mem::size_of::<Vec<u8>>()
+                        + 2 * mem::size_of::<usize>();
+                    keys.keys.push(allocation);
+                    let num_bytes = mem::size_of::<u32>() + mem::size_of::<V>();
+                    let key_addr = memory_arena.allocate_space(num_bytes);
+                    let data = memory_arena.slice_mut(key_addr, num_bytes);
+                    data[..4].copy_from_slice(&index.to_le_bytes());
+                    store(&mut data[4..], val);
+                    key_addr
+                } else {
+                    let num_bytes = mem::size_of::<u16>() + key.len() + mem::size_of::<V>();
+                    let key_addr = memory_arena.allocate_space(num_bytes);
                     let data = memory_arena.slice_mut(key_addr, num_bytes);
                     let key_len_bytes: [u8; 2] = (key.len() as u16).to_le_bytes();
                     data[..2].copy_from_slice(&key_len_bytes);
                     let stop = 2 + key.len();
                     fast_short_slice_copy(key, &mut data[2..stop]);
                     store(&mut data[stop..], val);
-                }
+                    key_addr
+                };
 
                 self.set_bucket(hash, key_addr, bucket);
                 return val;
@@ -353,9 +408,103 @@ impl SharedArenaHashMap {
 mod tests {
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::{SharedArenaHashMap, compute_previous_power_of_two};
-    use crate::MemoryArena;
+    use crate::{ByteDeduplicator, MemoryArena};
+
+    #[test]
+    fn deduplicated_keys_share_allocations_but_not_values() {
+        let pool = Arc::new(ByteDeduplicator::new());
+        let mut first = SharedArenaHashMap::with_byte_deduplicator(4, pool.clone());
+        let mut second = SharedArenaHashMap::with_byte_deduplicator(4, pool.clone());
+        let mut first_arena = MemoryArena::default();
+        let mut second_arena = MemoryArena::default();
+        first.mutate_or_create(b"same", &mut first_arena, |_: Option<u64>| 10);
+        second.mutate_or_create(b"same", &mut second_arena, |_: Option<u64>| 20);
+        first.mutate_or_create(b"same", &mut first_arena, |v: Option<u64>| v.unwrap() + 1);
+        let first_keys = &first.shared_keys.as_ref().unwrap().keys;
+        let second_keys = &second.shared_keys.as_ref().unwrap().keys;
+        assert_eq!(first_keys.len(), 1);
+        assert!(Arc::ptr_eq(&first_keys[0], &second_keys[0]));
+        assert!(Arc::ptr_eq(&first_keys[0], &pool.get_or_allocate(b"same")));
+        assert_eq!(first.get::<u64>(b"same", &first_arena), Some(11));
+        assert_eq!(second.get::<u64>(b"same", &second_arena), Some(20));
+        let weak = Arc::downgrade(&first_keys[0]);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none());
+        pool.remove_expired();
+    }
+
+    #[test]
+    fn deduplicated_keys_resize_and_preserve_arbitrary_bytes() {
+        let pool = Arc::new(ByteDeduplicator::new());
+        let mut map = SharedArenaHashMap::with_byte_deduplicator(1, pool.clone());
+        let mut arena = MemoryArena::default();
+        let mut keys = vec![vec![], vec![0, 255, 128, 0], vec![42; u16::MAX as usize]];
+        let mut long_key = keys[2].clone();
+        long_key[u16::MAX as usize - 1] = 43;
+        keys.push(long_key);
+        keys.extend((0u32..10_000).map(|i| i.to_le_bytes().to_vec()));
+        let allocations: Vec<_> = keys.iter().map(|k| pool.get_or_allocate(k)).collect();
+        for (i, key) in keys.iter().enumerate() {
+            map.mutate_or_create(key, &mut arena, |v: Option<u64>| {
+                assert_eq!(v, None);
+                i as u64
+            });
+        }
+        assert_eq!(map.len(), keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(map.get::<u64>(key, &arena), Some(i as u64));
+            assert!(Arc::ptr_eq(
+                &map.shared_keys.as_ref().unwrap().keys[i],
+                &allocations[i]
+            ));
+        }
+        for (key, addr) in map.iter(&arena) {
+            assert_eq!(key, keys[arena.read::<u64>(addr) as usize]);
+        }
+        assert_eq!(map.get::<u64>(b"missing", &arena), None);
+    }
+
+    #[test]
+    fn deduplicated_keys_keep_the_length_limit() {
+        let byte_deduplicator = Arc::new(ByteDeduplicator::new());
+        let mut map = SharedArenaHashMap::with_byte_deduplicator(4, byte_deduplicator.clone());
+        let mut arena = MemoryArena::default();
+        let mut key = vec![42; u16::MAX as usize];
+        map.mutate_or_create(&key, &mut arena, |_: Option<u64>| 1);
+        key.push(43);
+        map.mutate_or_create(&key, &mut arena, |value: Option<u64>| {
+            assert_eq!(value, Some(1));
+            2
+        });
+        let (stored_key, addr) = map.iter(&arena).next().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(stored_key, &key[..u16::MAX as usize]);
+        assert_eq!(arena.read::<u64>(addr), 2);
+        assert_eq!(map.get::<u64>(stored_key, &arena), Some(2));
+    }
+
+    #[test]
+    fn deduplicated_key_memory_accounting() {
+        let pool = Arc::new(ByteDeduplicator::new());
+        let mut map = SharedArenaHashMap::with_byte_deduplicator(4, pool);
+        let mut arena = MemoryArena::default();
+        let table_bytes = map.mem_usage();
+        map.mutate_or_create(b"payload", &mut arena, |_: Option<u32>| 1);
+        let keys = map.shared_keys.as_ref().unwrap();
+        let expected = table_bytes
+            + keys.keys.capacity() * std::mem::size_of::<Arc<Vec<u8>>>()
+            + keys.keys[0].capacity()
+            + std::mem::size_of::<Vec<u8>>()
+            + 2 * std::mem::size_of::<usize>();
+        assert_eq!(map.mem_usage(), expected);
+        map.mutate_or_create(b"payload", &mut arena, |_: Option<u32>| 2);
+        assert_eq!(map.mem_usage(), expected);
+    }
 
     #[test]
     fn test_hash_map() {
