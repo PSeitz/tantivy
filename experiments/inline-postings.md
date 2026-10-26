@@ -1,6 +1,6 @@
 # Inline postings: storage, decoding, and external read plans
 
-Input: synthetic split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, segment `4fea6c896fd045aba3cece0808f3e41e`, field 3 (`message`), with **7,671,280 terms**. The [dictionary report](dictionary.md) describes the original blocks and keys.
+Input: split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, segment `4fea6c896fd045aba3cece0808f3e41e`, field 3 (`message`), with **7,671,280 terms**. The [dictionary report](dictionary.md) describes the original blocks and keys.
 
 An inline list stores its document IDs, frequencies, and positions inside its dictionary block. The cutoff is the maximum document count for a whole list to qualify. Longer lists remain external, including their short final blocks.
 

@@ -1,6 +1,6 @@
 # Dictionary metadata: serialized size and candidate blocks
 
-The input is a synthetic message corpus, segment `4fea6c896fd045aba3cece0808f3e41e`, field 3 (`message`).
+Input: split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, segment `4fea6c896fd045aba3cece0808f3e41e`, field 3 (`message`).
 These measurements preserve its original physical dictionary blocks. The [dictionary baseline](dictionary.md) describes the extracted keys and existing index.
 
 | Input | Measurement |
