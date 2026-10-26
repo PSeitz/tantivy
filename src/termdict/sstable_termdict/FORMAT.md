@@ -1,6 +1,8 @@
-# Block-local short postings
+# Experimental block-local short postings
 
-With `quickwit`, `IndexSettings.max_inline_docs` selects the maximum documents in a postings list stored in its term dictionary block. It accepts 0–32 and defaults to 0, which disables embedding. Longer lists, including their short final blocks, retain the external postings/positions format. Documents and frequencies use the existing 128-document postings buffer. Positions are buffered until the list closes or exceeds the configured maximum.
+This note describes the experimental format and reader/writer behavior. The implementation source is outside this report-only publication.
+
+With `quickwit` in the experiment, `IndexSettings.max_inline_docs` selects the maximum documents in a postings list stored in its term dictionary block. It accepts 0–32 and defaults to 0, which disables embedding. Longer lists, including their short final blocks, retain the external postings/positions format. Documents and frequencies use the existing 128-document postings buffer. Positions are buffered until the list closes or exceeds the configured maximum.
 
 ```rust
 let settings = tantivy::IndexSettings {
@@ -13,7 +15,7 @@ Use these settings when building the index. Newly written segments and merge out
 
 ## Compatibility
 
-New Quickwit dictionaries use dictionary type 4. Their trailer is `[max_inline_docs: u8, dictionary type: u32 LE]`, following the SSTable footer. The maximum is stored **once per dictionary**, including empty and external-only dictionaries. It is not repeated in blocks. Opening reads both trailer fields together and validates the maximum. Each stream copies the maximum into a fresh value reader, including async and disjoint-block streams.
+New dictionaries written by the experiment with `quickwit` use dictionary type 4. Their trailer is `[max_inline_docs: u8, dictionary type: u32 LE]`, following the SSTable footer. The maximum is stored **once per dictionary**, including empty and external-only dictionaries. It is not repeated in blocks. Opening reads both trailer fields together and validates the maximum. Each stream copies the maximum into a fresh value reader, including async and disjoint-block streams.
 
 This reader also accepts type-2 external dictionaries and type-3 fixed-eight dictionaries. Type 3 retains its implicit maximum of 8 and four-bit layout. New short-postings blocks use codec version 2 with document-ID deltas. The reader also accepts version 1 with absolute IDs. Readers supporting only version 1 reject version 2 blocks. Dictionary type 4 identifies the dictionary metadata and variable-width layout. Older readers reject type 4. Default-feature FST dictionaries keep their existing format and external postings.
 
@@ -83,4 +85,4 @@ The value reader decodes all short streams when loading a dictionary block, incl
 
 The historical `MEASUREMENTS.md`, `COALESCING.md`, and `CUTOFFS.md` tables under `experiments/inline-postings/` describe the earlier byte-preserving prototype with external positions.
 
-[`PRODUCTION_SIZE.md`](../../../experiments/inline-postings/PRODUCTION_SIZE.md) measures the preceding type-3, fixed-eight encoding on the message field of split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, including positions. Dictionary + external postings + external positions shrink from 516,500,105 to 491,114,628 bytes (4.91%). At an explicitly selected maximum of 8, type 4 retains that block encoding and adds one dictionary metadata byte. Other maxima now derive their own packing width, so historical fixed-width cutoff tables are not measurements of this configurable format. That report also includes preliminary resident scan timings and outer-zstd experiments. Indexing throughput and live-query latency remain unmeasured.
+[`ABSOLUTE_ID_SIZE.md`](../../../experiments/inline-postings/ABSOLUTE_ID_SIZE.md) measures the preceding type-3, fixed-eight encoding on the message field of split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, including positions. Dictionary + external postings + external positions shrink from 516,500,105 to 491,114,628 bytes (4.91%). At an explicitly selected maximum of 8, type 4 retains the four-bit count/positions layout and adds one dictionary metadata byte. Its version-2 blocks use document-ID deltas instead of the historical absolute IDs. Other maxima derive their own packing width, so historical fixed-width cutoff tables are separate measurements from this configurable delta format. That report also includes preliminary resident scan timings and outer-zstd experiments. Indexing throughput and live-query latency remain unmeasured.

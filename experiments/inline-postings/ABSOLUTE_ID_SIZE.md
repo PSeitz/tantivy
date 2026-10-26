@@ -1,6 +1,6 @@
-# Production size: message field on KH4Y_01M5MTJQ3SVHDTK2W3XCB5
+# Absolute-ID size: message field on KH4Y_01M5MTJQ3SVHDTK2W3XCB5
 
-Measured with the production dictionary writer: whole lists of up to eight documents, absolute document IDs, separate compressed byte lanes, and singleton positions embedded in tagged frequencies. This differs from the older byte-preserving prototype in `MEASUREMENTS.md` and `COALESCING.md`.
+Measured with the historical experimental dictionary writer (type 3, fixed-four-bit counts): whole lists of up to eight documents, absolute document IDs, separate compressed byte lanes, and singleton positions embedded in tagged frequencies. This differs from the older byte-preserving prototype in `MEASUREMENTS.md` and `COALESCING.md`.
 
 ## Results
 
@@ -21,7 +21,7 @@ The dictionary grows **22.82 MB**, replacing **48.21 MB** of external postings a
 - Embedded document entries: 7,261,570. A document can contribute to multiple lists.
 - Embedded position entries: 7,299,388.
 
-The absolute-ID sweep for maximum list lengths **0, 1, 2, 3, 4, 5, 6, 7, and 8** is in [`PRODUCTION_CUTOFFS.md`](PRODUCTION_CUTOFFS.md). Total size ranges from 492.833 MB at ≤1 to 491.115 MB at ≤8.
+The absolute-ID sweep for maximum list lengths **0, 1, 2, 3, 4, 5, 6, 7, and 8** is in [`ABSOLUTE_ID_CUTOFFS.md`](ABSOLUTE_ID_CUTOFFS.md). Total size ranges from 492.833 MB at ≤1 to 491.115 MB at ≤8.
 
 ## Dictionary growth breakdown
 
@@ -57,17 +57,17 @@ Compared absolute IDs with `first_doc, doc[1] - doc[0], doc[2] - doc[1], …`, r
 
 Only **664,034 of 7,261,570 document entries (9.14%)** become gaps. Each of the 6,597,536 lists retains its first absolute ID. The two low-byte lanes keep the same compressed size. The third lane saves 24,804 bytes; the high-byte lane and length prefixes stay the same size. The rebuilt index saves another 32 bytes.
 
-This experiment restores and verifies every document ID after decompressing the alternative lanes. Rebuilding with absolute IDs reproduces the complete production dictionary byte-for-byte. Tests cover delta resets across lists and the existing byte-accounting checks. The experiment lives in `examples/short_postings_size/encodings.rs` and runs with the command below.
+This experiment restores and verifies every document ID after decompressing the alternative lanes. Rebuilding with absolute IDs reproduces the complete absolute-ID baseline dictionary byte-for-byte. Tests cover delta resets across lists and the existing byte-accounting checks. The experiment lives in `examples/short_postings_size/encodings.rs` and runs with the command below.
 
-**Production remains absolute-ID encoded.** The small size reduction does not establish a reason to change the format. This is an in-memory encoding experiment with the original metadata held fixed. It emits measurements rather than a usable delta-format dictionary. Decode throughput and query latency have not been measured. Cross-term deltas would be a separate experiment.
+**This historical experiment keeps the absolute-ID baseline unchanged.** The small size reduction alone does not establish a reason to change the format. The later configurable delta encoding is measured in [`SIZE_UP_TO_128.md`](SIZE_UP_TO_128.md). This is an in-memory encoding experiment with the original metadata held fixed. It emits measurements rather than a usable delta-format dictionary. Decode throughput and query latency have not been measured. Cross-term deltas would be a separate experiment.
 
 ## Per-lane zstd plus an outer compression pass
 
-Production already compresses each of the four byte lanes separately with zstd level 3. These experiments retain absolute document IDs and those per-lane frames, then try an outer zstd level-3 pass.
+The absolute-ID baseline compresses each of the four byte lanes separately with zstd level 3. These experiments retain absolute document IDs and those per-lane frames, then try an outer zstd level-3 pass.
 
-| Layout | Dictionary bytes | Change from production | Field total including external postings/positions |
+| Layout | Dictionary bytes | Change from baseline | Field total including external postings/positions |
 |---|---:|---:|---:|
-| Current: separately compressed lanes, metadata, and keys | 74,501,195 | — | 491,114,628 |
+| Baseline: separately compressed lanes, metadata, and keys | 74,501,195 | — | 491,114,628 |
 | Outer pass over raw metadata + compressed lane payload + raw keys | 79,311,420 | +4,810,225 (+6.46%) | 495,924,853 |
 | Outer pass preserving all current inner frames, used only when smaller | 73,414,728 | −1,086,467 (−1.46%) | 490,028,161 |
 
@@ -75,22 +75,22 @@ The second alternative keeps the existing multipart block intact inside an outer
 
 Checks and scope:
 
-- The raw-metadata/raw-keys alternative uses existing block flags 0/1. The production reader opens it and all 7,671,280 terms, including their embedded document IDs, frequencies, and positions, match exactly.
-- The preserved-inner-frames alternative uses an experiment-only nested-block tag in memory. Unwrapping it and rebuilding the original index reproduces the production dictionary **byte-for-byte**. It requires format dispatch and reader support before adoption. No nested-format dictionary is emitted to disk.
-- Resident dictionary scans for the first alternative had medians of 681.2 ms for current production and 675.4 ms for the alternative. These are three interleaved samples per layout, with no CPU isolation. They do not establish a speed improvement. The preserved-inner-frames alternative has no production-reader throughput measurement.
-- Production encoding remains unchanged. Live-query latency, indexing throughput, and deployment compatibility for a nested-block format remain untested.
+- The raw-metadata/raw-keys alternative uses existing block flags 0/1. The experimental reader opens it and all 7,671,280 terms, including their embedded document IDs, frequencies, and positions, match exactly.
+- The preserved-inner-frames alternative uses an experiment-only nested-block tag in memory. Unwrapping it and rebuilding the original index reproduces the baseline dictionary **byte-for-byte**. It requires format dispatch and reader support before adoption. No nested-format dictionary is emitted to disk.
+- Resident dictionary scans for the first alternative had medians of 681.2 ms for the baseline and 675.4 ms for the alternative. These are three interleaved samples per layout, with no CPU isolation. They do not establish a speed improvement. The preserved-inner-frames alternative has no throughput measurement with the experimental reader.
+- The baseline encoding remains unchanged. Live-query latency, indexing throughput, and deployment compatibility for a nested-block format remain untested.
 
 ## Method and checks
 
-`examples/short_postings_size.rs` reads the original message field (field 3), decodes each short list's document IDs, frequencies, and position deltas, and writes the actual production dictionary encoding. External lists keep their original encoded bytes with compacted offsets. The dictionary is reopened and **every term** is checked: keys, document counts, external offsets, and all short document/frequency/position arrays. Two release runs produced identical sizes.
+`examples/short_postings_size.rs` reads the original message field (field 3), decodes each short list's document IDs, frequencies, and position deltas, and writes the experimental absolute-ID dictionary encoding. External lists keep their original encoded bytes with compacted offsets. The dictionary is reopened and **every term** is checked: keys, document counts, external offsets, and all short document/frequency/position arrays. Two release runs produced identical sizes.
 
 All three source component footers and CRCs were validated. The `.pos` component was fetched read-only from the same S3 split, bytes `[899245506, 1110302609)`. SHA256: `70d9bb1b03950ca893095e7c4c88d1d4b54cdb292e20bd3cd4c295037ea77e29`.
 
 The dictionary byte count is measured from encoded output. External byte counts model byte-preserving compaction. No complete rewritten split is emitted. Counts exclude the unchanged eight-byte token count, composite-file metadata, component footers, and other fields. They do not include cache effects or live-query latency. The 512 KiB read-coalescing setting changes read plans rather than stored sizes.
 
-Raw results: [`production-size.json`](production-size.json).
+Historical raw results: `production-size.json` (unpublished).
 
-Reproduce:
+Historical reproduction command, requiring the experimental source and original split. The later writer uses configurable counts and document-ID deltas, so its output differs:
 
 ```sh
 cargo run --release --example short_postings_size --features quickwit -- \

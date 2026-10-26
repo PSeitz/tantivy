@@ -1,12 +1,12 @@
 # Six-bit counts: absolute document IDs versus per-list deltas
 
-Split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, message field 3. Every cutoff **0–32** was rerun in the isolated six-bit-count experiment. Production remains unchanged at ≤8 with absolute IDs.
+Split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, message field 3. Every cutoff **0–32** was rerun in the isolated six-bit-count experiment. The historical baseline implementation remained unchanged at ≤8 with absolute IDs. The later configurable delta encoding is measured in [`SIZE_UP_TO_128.md`](SIZE_UP_TO_128.md).
 
 ## Encoding and controls
 
 The first document ID in each list remains absolute. Each subsequent value is the difference from the previous ID. Delta state resets at every list boundary. The resulting u32 values use the same four zstd-compressed byte lanes, compression level, six-bit count/position entries, and dictionary block boundaries as the absolute control.
 
-Only document-ID lane bytes, their length prefixes, enclosing payload/block lengths, and the block index change. Metadata, keys, frequencies, positions, and external ranges are preserved. The alternative retains the absolute-format metadata and version for this controlled measurement. It is verified and measured in memory; it is **not emitted as a usable delta dictionary format**. Production has no new delta-format reader.
+Only document-ID lane bytes, their length prefixes, enclosing payload/block lengths, and the block index change. Metadata, keys, frequencies, positions, and external ranges are preserved. The alternative retains the absolute-format metadata and version for this controlled measurement. It is verified and measured in memory; it is **not emitted as a usable delta dictionary format**. This experiment added no delta-format reader to its baseline implementation.
 
 ## Results
 
@@ -85,13 +85,13 @@ All positive cutoffs below use the same six-bit layout. A negative delta saving 
 - Parsed embedded-list and document-entry counts match the independently counted source lists at every cutoff. The 0/1 no-change controls and all total-size arithmetic pass.
 - Five example tests pass. A new regression covers every list length 1–32, descending first-ID anchors across lists, and a complete mixed-length dictionary rewrite. Scoped Clippy passes with warnings denied.
 
-Exact results: [`six-bit-deltas.json`](six-bit-deltas.json). In that file, `after` is the absolute control, `delta_after` contains the delta sizes, and `per_list_doc_id_deltas` contains the lane measurements and roundtrip-control result. The absolute-only experiment remains in [`SIX_BIT_COUNTS.md`](SIX_BIT_COUNTS.md).
+Historical exact results: `six-bit-deltas.json` (unpublished). In that file, `after` is the absolute control, `delta_after` contains the delta sizes, and `per_list_doc_id_deltas` contains the lane measurements and roundtrip-control result. The absolute-only experiment remains in [`SIX_BIT_COUNTS.md`](SIX_BIT_COUNTS.md).
 
 ## Reproduction
 
-Historical recipe: these patches target the implementation before dictionary-level inline-size configuration. Current measurements derive the packing width from the dictionary maximum, while this saved experiment uses six bits at every positive cutoff.
+Historical recipe: these patches target the implementation before dictionary-level inline-size configuration. Later measurements derive the packing width from the dictionary maximum, while this saved experiment uses six bits at every positive cutoff.
 
-Apply the existing six-bit patch and the additional delta-sweep patch to a fresh copy of this worktree. The additional patch enables the existing delta comparison for every cutoff and adds the regression test. It does not change the compression algorithm.
+The historical recipe below requires the unpublished six-bit and delta-sweep patches, the original split, and a fresh copy of the experimental source from that time. The additional patch enables the existing delta comparison for every cutoff and adds the regression test. It does not change the compression algorithm.
 
 ```sh
 # Run from this worktree. Include its existing uncommitted implementation/examples.

@@ -102,7 +102,7 @@ python3 dictionary_analysis/comparison.py
 ```
 
 - [Detailed prefix-excluded results](prefix_summaries/prefix_summaries.md): both prefix modes, serialized layouts, all query counts, validation, and limitations.
-- [Machine-readable prefix-excluded results](prefix_summaries/prefix_summaries.json).
+- Machine-readable prefix-excluded results: `prefix_summaries/prefix_summaries.json` (unpublished).
 - [Historical full-term comparison](full_term_comparison.md): the prior experiment, which included prefixes in masks. Its numbers are superseded for the current test convention.
 
 Every sidecar was decoded and compared with build-time data. Full-term matches were independently counted and checked per block against the existing evaluator. The suffix matcher conservatively allows an empty remainder when the query matches the end of the prefix; it stores no separate empty-remainder flag.

@@ -9,7 +9,7 @@ compressed byte lanes, tagged singleton positions, and a dictionary-level cutoff
 Short-postings codec version 2 identifies this encoding. The reader also accepts
 version 1 with absolute IDs.
 Count/positions entries use 4, 6, 7, and 8 bits at cutoffs 8, 32, 64, and 128.
-The production limit remains **32**, with inlining disabled by default.
+The experimental indexing implementation accepts at most **32**, with inlining disabled by default. Cutoffs 64 and 128 use an isolated dictionary-encoding extension.
 
 ## Sizes
 
@@ -47,7 +47,7 @@ Postings and positions columns contain only the remaining external data.
 ## Compared with absolute document IDs
 
 Only the dictionary changes. External postings and positions match the
-[absolute-ID measurements](size-up-to-128-absolute.json) at every cutoff.
+absolute-ID measurements (`size-up-to-128-absolute.json`, unpublished) at every cutoff.
 
 | Cutoff | Absolute dictionary MB | Delta dictionary MB | Bytes saved |
 |---|---:|---:|---:|
@@ -64,7 +64,7 @@ Decoding also requires a checked prefix sum per list.
 
 ### Decoding cost
 
-The production reader was timed over full RAM-resident dictionary streams on an
+The experimental reader was timed over full RAM-resident dictionary streams on an
 Apple M4 Max (64 GiB, Rust 1.98 release build). Each stream visits all 7,671,280
 terms. Both encodings use the same binary, two warmup rounds, and 12 measured
 repeats with alternating order. File I/O and dictionary opening are excluded.
@@ -78,8 +78,8 @@ These elapsed times include decompression, allocations, validation, positions,
 and a checksum over every inline document ID. Exact keys and full term values
 were compared before timing. Shared-workstation variance limits precision.
 The result shows a small CPU cost in this scan, not a query/network latency result.
-Samples are in [`dictionary-scan.json`](dictionary-scan.json), with the benchmark
-source in [`dictionary_scan.rs`](dictionary_scan.rs).
+Historical samples are in `dictionary-scan.json`, with the benchmark
+source in `dictionary_scan.rs`. Both artifacts are unpublished.
 
 The smaller external files come with a larger dictionary. These storage sizes
 exclude query execution and cache behavior. Cold dictionary read costs at the
@@ -109,16 +109,15 @@ than the original source due to its dictionary-level configuration byte.
 Dictionary sizes are actual serialized sizes. External sizes model byte-preserving
 compaction. No complete rewritten split is emitted. Counts exclude the unchanged
 eight-byte token count, composite metadata, component footers, and other fields.
-Supporting 128 in production also requires writer and postings-cursor changes at
+Supporting 128 in the indexing implementation also requires writer and postings-cursor changes at
 the full-block boundary. The experiment does not implement those changes.
 
-Exact results: [`size-up-to-128.json`](size-up-to-128.json).
-The isolated modifications are preserved in
-[`size-up-to-128.patch`](size-up-to-128.patch).
+Historical artifacts (unpublished): `size-up-to-128.json` contains exact results.
+`size-up-to-128.patch` contains the isolated modifications.
 
 ## Reproduce in an isolated copy
 
-From this working tree, with the original split available locally:
+Historical recipe, requiring the experimental source, unpublished patch, and original split available locally:
 
 ```sh
 experiment=$(mktemp -d /tmp/large-cutoff-size.XXXXXX)
@@ -135,7 +134,8 @@ cargo test --manifest-path "$experiment/Cargo.toml" --release \
 The run emits full measurements and fixture data. The saved JSON contains a compact
 summary with exact sizes, entry counts, and verification counts.
 
-To reproduce the RAM-scan comparison, set `DICTIONARY_DIR=/tmp/dictionary-scan`
+The RAM-scan recipe also requires the unpublished `dictionary_scan.rs` source.
+Set `DICTIONARY_DIR=/tmp/dictionary-scan`
 on the measurement command above. This also writes absolute and delta dictionaries
 at cutoffs 8 and 32, using the encoding-comparison helper to normalize each version.
 Then run:

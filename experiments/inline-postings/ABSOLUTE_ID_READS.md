@@ -1,10 +1,10 @@
-# Query read plans with production short postings
+# Query read plans with absolute-ID short postings
 
-Split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, message field 3. Absolute document IDs and the unchanged production encoding. Decimal MB throughout.
+Split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, message field 3. Historical experimental encoding with absolute document IDs and fixed-four-bit counts. Decimal MB throughout.
 
-## Current cutoff ≤8 versus the original code
+## Experimental cutoff ≤8 versus the original code
 
-The original code coalesced gaps up to 4 MiB. The current code uses 512 KiB. This comparison includes both changes. The original 4 MiB setting is a historical baseline, not an active sweep candidate.
+The original code coalesced gaps up to 4 MiB. The measured experimental code uses 512 KiB. This comparison includes both changes. The original 4 MiB setting is a historical baseline, not an active sweep candidate.
 
 “Cold blocks” includes dictionary-block reads plus external postings, assuming the dictionary index is already open. “Postings” is the additional data when dictionary blocks are fully cached and postings are uncached. External positions are unnecessary for these automaton queries. Inline positions are part of the dictionary bytes.
 
@@ -22,7 +22,7 @@ All six leading-wildcard queries select the entire dictionary's data blocks in t
 
 ## Cutoff comparison at the same 512 KiB coalescing gap
 
-These tables use 512 KiB for both the original dictionary and all cutoffs. They isolate the encoding/compaction effect from the change in coalescing policy. A subsequent limit-0 rebuild reproduced the original dictionary bytes apart from its type marker (see `PRODUCTION_CUTOFFS.md`), so its block read plans are identical to the original baseline. The reproduction command now includes that additional cutoff.
+These tables use 512 KiB for both the original dictionary and all cutoffs. They isolate the encoding/compaction effect from the change in coalescing policy. A subsequent limit-0 rebuild reproduced the original dictionary bytes apart from its type marker (see `ABSOLUTE_ID_CUTOFFS.md`), so its block read plans are identical to the original baseline. The reproduction command now includes that additional cutoff.
 
 ### Dictionary-block + external postings MB
 
@@ -57,13 +57,13 @@ The `*aba*` external bytes increase at ≤8 even as matching external lists decr
 ## Measurement and validation
 
 - Dictionary ranges are recorded from the actual `into_stream_async_merging_holes` path using the seven regex automata corresponding to these wildcard patterns.
-- The dictionary index/footer is opened before tracking asynchronous block requests. The subsequent synchronous enumeration reads are assumed cache hits, matching production warmup's cache contract.
-- Postings requests model production's inclusive gap coalescing over matching terms' remapped ranges. Empty inline ranges generate no external request.
+- The dictionary index/footer is opened before tracking asynchronous block requests. The subsequent synchronous enumeration reads are assumed cache hits, matching the warmup path's cache contract.
+- Postings requests model the experimental implementation's inclusive gap coalescing over matching terms' remapped ranges. Empty inline ranges generate no external request.
 - All matching-list counts, inline counts, useful postings bytes, coalesced postings bytes, and request counts match the historical prototype plans for overlapping cutoffs at 512 KiB. The external layout is identical despite the new dictionary encoding.
 - All previously measured storage sizes and dictionary breakdowns remain unchanged. Every rewritten term is still verified for every cutoff.
 - Tests cover gap boundaries, empty ranges, and inline-only matches that fetch dictionary bytes but no external postings. Example Clippy passes with warnings denied.
 
-Reproduce the full cutoff sweep and both historical baselines:
+Historical reproduction command for the full cutoff sweep and both baselines, requiring the experimental source and original split:
 
 ```sh
 cargo run --release --example short_postings_size --features quickwit -- \
@@ -72,6 +72,6 @@ cargo run --release --example short_postings_size --features quickwit -- \
   /path/to/4fea6c896fd045aba3cece0808f3e41e.pos reads
 ```
 
-Raw bytes and counts: [`production-read-plans.json`](production-read-plans.json). Storage-only sweep: [`PRODUCTION_CUTOFFS.md`](PRODUCTION_CUTOFFS.md).
+Historical raw bytes and counts: `production-read-plans.json` (unpublished). Storage-only sweep: [`ABSOLUTE_ID_CUTOFFS.md`](ABSOLUTE_ID_CUTOFFS.md).
 
 Scope: these are planned inverted-index reads. They exclude external positions, index-opening reads, other fields, hit/document retrieval, cache reuse between queries, retries, storage-specific read alignment/request-size limits, and live network latency. Each cold-block query is independent. No complete split is rewritten or deployed.

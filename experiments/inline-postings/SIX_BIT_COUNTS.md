@@ -2,7 +2,7 @@
 
 Split `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, message field 3, 7,671,280 terms. Every integer cutoff from **0 through 32** was measured with absolute document IDs.
 
-This is an **isolated encoding experiment**. Production remains at ≤8 with four-bit count/position entries. The working repository's production writer, reader, validator, and indexing threshold were left unchanged.
+This is a **historical isolated encoding experiment**. Its baseline implementation used ≤8 with four-bit count/position entries. That baseline writer, reader, validator, and indexing threshold were left unchanged. The later configurable implementation supports 0–32 with inlining disabled by default, as described in [`FORMAT.md`](../../src/termdict/sstable_termdict/FORMAT.md).
 
 The follow-up [`SIX_BIT_DELTAS.md`](SIX_BIT_DELTAS.md) compares per-list document-ID deltas at every cutoff 0–32. At ≤32, deltas save another 4.709 MB, reducing the combined total to 458.190 MB (−11.29% versus the original).
 
@@ -12,7 +12,7 @@ The experimental entry uses **five bits for document count minus one**, plus **o
 
 All experimental nonzero cutoffs use this same six-bit layout, including cutoffs 1–8. Document IDs remain absolute. Frequency tagging, position deltas, four zstd-compressed byte lanes per stream, compression level, block framing, and key-based block boundaries remain unchanged. No whole list longer than the selected cutoff is embedded.
 
-The copied codec uses experimental block version 2 and validates lists through 32 documents. It preserves decoding of the original all-external source format. It is not a production format migration: production version-1 inline blocks are not accepted by this experimental decoder. The indexing serializer still has its original ≤8 threshold; this example builds the wider-cutoff dictionaries directly from decoded source lists.
+The copied codec uses experimental block version 2 and validates lists through 32 documents. It preserves decoding of the original all-external source format. This historical decoder rejects the baseline version-1 inline blocks. Its version-2 tag is specific to this isolated experiment and differs from the later delta codec described in `FORMAT.md`. The indexing serializer retained its original ≤8 threshold. This example builds the wider-cutoff dictionaries directly from decoded source lists.
 
 ## Summary
 
@@ -21,13 +21,13 @@ Decimal MB. Total includes dictionary + external postings + external positions. 
 | Layout / cutoff | Dictionary MB | Total MB | Saved MB versus original | Reduction |
 |---|---:|---:|---:|---:|
 | Original / rebuilt 0 | 51.678 | 516.500 | 0.000 | 0.00% |
-| Production four-bit / ≤8 | 74.501 | 491.115 | 25.385 | 4.91% |
+| Baseline four-bit / ≤8 | 74.501 | 491.115 | 25.385 | 4.91% |
 | Experimental six-bit / ≤8 | 74.616 | 491.230 | 25.270 | 4.89% |
 | Experimental six-bit / ≤16 | 93.078 | 481.071 | 35.430 | 6.86% |
 | Experimental six-bit / ≤32 | 129.426 | 462.899 | 53.602 | 10.38% |
 
 - At cutoff 8, widening the count/position entry adds **115,053 bytes**: 114,973 bytes of compressed metadata and 80 bytes of index/footer growth. Document/frequency/position lanes, keys, framing, external sizes, and embedded entry counts are identical to the four-bit control.
-- Cutoff 32 saves **53,601,542 bytes (10.38%)** versus the original. This is **28,216,065 additional bytes saved** versus production's four-bit cutoff 8.
+- Cutoff 32 saves **53,601,542 bytes (10.38%)** versus the original. This is **28,216,065 additional bytes saved** versus the baseline four-bit cutoff 8.
 - That additional net saving comes from **83,140,847 fewer external bytes**, offset by **54,924,782 more dictionary bytes**. The dictionary grows from 74.501 MB to 129.426 MB.
 - At cutoff 32, **7,537,196 lists**, **23,784,883 document entries**, and **24,078,623 position entries** are embedded.
 - Combined storage decreases at every step through 32. **32 is the smallest total among the tested cutoffs.** No optimum beyond 32 is inferred.
@@ -77,17 +77,17 @@ The original baseline is **516,500,105 bytes**. The limit-0 rebuild matches all 
 - Source component footers and CRCs are checked. Source postings and positions ranges must be contiguous and account for all input bytes.
 - Every resulting dictionary is reopened. All **7,671,280 terms at each of 33 cutoffs** are verified: keys, document counts, complete embedded document/frequency/position arrays, and remapped external offsets. No dictionary-only size estimate substitutes for an encoded output.
 - All dictionary bytes reconcile to the recorded stream, metadata, key, framing, and index/footer categories.
-- The limit-0 body is byte-identical to the original. Across cutoffs 1–8, all payload-lane sizes, key/framing sizes, external sizes, and entry counts match the four-bit production measurements. Only compressed metadata and index/footer sizes change.
+- The limit-0 body is byte-identical to the original. Across cutoffs 1–8, all payload-lane sizes, key/framing sizes, external sizes, and entry counts match the four-bit baseline measurements. Only compressed metadata and index/footer sizes change.
 - Codec tests cover document counts 1–32 with and without positions, byte-lane roundtrips and truncation, tagged positions, all six-bit padding alignments, and rejection of length 33. The focused library run passed 14 tests. All four example tests and scoped example Clippy passed.
 - Arithmetic and monotonicity checks passed for all 33 measurements.
 
-Exact bytes and stream breakdowns: [`six-bit-cutoffs.json`](six-bit-cutoffs.json). Four-bit controls remain in [`production-cutoffs.json`](production-cutoffs.json).
+Historical raw artifacts (unpublished): `six-bit-cutoffs.json` contains exact bytes and stream breakdowns. `production-cutoffs.json` contains the four-bit controls, summarized in [`ABSOLUTE_ID_CUTOFFS.md`](ABSOLUTE_ID_CUTOFFS.md).
 
 ## Reproduction
 
-Historical recipe: the patch below targets the implementation before dictionary-level inline-size configuration. The current example supports 0–32 directly and derives each dictionary's packing width. Its output therefore differs from this fixed-six-bit experiment.
+Historical recipe: the patch below targets the implementation before dictionary-level inline-size configuration. The later experimental example supports 0–32 directly and derives each dictionary's packing width. Its output therefore differs from this fixed-six-bit experiment.
 
-[`six-bit-counts.patch`](six-bit-counts.patch) contains the experiment-only changes to the codec, validation limit, size-example cutoff sweep, and its metadata parser. Apply it only to a **separate copy** of this worktree, including the existing uncommitted production implementation and examples:
+The unpublished `six-bit-counts.patch` contains the experiment-only changes to the codec, validation limit, size-example cutoff sweep, and its metadata parser. The following historical recipe requires that patch, the original split, and a **separate copy** of the experimental implementation and examples from that time:
 
 ```sh
 # Run from this worktree. Use a fresh destination.

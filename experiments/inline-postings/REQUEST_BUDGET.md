@@ -26,7 +26,7 @@ establish read plans and make **no observed latency claim**.
 
 ## Reproduce
 
-From the repository root, using the original local split's non-inline dictionary:
+Historical recipe, requiring the experimental source (including the unpublished `examples/postings_read_plans.rs`) and the original local split's non-inline dictionary:
 
 ```sh
 cargo run --release --example postings_read_plans --features quickwit -- \
@@ -41,16 +41,16 @@ cmp experiments/inline-postings/request-budget.json /tmp/request-budget-repeat.j
 cargo clippy --release --example postings_read_plans --features quickwit -- -D warnings
 ```
 
-The release example and clippy passed after integrating the production call site.
+The release example and clippy passed after wiring the planner into the experimental warmup call site.
 Two release runs produced byte-identical JSON (`cmp` passed). All 35 plans passed
 request-count, byte-budget, and coverage assertions. Their results also match an
 independent cheapest-gap calculation from the source dictionary's range extraction.
 The common tests include exhaustive comparison against every gap subset for small
 inputs. The full Quickwit library suite passed with 1,361 tests.
 
-[`examples/postings_read_plans.rs`](../../examples/postings_read_plans.rs) calls
+`examples/postings_read_plans.rs` calls
 `common::merge_ranges_with_byte_budget` on a clone of the fixed-512-KiB plan.
-The compact summary in [`request-budget.json`](request-budget.json) records all
+The unpublished compact summary `request-budget.json` records all
 35 cutoff/pattern combinations, matching/inline/external input counts, useful
 bytes, both plans, and each extra-byte allowance. It contains no individual ranges.
 
@@ -61,7 +61,7 @@ and 128 remove **every** list with `doc_freq <= cutoff`, including nonmatching
 lists, before remapping matching external offsets. This models compaction without
 rebuilding postings or dictionary. Only the `.term` file is needed.
 
-**Cutoffs 64 and 128 are hypothetical.** The current implementation accepts at
+**Cutoffs 64 and 128 are hypothetical.** The experimental implementation accepts at
 most 32 documents per inline list. These larger cutoffs model external postings
 removal only. An isolated encoding experiment measures their dictionary storage
 sizes in [`SIZE_UP_TO_128.md`](SIZE_UP_TO_128.md). Cold dictionary read costs
@@ -146,19 +146,19 @@ by this policy. The historical absolute-ID inline-8 measurement has
 **74,303,555 bytes (74.304 MB)** of cold dictionary-block reads for each
 leading-wildcard query. Adding that measured dictionary cost to `*a*` gives
 153,424,657 bytes with fixed merging and 171,901,262 with the request budget.
-See [`PRODUCTION_READS.md`](PRODUCTION_READS.md) for the independently measured
+See [`ABSOLUTE_ID_READS.md`](ABSOLUTE_ID_READS.md) for the independently measured
 dictionary plans. This example does not remeasure dictionary I/O. New dictionaries
 use document-ID deltas, whose storage sizes are in [`SIZE_UP_TO_128.md`](SIZE_UP_TO_128.md).
 Their cold dictionary read costs require a new measurement. The external-postings
 plans here apply to both encodings because their external ranges are identical.
 
-The production path merges gaps up to 512 KiB while streaming, before collecting
+The experimental warmup path merges gaps up to 512 KiB while streaming, before collecting
 ranges. Thus cutoff-0 `*a*` reduces 1,921,269 matching ranges to **48** planner
 inputs. At cutoff 8, 3,870 external ranges become **33**. The helper sorts only
 the remaining baseline gaps: **O(r log r) CPU time and O(r) scratch memory**, where
 `r` is the fixed baseline request count. The initial stream merge takes O(n) time.
 The example retains matching input ranges to validate exact coverage. Its memory
-use therefore differs from production's small baseline-range collection.
+use therefore differs from the warmup path's small baseline-range collection.
 
 Actual request overhead, storage throughput, concurrency, cache states, and
 end-to-end latency require measurement. This run reads dictionary metadata and

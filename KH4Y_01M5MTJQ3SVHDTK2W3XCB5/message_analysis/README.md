@@ -87,7 +87,7 @@ Its nonnumeric terms include:
 4143dxv3bqhwf
 ```
 
-These actual IDs explain why numeric-looking fences do not imply a numeric-only block. Full keys for this block are in [block_2738_terms.txt](block_2738_terms.txt). [numeric_blocks.tsv](numeric_blocks.tsv) ranks all original blocks by numeric fraction.
+These actual IDs explain why numeric-looking fences do not imply a numeric-only block. Full keys for this block are in `block_2738_terms.txt`. `numeric_blocks.tsv` ranks all original blocks by numeric fraction.
 
 ## 2. What is stored in current block metadata
 
@@ -114,9 +114,9 @@ Each physical data block also has a 4-byte frame length and a 1-byte compression
 
 Readable complete dumps:
 
-- [existing_metadata.tsv](existing_metadata.tsv): one row per block. Actual stored/decoded fields come first. Computed observations are explicitly named `derived_*`.
-- [address_store_metadata.tsv](address_store_metadata.tsv): actual address-store group headers.
-- [blocks.jsonl](blocks.jsonl): machine-readable blocks, exact terms/fences in hex, sizes, original current-index candidate decisions, and derived observations.
+- `existing_metadata.tsv`: one row per block. Actual stored/decoded fields come first. Computed observations are explicitly named `derived_*`.
+- `address_store_metadata.tsv`: actual address-store group headers.
+- `blocks.jsonl`: machine-readable blocks, exact terms/fences in hex, sizes, original current-index candidate decisions, and derived observations.
 
 ## 3. Exact query results: the ceiling on block pruning
 
@@ -322,15 +322,15 @@ python3 dictionary_analysis/report.py
 
 | File | Contents |
 |---|---|
-| [message.sstable](message.sstable) | Original message dictionary, unchanged |
-| [terms.bin](terms.bin) | Expanded keys, `[u32 LE length][raw bytes]` records |
-| [extraction.json](extraction.json) | Source provenance, exact sizes, term counts, definitions |
-| [validation.json](validation.json) | Independent export checks |
-| [existing_metadata.tsv](existing_metadata.tsv) | Readable current metadata, all blocks |
-| [address_store_metadata.tsv](address_store_metadata.tsv) | Existing address-store group headers |
-| [blocks.jsonl](blocks.jsonl) | Original block boundaries and observations |
-| [numeric_blocks.tsv](numeric_blocks.tsv) | Blocks ranked by numeric-term percentage |
-| [evaluation.json](evaluation.json) | Exact-model totals, size models, distributions |
-| [evaluate_blocks.jsonl](evaluate_blocks.jsonl) | Per-block candidates, counts, and cardinalities |
-| [filters.json](filters.json) | Bloom/suffix configuration results and sizes |
-| [filters_blocks.jsonl](filters_blocks.jsonl) | Per-block actual filter decisions |
+| `message.sstable` | Original message dictionary, unchanged |
+| `terms.bin` | Expanded keys, `[u32 LE length][raw bytes]` records |
+| `extraction.json` | Source provenance, exact sizes, term counts, definitions |
+| `validation.json` | Independent export checks |
+| `existing_metadata.tsv` | Readable current metadata, all blocks |
+| `address_store_metadata.tsv` | Existing address-store group headers |
+| `blocks.jsonl` | Original block boundaries and observations |
+| `numeric_blocks.tsv` | Blocks ranked by numeric-term percentage |
+| `evaluation.json` | Exact-model totals, size models, distributions |
+| `evaluate_blocks.jsonl` | Per-block candidates, counts, and cardinalities |
+| `filters.json` | Bloom/suffix configuration results and sizes |
+| `filters_blocks.jsonl` | Per-block actual filter decisions |
