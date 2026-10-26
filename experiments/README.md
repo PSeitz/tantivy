@@ -1,16 +1,9 @@
-# SSTable and regex experiments
+# SSTable measurements
 
-Two studies explore storage and read costs on a synthetic message workload.
+Measurements on the `message` field of one synthetic split: 7,671,280 terms in 16,794 dictionary blocks.
 
-| Study | Question | Reports |
-|---|---|---|
-| Inline postings | Can storing short posting lists inside dictionary blocks reduce total storage and external reads? | [Overview and results](inline-postings/README.md) |
-| Wildcard block skipping | How much block-summary metadata is needed to prune dictionary scans for wildcard queries? | [Study guide](../dictionary_analysis/README.md) |
+1. **[Dictionary contents and pruning limits](dictionary.md)** — term distribution, existing block metadata, exact query matches, and byte/pair/trigram filter measurements.
+2. **[Block metadata: bytes versus candidate blocks](block-metadata.md)** — serialized postings costs, per-query results at five metadata budgets, and log-word versus ID queries.
+3. **[Inline postings](inline-postings.md)** — dictionary/postings/positions sizes, absolute-ID versus delta decoding, and external read plans.
 
-The [message-analysis overview](../KH4Y_01M5MTJQ3SVHDTK2W3XCB5/message_analysis/README.md) describes the input dictionary and baseline measurements.
-
-## Scope
-
-These reports describe experimental implementations, measured storage, modeled read plans, and diagnostic query cohorts. Each report states its assumptions and validation. They do not establish end-to-end query latency improvements.
-
-This branch publishes Markdown only. Source programs, dictionaries, raw result files, and generated indexes are omitted. Commands and artifact filenames in the detailed reports refer to the original experiment environment.
+Reports only. Experiment programs and input files are outside this snapshot.

@@ -2,11 +2,7 @@
 
 Input: `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, segment `4fea6c896fd045aba3cece0808f3e41e`, schema field 3 (`message`). All original physical block boundaries are preserved. No library code or source data was changed.
 
-**Current prefix-excluded comparison:** [comparison.md](comparison.md) reports blocks skipped and actually serialized metadata costs, separating methods that need caller-supplied patterns from those that do not. Every current summary excludes the actual common prefix. The full-term summary experiments below are historical baselines.
-
-**Budget follow-up:** the subsequent limit is +100% of existing index metadata. See [budget.md](budget.md). Sharing repeated exact byte masks brings their actually serialized size down to 20,231 bytes (+10.34%), versus the fixed-per-block layout below. The tested trigram configurations exceed that budget.
-
-**Externally configured sequences:** [selected_sequences.md](selected_sequences.md) evaluates caller-supplied pairs, trigrams, and longer literals, including `*player*` and `*ms*`. The caller supplies the list. The indexer performs no automatic selection. The eight-sequence example plus shared byte masks serializes to 37,095 bytes (+18.96% of current index metadata).
+The storage estimates below describe per-block summaries. [Block metadata](block-metadata.md) measures serialized byte/pair/trigram postings and selected-trigram budgets on the same dictionary.
 
 ## Main findings
 
@@ -16,15 +12,15 @@ Input: `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, segment `4fea6c896fd045aba3cece0808f3e41e`
 - `*a*` and `*ab*` genuinely match terms in most blocks. Their maximum possible data-byte skipping is only **2.35%** and **7.62%** respectively.
 - Exact pairs cost about **3.4 MB** and skip **32.15%** of data bytes for `*traa*`. A free-prefix remainder pair graph raises that to **32.17%**.
 - Prefix removal saves only **415 bytes across the entire dictionary** in the modeled packed-pair layout. Most blocks still have the same alphabet after removing their prefix.
-- The appended `*player*` substring matches **21 terms in 13 blocks**. Pairs skip **44.14%** of data bytes. Exact trigrams retain just **14 blocks**.
-- The appended `*ms*` substring matches **50,585 terms in 14,065 blocks**. Exact pairs already reach its **18.30%** data-byte skipping ceiling. A trigram filter cannot test a two-byte literal.
+- The `*player*` substring matches **21 terms in 13 blocks**. Pairs skip **44.14%** of data bytes. Exact trigrams retain just **14 blocks**.
+- The `*ms*` substring matches **50,585 terms in 14,065 blocks**. Exact pairs already reach its **18.30%** data-byte skipping ceiling. A trigram filter cannot test a two-byte literal.
 - Trigrams are much more selective for `*traa*` and `*player*`. Practical Bloom results and size trade-offs appear below. Raw exact trigram lists are an expensive reference, not the recommended encoding.
 
 ## Definitions and interpretation
 
 - Percentages of terms count **distinct dictionary keys**, not token occurrences, posting counts, or documents.
 - Strict numeric means the entire nonempty key is ASCII `[0-9]+`. Decimals are counted separately as `[+-]?[0-9]+[.][0-9]+`.
-- Queries are **case-sensitive byte wildcards**: `*a*`, `*ab*`, `*traa*`, `*player*`, and `*ms*` are substring searches. The latter two are appended at indices 5 and 6. `*X` and diagnostic `*x` are suffix searches. `*` consumes any byte, including newline. These semantics are used consistently by the current-index baseline and exact scans.
+- Queries are **case-sensitive byte wildcards**: `*a*`, `*ab*`, `*traa*`, `*player*`, and `*ms*` are substring searches. `*X` and diagnostic `*x` are suffix searches. `*` consumes any byte, including newline. These semantics are used consistently by the current-index baseline and exact scans.
 - Uppercase `X` occurs in no term. If the production query analyzer lowercases `X`, use the **`*x` column**, not the `*X` column. This experiment does not run the production query analyzer.
 - Skipped data bytes are sums of original compressed physical block sizes, **without merging holes**. They are potential avoided reads/decompression, not measured I/O or latency. Reading new metadata and caching/coalescing can change the benefit.
 - MB means 1,000,000 bytes. All proposed metadata sizes are incremental, uncompressed layout estimates, with the explicit bookkeeping described below. These summaries have not been added to the on-disk SSTable format.
@@ -87,7 +83,7 @@ Its nonnumeric terms include:
 4143dxv3bqhwf
 ```
 
-These actual IDs explain why numeric-looking fences do not imply a numeric-only block. Full keys for this block are in `block_2738_terms.txt`. `numeric_blocks.tsv` ranks all original blocks by numeric fraction.
+These actual IDs explain why numeric-looking fences do not imply a numeric-only block.
 
 ## 2. What is stored in current block metadata
 
@@ -111,12 +107,6 @@ The address store has 132 groups, each normally covering 128 blocks. Its 4,752 b
 Each physical data block also has a 4-byte frame length and a 1-byte compression flag. All 16,794 blocks use zstd. The TermInfo value count is inside the block payload, so it is available after decoding, rather than as a pre-read pruning summary.
 
 **Current metadata has no term-length bounds, byte masks, pair sets, trigram sets, suffix masks, or numeric counts.**
-
-Readable complete dumps:
-
-- `existing_metadata.tsv`: one row per block. Actual stored/decoded fields come first. Computed observations are explicitly named `derived_*`.
-- `address_store_metadata.tsv`: actual address-store group headers.
-- `blocks.jsonl`: machine-readable blocks, exact terms/fences in hex, sizes, original current-index candidate decisions, and derived observations.
 
 ## 3. Exact query results: the ceiling on block pruning
 
@@ -171,7 +161,7 @@ The oracle checks actual terms. Other methods operate on summaries. Every method
 - `Bounds + min/max lengths` performs automaton/interval/length intersection, rather than merely comparing global length intervals.
 - Whole-key pair tests require all literal pairs. For `*traa*`, these are `tr`, `ra`, and `aa`. They can occur in different terms or positions, explaining the remaining false positives.
 - Exact trigrams additionally require `tra` and `raa`. They reduce `*traa*` to 116 candidate blocks; only 38 contain a true match.
-- The free-prefix pair graph consumes the exact prefix guaranteed by the stored fences, then restricts the remainder using its byte/pair sets. Prefix-crossing matches are preserved. For `*traa*`, this eliminates three more blocks than whole-key pairs. The tables also show the appended substring queries and both stored-prefix models.
+- The free-prefix pair graph consumes the exact prefix guaranteed by the stored fences, then restricts the remainder using its byte/pair sets. Prefix-crossing matches are preserved. For `*traa*`, this eliminates three more blocks than whole-key pairs. The tables also show both stored-prefix models.
 - Whole-key pair-graph intersection and cheap literal-pair tests are listed separately so their measured decisions can be compared for every query.
 
 ### Estimated additional storage for these models
@@ -240,7 +230,7 @@ Filters were actually constructed from each original block's terms. Three determ
 
 `Byte mask + trigram Bloom` has no pair layer, so two-byte queries `*ab*` and `*ms*` get only byte-mask pruning. `Byte mask + exact pairs + trigram Bloom` preserves exact pair pruning for short literals and uses both layers for longer literals. These configurations omit length metadata because membership tests do not use it. Adding bounds and lengths to the byte/pair tests did not improve their decisions here.
 
-Trigram Bloom sizes are per block. Seeds are alternative encodings, not three filters stored together. Hash counts are selected once per configuration from mean distinct-gram counts, then every bit array is built and queried. See [the helper README](../../dictionary_analysis/filters/README.md) for hashing and accounting details.
+Trigram Bloom sizes are per block. Seeds are alternative encodings, not three filters stored together. Hash counts are selected once per configuration from mean distinct-gram counts, then every bit array is built and queried.
 
 More skipped data is not automatically better: the 2 KiB + exact-pair configuration adds nearly 38 MB of metadata to a dictionary with 51.5 MB of compressed data. Metadata read/residency cost must be included in a later end-to-end benchmark.
 
@@ -286,16 +276,7 @@ Data-byte skipping within this subset:
 
 Every numeric-majority block genuinely contains `a`. Consequently, no correct whole-block filter can skip any of them for `*a*`. Conversely, none contains `traa`: the pair summary skips 84.72% of their bytes, and exact trigrams skip all of them.
 
-## 8. Conclusion and next experiments
-
-1. **Bounds + lengths have little selectivity for these specific queries.** They skip four blocks for `*player*` (0.03% of bytes) and none for the other six. Whole-byte masks already reject those four blocks. They can still help other workloads.
-2. **A byte mask is cheap, but common one-/two-byte queries have little block-level headroom.** Even ideal summaries cannot avoid reading most blocks for `*a*` or `*ab*`.
-3. **Exact alphabet-packed pairs are the simplest useful candidate here:** roughly 3.4 MB additional metadata and 32.15% data-byte skipping for `*traa*`. Removing the prefix contributes little on this data.
-4. **For longer rare literals, benchmark trigram Bloom filters.** A 512 B/block filter combined with bytes and exact pairs skips 72.95–81.08% of bytes for `*traa*`, at about 12.0 MB of extra metadata. This is a candidate for latency/memory testing, not a selected production configuration.
-5. **For broad short patterns, investigate finer-grained indexing rather than larger block summaries.** Gram-to-term postings or smaller independently readable blocks can avoid the original-block ceiling, with their own storage costs.
-6. Evaluate a larger real query sample, confirm normalization, then measure warm/cold latency, metadata residency, bytes read after hole coalescing, decompression CPU, and ingestion/merge overhead.
-
-## Validation and reproduction
+## 8. Validation
 
 - Original source SHA-256: `d1225bc8fc56126acba7ca6cd3494865668a0a1a9ad781599595683355e04060`.
 - Extracted SSTable SHA-256: `54c3c6b4ec99d1e4cddd74ed9695e74cd0b1697d141b371cdb58fa0ff8ac531d`.
@@ -304,33 +285,3 @@ Every numeric-majority block genuinely contains `a`. Consequently, no correct wh
 - The exact evaluator reports **zero false negatives across 11 methods × 7 queries**, with no work-budget fallbacks.
 - The filter evaluator reports **zero false negatives across 59 configurations × 7 queries**. Every inserted gram is found by its Bloom filter. Last-byte candidates equal the suffix oracle.
 - Tests include brute-force small-alphabet comparisons, random prefix/boundary cases, empty/variable-length terms, arbitrary bytes, and conservative work-budget fallback. Repeated full runs produced identical outputs.
-
-Reproduce from the repository root:
-
-```sh
-cargo test --release --locked --manifest-path dictionary_analysis/extract/Cargo.toml
-cargo run --release --locked --manifest-path dictionary_analysis/extract/Cargo.toml -- KH4Y_01M5MTJQ3SVHDTK2W3XCB5
-python3 dictionary_analysis/extract/verify.py KH4Y_01M5MTJQ3SVHDTK2W3XCB5
-cargo test --release --locked --manifest-path dictionary_analysis/evaluate/Cargo.toml
-cargo run --release --locked --manifest-path dictionary_analysis/evaluate/Cargo.toml -- KH4Y_01M5MTJQ3SVHDTK2W3XCB5/message_analysis KH4Y_01M5MTJQ3SVHDTK2W3XCB5/message_analysis
-cargo test --release --locked --manifest-path dictionary_analysis/filters/Cargo.toml
-cargo run --release --locked --manifest-path dictionary_analysis/filters/Cargo.toml -- KH4Y_01M5MTJQ3SVHDTK2W3XCB5/message_analysis KH4Y_01M5MTJQ3SVHDTK2W3XCB5/message_analysis
-python3 dictionary_analysis/report.py
-```
-
-## Artifact map
-
-| File | Contents |
-|---|---|
-| `message.sstable` | Original message dictionary, unchanged |
-| `terms.bin` | Expanded keys, `[u32 LE length][raw bytes]` records |
-| `extraction.json` | Source provenance, exact sizes, term counts, definitions |
-| `validation.json` | Independent export checks |
-| `existing_metadata.tsv` | Readable current metadata, all blocks |
-| `address_store_metadata.tsv` | Existing address-store group headers |
-| `blocks.jsonl` | Original block boundaries and observations |
-| `numeric_blocks.tsv` | Blocks ranked by numeric-term percentage |
-| `evaluation.json` | Exact-model totals, size models, distributions |
-| `evaluate_blocks.jsonl` | Per-block candidates, counts, and cardinalities |
-| `filters.json` | Bloom/suffix configuration results and sizes |
-| `filters_blocks.jsonl` | Per-block actual filter decisions |
