@@ -22,7 +22,7 @@ fn make_term_info(term_ord: u64) -> TermInfo {
 fn test_short_postings_dictionary_legacy_versions_and_invalid_trailers() -> io::Result<()> {
     use std::sync::Arc;
 
-    use crate::postings::ShortPostings;
+    use crate::postings::PostingsData;
 
     let external = make_term_info(9);
     let mut builder = TermDictionaryBuilder::create(Vec::new())?;
@@ -40,10 +40,10 @@ fn test_short_postings_dictionary_legacy_versions_and_invalid_trailers() -> io::
 
     let short = TermInfo {
         doc_freq: 1,
-        short_postings: Some(Arc::new(ShortPostings {
-            doc_ids: vec![42],
-            term_freqs: vec![1],
-            position_deltas: vec![17],
+        short_postings: Some(Arc::new(PostingsData {
+            doc_ids: Box::new([42]),
+            term_freqs: Box::new([1]),
+            position_deltas: Box::new([17]),
         })),
         ..TermInfo::default()
     };

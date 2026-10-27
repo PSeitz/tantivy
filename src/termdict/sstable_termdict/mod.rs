@@ -146,10 +146,6 @@ impl ValueWriter for TermInfoBlock {
     }
 
     fn serialize_block(&self, buffer: &mut Vec<u8>) {
-        assert!(self
-            .term_infos
-            .iter()
-            .all(|term| term.short_postings.is_none()));
         VInt(self.term_infos.len() as u64).serialize_into_vec(buffer);
         if self.term_infos.is_empty() {
             return;

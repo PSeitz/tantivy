@@ -1,155 +1,164 @@
+use std::sync::Arc;
+
 use crate::docset::{DocSet, TERMINATED};
 use crate::postings::{Postings, SegmentPostings};
 use crate::DocId;
 
-/// `LoadedPostings` is a `DocSet` and `Postings` implementation.
-/// It is used to represent the postings of a term in memory.
-/// It is suitable if there are few documents for a term.
+/// Decoded postings shared by term dictionaries and in-memory postings readers.
+#[derive(Debug, Default, Eq, PartialEq, Clone)]
+pub struct PostingsData {
+    /// Strictly increasing segment-local document IDs.
+    pub doc_ids: Box<[DocId]>,
+    /// One frequency per document, or empty when frequencies are absent.
+    pub term_freqs: Box<[u32]>,
+    /// Position deltas in document order, or empty when positions are absent.
+    pub position_deltas: Box<[u32]>,
+}
+
+/// An in-memory postings reader with a cursor over shared decoded data.
 ///
-/// It exists mainly to reduce memory usage.
-/// `SegmentPostings` uses 1840 bytes per instance due to its caches.
-/// If you need to keep many terms around with few docs, it's cheaper to load all the
-/// postings in memory.
-///
-/// This is relevant for `RegexPhraseQuery`, which may have a lot of
-/// terms.
-/// E.g. 100_000 terms would need 184MB due to SegmentPostings.
+/// Used for sparse terms in `RegexPhraseQuery` to avoid retaining the block
+/// decoder buffers of a `SegmentPostings` for every term.
 pub struct LoadedPostings {
-    doc_ids: Box<[DocId]>,
-    position_offsets: Box<[u32]>,
-    positions: Box<[u32]>,
+    data: Arc<PostingsData>,
     cursor: usize,
+    position_offset: usize,
 }
 
 impl LoadedPostings {
-    /// Creates a new `LoadedPostings` from a `SegmentPostings`.
-    ///
-    /// It will also preload positions, if positions are available in the SegmentPostings.
+    pub(crate) fn new(data: Arc<PostingsData>) -> Self {
+        Self {
+            data,
+            cursor: 0,
+            position_offset: 0,
+        }
+    }
+
+    pub(crate) fn doc_ids(&self) -> &[DocId] {
+        &self.data.doc_ids
+    }
+
+    /// Loads the remaining documents, frequencies, and available positions.
     pub fn load(segment_postings: &mut SegmentPostings) -> LoadedPostings {
         let num_docs = segment_postings.doc_freq() as usize;
         let mut doc_ids = Vec::with_capacity(num_docs);
-        let mut positions = Vec::with_capacity(num_docs);
-        let mut position_offsets = Vec::with_capacity(num_docs);
+        let mut term_freqs = Vec::with_capacity(num_docs);
+        let mut position_deltas = Vec::new();
         while segment_postings.doc() != TERMINATED {
-            position_offsets.push(positions.len() as u32);
             doc_ids.push(segment_postings.doc());
-            segment_postings.append_positions_with_offset(0, &mut positions);
+            term_freqs.push(segment_postings.term_freq());
+            let start = position_deltas.len();
+            segment_postings.append_positions_with_offset(0, &mut position_deltas);
+            let mut previous = 0;
+            for position in &mut position_deltas[start..] {
+                let absolute = *position;
+                *position -= previous;
+                previous = absolute;
+            }
             segment_postings.advance();
         }
-        position_offsets.push(positions.len() as u32);
-        LoadedPostings {
+        Self::new(Arc::new(PostingsData {
             doc_ids: doc_ids.into_boxed_slice(),
-            positions: positions.into_boxed_slice(),
-            position_offsets: position_offsets.into_boxed_slice(),
-            cursor: 0,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<(Vec<DocId>, Vec<Vec<u32>>)> for LoadedPostings {
-    fn from(doc_ids_and_positions: (Vec<DocId>, Vec<Vec<u32>>)) -> LoadedPostings {
-        let mut position_offsets = Vec::new();
-        let mut all_positions = Vec::new();
-        let (doc_ids, docid_positions) = doc_ids_and_positions;
-        for positions in docid_positions {
-            position_offsets.push(all_positions.len() as u32);
-            all_positions.extend_from_slice(&positions);
-        }
-        position_offsets.push(all_positions.len() as u32);
-        LoadedPostings {
-            doc_ids: doc_ids.into_boxed_slice(),
-            positions: all_positions.into_boxed_slice(),
-            position_offsets: position_offsets.into_boxed_slice(),
-            cursor: 0,
-        }
+            term_freqs: term_freqs.into_boxed_slice(),
+            position_deltas: position_deltas.into_boxed_slice(),
+        }))
     }
 }
 
 impl DocSet for LoadedPostings {
     fn advance(&mut self) -> DocId {
-        self.cursor += 1;
-        if self.cursor >= self.doc_ids.len() {
-            self.cursor = self.doc_ids.len();
-            return TERMINATED;
+        if self.cursor < self.data.doc_ids.len() {
+            if !self.data.position_deltas.is_empty() {
+                self.position_offset += self.term_freq() as usize;
+            }
+            self.cursor += 1;
         }
         self.doc()
     }
 
     fn doc(&self) -> DocId {
-        if self.cursor >= self.doc_ids.len() {
-            return TERMINATED;
-        }
-        self.doc_ids[self.cursor]
+        self.data
+            .doc_ids
+            .get(self.cursor)
+            .copied()
+            .unwrap_or(TERMINATED)
     }
 
     fn size_hint(&self) -> u32 {
-        self.doc_ids.len() as u32
+        self.data.doc_ids.len() as u32
     }
 }
+
 impl Postings for LoadedPostings {
     fn term_freq(&self) -> u32 {
-        let start = self.position_offsets[self.cursor] as usize;
-        let end = self.position_offsets[self.cursor + 1] as usize;
-        (end - start) as u32
+        self.data.term_freqs.get(self.cursor).copied().unwrap_or(1)
     }
 
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
-        let start = self.position_offsets[self.cursor] as usize;
-        let end = self.position_offsets[self.cursor + 1] as usize;
-        for pos in &self.positions[start..end] {
-            output.push(*pos + offset);
+        if self.data.position_deltas.is_empty() || self.doc() == TERMINATED {
+            return;
+        }
+        let end = self.position_offset + self.term_freq() as usize;
+        let mut position = offset;
+        for &delta in &self.data.position_deltas[self.position_offset..end] {
+            position += delta;
+            output.push(position);
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-
     use super::*;
 
     #[test]
     pub fn test_vec_postings() {
-        let doc_ids: Vec<DocId> = (0u32..1024u32).map(|e| e * 3).collect();
-        let mut postings = LoadedPostings::from((doc_ids, vec![]));
+        let mut postings = LoadedPostings::new(Arc::new(PostingsData {
+            doc_ids: (0..1024).map(|doc| doc * 3).collect(),
+            ..Default::default()
+        }));
+        assert_eq!(postings.term_freq(), 1);
         assert_eq!(postings.doc(), 0u32);
         assert_eq!(postings.advance(), 3u32);
-        assert_eq!(postings.doc(), 3u32);
         assert_eq!(postings.seek(14u32), 15u32);
-        assert_eq!(postings.doc(), 15u32);
         assert_eq!(postings.seek(300u32), 300u32);
-        assert_eq!(postings.doc(), 300u32);
         assert_eq!(postings.seek(6000u32), TERMINATED);
     }
 
     #[test]
-    pub fn test_vec_postings2() {
-        let doc_ids: Vec<DocId> = (0u32..1024u32).map(|e| e * 3).collect();
+    fn test_shared_data_independent_cursors() {
+        let data = Arc::new(PostingsData {
+            doc_ids: Box::new([1, 3, 8]),
+            term_freqs: Box::new([2, 1, 3]),
+            position_deltas: Box::new([0, 2, 5, 1, 2, 4]),
+        });
+        let mut first = LoadedPostings::new(data.clone());
+        let mut second = LoadedPostings::new(data);
+        assert!(Arc::ptr_eq(&first.data, &second.data));
+        assert_eq!(first.seek(3), 3);
+        let mut positions = vec![99];
+        first.append_positions_with_offset(10, &mut positions);
+        assert_eq!(positions, [99, 15]);
+        assert_eq!(second.doc(), 1);
+        assert_eq!(second.term_freq(), 2);
+        second.positions(&mut positions);
+        assert_eq!(positions, [0, 2]);
+        assert_eq!(second.seek(7), 8);
+        second.positions(&mut positions);
+        assert_eq!(positions, [1, 3, 7]);
+        assert_eq!(second.advance(), TERMINATED);
+        assert_eq!(second.advance(), TERMINATED);
+        assert_eq!(first.doc(), 3);
+    }
+
+    #[test]
+    fn test_empty_postings() {
+        let mut postings = LoadedPostings::new(Arc::default());
+        assert_eq!(postings.doc(), TERMINATED);
+        assert_eq!(postings.advance(), TERMINATED);
+        assert_eq!(postings.seek(TERMINATED), TERMINATED);
         let mut positions = Vec::new();
-        positions.resize(1024, Vec::new());
-        positions[0] = vec![1u32, 2u32, 3u32];
-        positions[1] = vec![30u32];
-        positions[2] = vec![10u32];
-        positions[4] = vec![50u32];
-        let mut postings = LoadedPostings::from((doc_ids, positions));
-
-        let load = |postings: &mut LoadedPostings| {
-            let mut loaded_positions = Vec::new();
-            postings.positions(loaded_positions.as_mut());
-            loaded_positions
-        };
-        assert_eq!(postings.doc(), 0u32);
-        assert_eq!(load(&mut postings), vec![1u32, 2u32, 3u32]);
-
-        assert_eq!(postings.advance(), 3u32);
-        assert_eq!(postings.doc(), 3u32);
-
-        assert_eq!(load(&mut postings), vec![30u32]);
-
-        assert_eq!(postings.seek(14u32), 15u32);
-        assert_eq!(postings.doc(), 15u32);
-        assert_eq!(postings.seek(300u32), 300u32);
-        assert_eq!(postings.doc(), 300u32);
-        assert_eq!(postings.seek(6000u32), TERMINATED);
+        postings.positions(&mut positions);
+        assert!(positions.is_empty());
     }
 }

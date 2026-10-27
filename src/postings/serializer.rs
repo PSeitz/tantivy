@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use common::{BinarySerializable, CountingWriter, VInt};
 
-use super::{ShortPostings, TermInfo};
+use super::{PostingsData, TermInfo};
 use crate::directory::{CompositeWrite, WritePtr};
 use crate::fieldnorm::FieldNormReader;
 use crate::index::Segment;
@@ -263,14 +263,14 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 
         if (1..=self.max_inline_docs).contains(&self.current_term_info.doc_freq) {
             let block = &self.postings_serializer.block;
-            self.current_term_info.short_postings = Some(Arc::new(ShortPostings {
-                doc_ids: block.doc_ids().to_vec(),
+            self.current_term_info.short_postings = Some(Arc::new(PostingsData {
+                doc_ids: block.doc_ids().into(),
                 term_freqs: if self.postings_serializer.term_has_freq {
-                    block.term_freqs().to_vec()
+                    block.term_freqs().into()
                 } else {
-                    Vec::new()
+                    Box::default()
                 },
-                position_deltas: std::mem::take(&mut self.buffered_positions),
+                position_deltas: std::mem::take(&mut self.buffered_positions).into_boxed_slice(),
             }));
         } else {
             self.postings_serializer
@@ -589,7 +589,9 @@ mod tests {
                 let positions_start = position_serializer.written_bytes() as usize;
                 let mut ordinary = PostingsSerializer::new(0.0, mode, None);
                 ordinary.new_term(doc_freq, record_term_freq);
-                let mut expected = ShortPostings::default();
+                let mut doc_ids = Vec::new();
+                let mut term_freqs = Vec::new();
+                let mut position_deltas = Vec::new();
                 for doc in 0..count {
                     let doc_id = doc * 3;
                     // Include a full positions block among the first eight buffered documents.
@@ -604,12 +606,12 @@ mod tests {
                     };
                     let deltas: Vec<u32> = (0..freq).map(|position| position % 5).collect();
                     serializer.write_doc(doc_id, freq, &deltas);
-                    expected.doc_ids.push(doc_id);
+                    doc_ids.push(doc_id);
                     if mode.has_freq() && record_term_freq {
-                        expected.term_freqs.push(freq);
+                        term_freqs.push(freq);
                     }
                     if mode.has_positions() {
-                        expected.position_deltas.extend_from_slice(&deltas);
+                        position_deltas.extend_from_slice(&deltas);
                     }
                     if !embed {
                         ordinary.write_doc(doc_id, freq);
@@ -624,6 +626,11 @@ mod tests {
                 let info = &serializer.current_term_info;
                 assert_eq!(info.doc_freq, count);
                 if embed {
+                    let expected = PostingsData {
+                        doc_ids: doc_ids.into_boxed_slice(),
+                        term_freqs: term_freqs.into_boxed_slice(),
+                        position_deltas: position_deltas.into_boxed_slice(),
+                    };
                     assert_eq!(info.short_postings.as_deref(), Some(&expected));
                 } else {
                     assert!(info.short_postings.is_none());

@@ -23,6 +23,7 @@ mod skip;
 mod term_info;
 
 pub(crate) use loaded_postings::LoadedPostings;
+pub use loaded_postings::PostingsData;
 pub(crate) use merger::{next_mapped_doc, PostingsMerger};
 pub(crate) use stacker::compute_table_memory_size;
 
@@ -34,7 +35,7 @@ pub(crate) use self::postings_writer::{serialize_postings, IndexingPosition, Pos
 pub use self::segment_postings::SegmentPostings;
 pub use self::serializer::{FieldSerializer, InvertedIndexSerializer};
 pub(crate) use self::skip::{BlockInfo, SkipReader};
-pub use self::term_info::{ShortPostings, TermInfo};
+pub use self::term_info::TermInfo;
 
 #[expect(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Clone, Copy, Eq)]

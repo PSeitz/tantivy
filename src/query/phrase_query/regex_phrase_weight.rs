@@ -192,14 +192,22 @@ impl RegexPhraseWeight {
         const SPARSE_TERM_DOC_THRESHOLD: u32 = 100;
 
         for term_info in term_infos {
-            let mut term_posting = inverted_index
-                .read_postings_from_terminfo(term_info, IndexRecordOption::WithFreqsAndPositions)?;
-            let num_docs = term_posting.doc_freq();
+            let num_docs = term_info.doc_freq;
 
             if num_docs < SPARSE_TERM_DOC_THRESHOLD {
                 let current_bucket = &mut sparse_buckets[0];
-                Self::add_to_bitset(inverted_index, term_info, &mut current_bucket.0)?;
-                let docset = LoadedPostings::load(&mut term_posting);
+                let docset = if let Some(data) = &term_info.short_postings {
+                    LoadedPostings::new(Arc::clone(data))
+                } else {
+                    let mut term_posting = inverted_index.read_postings_from_terminfo(
+                        term_info,
+                        IndexRecordOption::WithFreqsAndPositions,
+                    )?;
+                    LoadedPostings::load(&mut term_posting)
+                };
+                for &doc in docset.doc_ids() {
+                    current_bucket.0.insert(doc);
+                }
                 current_bucket.1.push(docset);
 
                 // Move the bucket to the end if the term limit is reached
@@ -226,7 +234,10 @@ impl RegexPhraseWeight {
 
                 // Add term postings to the appropriate bucket
                 Self::add_to_bitset(inverted_index, term_info, &mut bucket.0)?;
-                bucket.1.push(term_posting);
+                bucket.1.push(inverted_index.read_postings_from_terminfo(
+                    term_info,
+                    IndexRecordOption::WithFreqsAndPositions,
+                )?);
 
                 // Move the bucket to the end if the term limit is reached
                 if bucket.1.len() == 512 {

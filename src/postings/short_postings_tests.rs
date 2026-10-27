@@ -1,7 +1,7 @@
 use crate::collector::{Count, TopDocs};
 use crate::indexer::NoMergePolicy;
-use crate::postings::Postings;
-use crate::query::{PhraseQuery, TermQuery};
+use crate::postings::{LoadedPostings, Postings};
+use crate::query::{PhraseQuery, RegexPhraseQuery, TermQuery};
 use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, TEXT};
 use crate::{DocSet, Index, IndexSettings, Term, TERMINATED};
 
@@ -126,7 +126,7 @@ fn test_short_postings_record_options_at_every_inline_cutoff() -> crate::Result<
                 );
                 let expected_docs: Vec<_> = (0..count).map(|ordinal| ordinal * 2 + 1).collect();
                 if let Some(short) = &info.short_postings {
-                    assert_eq!(short.doc_ids, expected_docs);
+                    assert_eq!(&*short.doc_ids, expected_docs);
                     assert_eq!(
                         short.term_freqs.is_empty(),
                         indexed_option == IndexRecordOption::Basic
@@ -134,27 +134,33 @@ fn test_short_postings_record_options_at_every_inline_cutoff() -> crate::Result<
                 }
                 for requested_option in options {
                     let mut postings = inverted.read_postings(&term, requested_option)?.unwrap();
-                    for ordinal in 0..count {
-                        assert_eq!(postings.doc(), ordinal * 2 + 1);
-                        let freq = if indexed_option == IndexRecordOption::Basic
-                            || requested_option == IndexRecordOption::Basic
-                        {
-                            1
-                        } else {
-                            ordinal % 3 + 1
-                        };
-                        assert_eq!(postings.term_freq(), freq);
-                        if indexed_option == IndexRecordOption::WithFreqsAndPositions
-                            && requested_option == IndexRecordOption::WithFreqsAndPositions
-                        {
-                            let start = count.saturating_sub(ordinal + 1) * freq;
+                    let mut loaded = LoadedPostings::load(&mut postings.clone());
+                    assert_eq!(loaded.size_hint(), count);
+                    for postings in [&mut postings as &mut dyn Postings, &mut loaded] {
+                        for ordinal in 0..count {
+                            assert_eq!(postings.doc(), ordinal * 2 + 1);
+                            let freq = if indexed_option == IndexRecordOption::Basic
+                                || requested_option == IndexRecordOption::Basic
+                            {
+                                1
+                            } else {
+                                ordinal % 3 + 1
+                            };
+                            assert_eq!(postings.term_freq(), freq);
                             let mut positions = Vec::new();
                             postings.positions(&mut positions);
-                            assert_eq!(positions, (start..start + freq).collect::<Vec<_>>());
+                            if indexed_option == IndexRecordOption::WithFreqsAndPositions
+                                && requested_option == IndexRecordOption::WithFreqsAndPositions
+                            {
+                                let start = count.saturating_sub(ordinal + 1) * freq;
+                                assert_eq!(positions, (start..start + freq).collect::<Vec<_>>());
+                            } else {
+                                assert!(positions.is_empty());
+                            }
+                            postings.advance();
                         }
-                        postings.advance();
+                        assert_eq!(postings.doc(), TERMINATED);
                     }
-                    assert_eq!(postings.doc(), TERMINATED);
                     let mut postings = inverted.read_postings(&term, requested_option)?.unwrap();
                     assert_eq!(postings.seek((count * 2 - 2).max(1)), count * 2 - 1);
                     assert_eq!(postings.seek(count * 2), TERMINATED);
@@ -198,46 +204,67 @@ fn test_short_postings_record_options_at_every_inline_cutoff() -> crate::Result<
 
 #[test]
 fn test_short_postings_phrase_matches_and_bm25_scores() -> crate::Result<()> {
-    let mut schema = Schema::builder();
-    let field = schema.add_text_field("text", TEXT);
-    let mut index = Index::create_in_ram(schema.build());
-    index.settings_mut().max_inline_docs = 8;
-    let mut writer = index.writer_for_tests()?;
-    for text in [
-        "alpha beta filler filler",
-        "alpha beta alpha beta",
-        "beta alpha filler filler",
-    ] {
-        writer.add_document(doc!(field => text))?;
-    }
-    writer.commit()?;
-    let searcher = index.reader()?.searcher();
-    let inverted = searcher.segment_reader(0).inverted_index(field)?;
-    let alpha = Term::from_field_text(field, "alpha");
-    let beta = Term::from_field_text(field, "beta");
-    for term in [&alpha, &beta] {
-        assert!(inverted
-            .get_term_info(term)?
-            .unwrap()
-            .short_postings
-            .is_some());
-    }
-    for (terms, expected) in [
-        (vec![alpha.clone(), beta.clone()], 2),
-        (vec![beta.clone(), alpha.clone()], 2),
-        (vec![alpha.clone(), alpha.clone()], 0),
-    ] {
-        assert_eq!(searcher.search(&PhraseQuery::new(terms), &Count)?, expected);
-    }
-    let query = TermQuery::new(alpha, IndexRecordOption::WithFreqs);
-    let hits = searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
-    assert_eq!(hits.len(), 3);
-    // All field lengths are four. BM25 reduces to idf * tf * 2.2 / (tf + 1.2).
-    let idf = (1.0f32 + 0.5 / 3.5).ln();
-    for ((score, address), (doc, freq)) in hits.iter().zip([(1, 2.0), (0, 1.0), (2, 1.0)]) {
-        assert_eq!(address.doc_id, doc);
-        let expected = idf * freq * 2.2 / (freq + 1.2);
-        assert!((score - expected).abs() < 1e-6, "{score} != {expected}");
+    for cutoff in [0, 2, 8, 32] {
+        let mut schema = Schema::builder();
+        let field = schema.add_text_field("text", TEXT);
+        let mut index = Index::create_in_ram(schema.build());
+        index.settings_mut().max_inline_docs = cutoff;
+        let mut writer = index.writer_for_tests()?;
+        for text in [
+            "alpha beta filler filler",
+            "alpha beta alpha beta",
+            "beta alpha filler filler",
+        ] {
+            writer.add_document(doc!(field => text))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        let inverted = searcher.segment_reader(0).inverted_index(field)?;
+        let alpha = Term::from_field_text(field, "alpha");
+        let beta = Term::from_field_text(field, "beta");
+        for term in [&alpha, &beta] {
+            assert_eq!(
+                inverted
+                    .get_term_info(term)?
+                    .unwrap()
+                    .short_postings
+                    .is_some(),
+                cutoff >= 3
+            );
+        }
+        for (terms, expected) in [
+            (vec![alpha.clone(), beta.clone()], 2),
+            (vec![beta.clone(), alpha.clone()], 2),
+            (vec![alpha.clone(), alpha.clone()], 0),
+        ] {
+            let regex = RegexPhraseQuery::new(
+                field,
+                terms
+                    .iter()
+                    .map(|term| term.value().as_str().unwrap().to_owned())
+                    .collect(),
+            );
+            let phrase = PhraseQuery::new(terms);
+            assert_eq!(searcher.search(&phrase, &Count)?, expected);
+            let top_docs = TopDocs::with_limit(3).order_by_score();
+            assert_eq!(
+                searcher.search(&regex, &top_docs)?,
+                searcher.search(&phrase, &top_docs)?
+            );
+        }
+        // At cutoff 2, this union mixes inline "filler" with external "alpha" and "beta".
+        let regex = RegexPhraseQuery::new(field, vec![".*".into(), ".*".into()]);
+        assert_eq!(searcher.search(&regex, &Count)?, 3);
+        let query = TermQuery::new(alpha, IndexRecordOption::WithFreqs);
+        let hits = searcher.search(&query, &TopDocs::with_limit(3).order_by_score())?;
+        assert_eq!(hits.len(), 3);
+        // All field lengths are four. BM25 reduces to idf * tf * 2.2 / (tf + 1.2).
+        let idf = (1.0f32 + 0.5 / 3.5).ln();
+        for ((score, address), (doc, freq)) in hits.iter().zip([(1, 2.0), (0, 1.0), (2, 1.0)]) {
+            assert_eq!(address.doc_id, doc);
+            let expected = idf * freq * 2.2 / (freq + 1.2);
+            assert!((score - expected).abs() < 1e-6, "{score} != {expected}");
+        }
     }
     Ok(())
 }
@@ -283,13 +310,13 @@ fn test_short_postings_term_info_survives_dictionary_block_changes_and_stream_dr
     drop(stream);
     for (i, info) in saved {
         let short = info.short_postings.as_ref().unwrap();
-        assert_eq!(short.doc_ids, [0]);
-        assert_eq!(short.term_freqs, [term_positions[i].len() as u32]);
+        assert_eq!(&*short.doc_ids, [0]);
+        assert_eq!(&*short.term_freqs, [term_positions[i].len() as u32]);
         let mut deltas = term_positions[i].clone();
         if deltas.len() == 2 {
             deltas[1] -= deltas[0];
         }
-        assert_eq!(short.position_deltas, deltas);
+        assert_eq!(&*short.position_deltas, deltas);
         let mut postings = inverted
             .read_postings_from_terminfo(&info, IndexRecordOption::WithFreqsAndPositions)?;
         assert_eq!(postings.doc(), 0);

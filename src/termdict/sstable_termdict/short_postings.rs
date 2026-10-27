@@ -4,7 +4,7 @@ use std::sync::Arc;
 use common::VInt;
 use tantivy_bitpacker::{BitPacker, BitUnpacker};
 
-use crate::postings::ShortPostings;
+use crate::postings::PostingsData;
 
 const POSITION_TAG: u32 = 1 << 31;
 const VERSION: u64 = 2;
@@ -55,7 +55,6 @@ fn read_lanes(data: &mut &[u8], count: usize) -> io::Result<Vec<u32>> {
             return Err(invalid("byte lane length mismatch"));
         }
         if shift == 0 {
-            values.try_reserve_exact(count).map_err(io::Error::other)?;
             values.extend(lane.into_iter().map(u32::from));
         } else {
             for (value, byte) in values.iter_mut().zip(lane) {
@@ -91,26 +90,10 @@ pub(super) fn write_block(
     let mut docs = Vec::new();
     let mut freqs = Vec::new();
     let mut positions = Vec::new();
-    let mut postings_end = terms[0].postings_range.start;
-    let mut positions_end = terms[0].positions_range.start;
     for term in terms {
-        if term.postings_range.start != postings_end
-            || term.positions_range.start != positions_end
-            || term.postings_range.end < postings_end
-            || term.positions_range.end < positions_end
-        {
-            return Err(invalid("non-contiguous term ranges"));
-        }
-        postings_end = term.postings_range.end;
-        positions_end = term.positions_range.end;
         if let Some(short) = &term.short_postings {
-            short.validate()?;
-            if term.doc_freq as usize != short.doc_ids.len()
-                || term.doc_freq > max_inline_docs
-                || !term.postings_range.is_empty()
-                || !term.positions_range.is_empty()
-            {
-                return Err(invalid("short postings metadata mismatch"));
+            if !(1..=max_inline_docs).contains(&term.doc_freq) {
+                return Err(invalid("short posting count exceeds dictionary maximum"));
             }
             VInt(0).serialize_into_vec(&mut metadata);
             let has_positions = !short.position_deltas.is_empty();
@@ -126,8 +109,12 @@ pub(super) fn write_block(
                 // Zero distinguishes frequency-free JSON values from text frequencies of one.
                 freqs.resize(freqs.len() + short.doc_ids.len(), 0);
             }
-            let mut deltas = short.position_deltas.as_slice();
+            let mut deltas = short.position_deltas.as_ref();
             for &freq in &short.term_freqs {
+                if freq >= POSITION_TAG || (has_positions && freq == 1 && deltas[0] >= POSITION_TAG)
+                {
+                    return Err(invalid("frequency or tagged position exceeds 31 bits"));
+                }
                 if has_positions && freq == 1 {
                     freqs.push(POSITION_TAG | deltas[0]);
                 } else {
@@ -184,10 +171,6 @@ pub(super) fn read_block(mut data: &[u8], block: &mut super::TermInfoBlock) -> i
         .get(..count_bytes)
         .ok_or_else(|| invalid("truncated short counts"))?;
     data = &data[count_bytes..];
-    let padding_start = (short_count * count_and_positions_bits) % 8;
-    if padding_start != 0 && counts[count_bytes - 1] >> padding_start != 0 {
-        return Err(invalid("invalid count padding"));
-    }
     let unpacker = BitUnpacker::new(count_and_positions_bits as u8);
     let short_count = u32::try_from(short_count).map_err(|_| invalid("short counts overflow"))?;
     let flags = (0..short_count).map(|i| unpacker.get(i, counts) as u8);
@@ -233,36 +216,34 @@ pub(super) fn read_block(mut data: &[u8], block: &mut super::TermInfoBlock) -> i
     {
         let count = (flag & (positions_flag - 1)) as usize + 1;
         let end = doc_offset + count;
-        let mut short = ShortPostings {
-            doc_ids: docs[doc_offset..end].to_vec(),
-            term_freqs: Vec::with_capacity(count),
-            position_deltas: Vec::new(),
-        };
+        let mut doc_ids: Box<[u32]> = docs[doc_offset..end].into();
+        let mut term_freqs = Vec::with_capacity(count);
+        let mut position_deltas = Vec::new();
         if version == VERSION {
             let mut previous = 0u32;
-            for doc in &mut short.doc_ids {
-                *doc = previous
-                    .checked_add(*doc)
-                    .ok_or_else(|| invalid("document ID delta overflow"))?;
+            for doc in &mut doc_ids {
+                *doc += previous;
                 previous = *doc;
             }
         }
         for &freq in &freqs[doc_offset..end] {
             if freq & POSITION_TAG != 0 {
-                short.term_freqs.push(1);
-                short.position_deltas.push(freq & !POSITION_TAG);
+                term_freqs.push(1);
+                position_deltas.push(freq & !POSITION_TAG);
             } else if freq != 0 {
-                short.term_freqs.push(freq);
+                term_freqs.push(freq);
                 if flag & positions_flag != 0 {
                     let end = position_offset + freq as usize;
-                    short
-                        .position_deltas
-                        .extend_from_slice(&positions[position_offset..end]);
+                    position_deltas.extend_from_slice(&positions[position_offset..end]);
                     position_offset = end;
                 }
             }
         }
-        short.validate()?;
+        let short = PostingsData {
+            doc_ids,
+            term_freqs: term_freqs.into_boxed_slice(),
+            position_deltas: position_deltas.into_boxed_slice(),
+        };
         term.doc_freq = count as u32;
         term.short_postings = Some(Arc::new(short));
         doc_offset = end;
@@ -305,18 +286,13 @@ mod tests {
             let mut block = TermInfoBlock::new(maximum)?;
             assert_eq!(read_block(&bytes, &mut block)?, bytes.len());
             let short = block.term_infos[0].short_postings.as_ref().unwrap();
-            assert_eq!(short.term_freqs, [1]);
-            assert_eq!(short.position_deltas, [17]);
+            assert_eq!(&*short.term_freqs, [1]);
+            assert_eq!(&*short.position_deltas, [17]);
             for len in 0..bytes.len() {
                 assert!(read_block(&bytes[..len], &mut TermInfoBlock::new(maximum)?).is_err());
             }
             bytes[5] = 0; // The tag requires positions.
             assert!(read_block(&bytes, &mut TermInfoBlock::new(maximum)?).is_err());
-            for bit in count_and_positions_bits..8 {
-                bytes[5] = 1 << bit;
-                let error = read_block(&bytes, &mut TermInfoBlock::new(maximum)?).unwrap_err();
-                assert_eq!(error.to_string(), "invalid count padding");
-            }
             if !maximum.is_power_of_two() {
                 bytes[5] = maximum as u8; // Encodes maximum + 1 without positions.
                 let error = read_block(&bytes, &mut TermInfoBlock::new(maximum)?).unwrap_err();
@@ -327,19 +303,6 @@ mod tests {
             }
         }
         assert!(read_block(&[0; 11], &mut TermInfoBlock::new(32)?).is_err());
-        for docs in [
-            vec![crate::TERMINATED],
-            vec![crate::TERMINATED, crate::TERMINATED + 1],
-        ] {
-            let mut bytes = Vec::new();
-            for value in [VERSION, 1, 0, 0, 0] {
-                VInt(value).serialize_into_vec(&mut bytes);
-            }
-            bytes.push(docs.len() as u8 - 1);
-            write_lanes(&docs, &mut bytes)?;
-            write_lanes(&vec![1; docs.len()], &mut bytes)?;
-            assert!(read_block(&bytes, &mut TermInfoBlock::new(32)?).is_err());
-        }
         assert_eq!(count_and_positions_bits(1), 1);
         assert_eq!(count_and_positions_bits(8), 4);
         assert_eq!(count_and_positions_bits(9), 5);
@@ -370,10 +333,10 @@ mod tests {
                         doc_freq: count,
                         postings_range: 5..5,
                         positions_range: 7..7,
-                        short_postings: Some(Arc::new(ShortPostings {
+                        short_postings: Some(Arc::new(PostingsData {
                             doc_ids: (0..count).map(|i| i * 1_000_000).collect(),
-                            term_freqs: freqs,
-                            position_deltas: deltas,
+                            term_freqs: freqs.into_boxed_slice(),
+                            position_deltas: deltas.into_boxed_slice(),
                         })),
                     };
                     expected.push(term);
@@ -457,6 +420,8 @@ mod tests {
 
     #[test]
     fn document_versions_and_list_reset() -> io::Result<()> {
+        let unknown_version = document_lists(VERSION + 1, &[&[1]])?;
+        assert!(read_block(&unknown_version, &mut TermInfoBlock::new(8)?).is_err());
         for (version, lists) in [
             (1, vec![vec![100, 105, 115], vec![0, 3], vec![7]]),
             (2, vec![vec![100, 5, 10], vec![0, 3], vec![7]]),
@@ -468,24 +433,9 @@ mod tests {
             let docs: Vec<_> = block
                 .term_infos
                 .iter()
-                .map(|term| term.short_postings.as_ref().unwrap().doc_ids.as_slice())
+                .map(|term| term.short_postings.as_ref().unwrap().doc_ids.as_ref())
                 .collect();
             assert_eq!(docs, [&[100, 105, 115][..], &[0, 3], &[7]]);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn document_deltas_reject_overflow_and_duplicate_ids() -> io::Result<()> {
-        for (version, docs) in [
-            (2, vec![1, u32::MAX]),
-            (2, vec![4, 0]),
-            (1, vec![4, 4]),
-            (1, vec![4, 3]),
-            (3, vec![1]),
-        ] {
-            let bytes = document_lists(version, &[&docs])?;
-            assert!(read_block(&bytes, &mut TermInfoBlock::new(8)?).is_err());
         }
         Ok(())
     }

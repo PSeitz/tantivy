@@ -6,7 +6,7 @@ use common::{BinarySerializable, VInt};
 use crate::directory::OwnedBytes;
 use crate::positions::COMPRESSION_BLOCK_SIZE;
 use crate::postings::compression::{BlockDecoder, VIntDecoder};
-use crate::postings::ShortPostings;
+use crate::postings::PostingsData;
 
 /// When accessing the positions of a term, we get a positions_idx from the `Terminfo`.
 /// This means we need to skip to the `nth` position efficiently.
@@ -20,7 +20,7 @@ use crate::postings::ShortPostings;
 
 #[derive(Clone)]
 pub struct PositionReader {
-    short_postings: Option<Arc<ShortPostings>>,
+    short_postings: Option<Arc<PostingsData>>,
     bit_widths: OwnedBytes,
     positions: OwnedBytes,
 
@@ -58,7 +58,7 @@ impl PositionReader {
         })
     }
 
-    pub(crate) fn from_short_postings(postings: Arc<ShortPostings>) -> Self {
+    pub(crate) fn from_short_postings(postings: Arc<PostingsData>) -> Self {
         Self {
             short_postings: Some(postings),
             bit_widths: OwnedBytes::empty(),
@@ -174,13 +174,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::PositionReader;
-    use crate::postings::ShortPostings;
+    use crate::postings::PostingsData;
 
     #[test]
     fn test_short_positions_random_access_and_clone() {
-        let postings = Arc::new(ShortPostings {
-            doc_ids: vec![1, 2],
-            term_freqs: vec![1, 300],
+        let postings = Arc::new(PostingsData {
+            doc_ids: Box::new([1, 2]),
+            term_freqs: Box::new([1, 300]),
             position_deltas: (0..301).collect(),
         });
         let mut reader = PositionReader::from_short_postings(postings.clone());

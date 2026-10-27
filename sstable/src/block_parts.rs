@@ -47,9 +47,6 @@ pub(crate) fn decode_block_parts(mut data: &[u8], output: &mut Vec<u8>) -> io::R
             .get(..stored_len)
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated block part"))?;
         data = &data[stored_len..];
-        let end = output.len().checked_add(decoded_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "decoded block length overflow")
-        })?;
         match codec {
             0 => {
                 if stored_len != decoded_len {
@@ -58,12 +55,14 @@ pub(crate) fn decode_block_parts(mut data: &[u8], output: &mut Vec<u8>) -> io::R
                         "raw part length mismatch",
                     ));
                 }
-                output.try_reserve(decoded_len).map_err(io::Error::other)?;
                 output.extend_from_slice(stored);
             }
             1 if part_index != 1 => {
                 #[cfg(feature = "zstd-compression")]
                 {
+                    let end = output.len().checked_add(decoded_len).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "decoded block length overflow")
+                    })?;
                     // Read at most one byte beyond the advertised size. Streaming avoids
                     // allocating a large buffer solely on the basis of an untrusted header.
                     zstd::stream::read::Decoder::new(stored)?
@@ -89,7 +88,6 @@ pub(crate) fn decode_block_parts(mut data: &[u8], output: &mut Vec<u8>) -> io::R
                 ));
             }
         }
-        debug_assert_eq!(output.len(), end);
     }
     if !data.is_empty() {
         return Err(io::Error::new(

@@ -45,7 +45,7 @@ For each term:
 - External: document count (>0), postings byte length, positions byte length.
 - Block-local: zero marker. Neither external offset advances.
 
-After all term entries, short terms have packed document counts and positions flags in marker order, least-significant bits first. The reader derives `count_and_positions_bits = bit_width(max_inline_docs - 1) + 1` from dictionary metadata. The highest bit indicates positions are present; the lower bits contain document count minus one. Entries can cross byte boundaries. Unused high bits in the final byte must be zero.
+After all term entries, short terms have packed document counts and positions flags in marker order, least-significant bits first. The reader derives `count_and_positions_bits = bit_width(max_inline_docs - 1) + 1` from dictionary metadata. The highest bit indicates positions are present; the lower bits contain document count minus one. Entries can cross byte boundaries. The writer zeroes unused high bits in the final byte. Readers ignore them.
 
 A maximum of 1 uses one bit (only the positions flag), 8 uses four bits, 9–16 use five bits, and 17–32 use six bits. Counts exceeding the dictionary maximum are rejected, including unused values at non-power-of-two maxima. A maximum of 0 permits no short-postings blocks.
 
@@ -67,9 +67,9 @@ Frequency values:
 - High bit clear, nonzero: ordinary frequency. Position-bearing entries contribute that many deltas to the positions stream.
 - High bit set: frequency one. The low 31 bits hold its sole position and the positions stream has no entry for it.
 
-Frequencies and tagged positions must fit in 31 bits. There is no escape or fallback encoding for larger values. Input validation rejects inconsistent arrays, unsorted document IDs, malformed lengths, invalid tags, and overflowing offsets.
+Frequencies and tagged positions must fit in 31 bits. The writer rejects larger values because there is no escape or fallback encoding. Readers check framing lengths, tags, and encoding limits. As with regular postings, callers supply consistent arrays and contiguous external ranges.
 
-Document IDs are reconstructed with a checked prefix sum reset per list. Overflow, duplicate IDs, and IDs at or above the termination sentinel are rejected. Version-1 blocks store absolute IDs and skip reconstruction. Position deltas reset per document, as in the existing serializer. Multi-occurrence positions retain their existing deltas. Size measurements and an absolute-ID comparison are in the [inline postings results](../../../experiments/inline-postings/README.md#storage-by-inline-cutoff).
+Document IDs are reconstructed with a prefix sum reset per list. Readers trust document ordering, valid IDs, and per-document position sums, as regular postings readers do. Version-1 blocks store absolute IDs and skip reconstruction. Position deltas reset per document, as in the existing serializer. Multi-occurrence positions retain their existing deltas. Size measurements and an absolute-ID comparison are in the [inline postings results](../../../experiments/inline-postings/README.md#storage-by-inline-cutoff).
 
 ## Reads and warmup
 

@@ -5,7 +5,7 @@ use common::VInt;
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
 use crate::postings::compression::{BlockDecoder, VIntDecoder, COMPRESSION_BLOCK_SIZE};
-use crate::postings::{BlockInfo, FreqReadingOption, ShortPostings, SkipReader};
+use crate::postings::{BlockInfo, FreqReadingOption, PostingsData, SkipReader};
 use crate::query::Bm25Weight;
 use crate::schema::IndexRecordOption;
 use crate::{DocId, Score, TERMINATED};
@@ -113,7 +113,7 @@ impl BlockSegmentPostings {
 
     /// Opens a single partial block from postings decoded by the term dictionary.
     pub(crate) fn from_short_postings(
-        postings: &ShortPostings,
+        postings: &PostingsData,
         record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> Self {
@@ -124,7 +124,7 @@ impl BlockSegmentPostings {
         block
     }
 
-    pub(crate) fn reset_short_postings(&mut self, postings: &ShortPostings) {
+    pub(crate) fn reset_short_postings(&mut self, postings: &PostingsData) {
         debug_assert!((1..=32).contains(&postings.doc_ids.len()));
         debug_assert!(
             postings.term_freqs.is_empty() || postings.doc_ids.len() == postings.term_freqs.len()
@@ -460,13 +460,13 @@ mod tests {
 
         use crate::fieldnorm::FieldNormReader;
         use crate::positions::PositionReader;
-        use crate::postings::ShortPostings;
+        use crate::postings::PostingsData;
         use crate::query::Bm25Weight;
 
-        let short = Arc::new(ShortPostings {
-            doc_ids: vec![1, 3, 8],
-            term_freqs: vec![2, 1, 3],
-            position_deltas: vec![0, 2, 5, 1, 2, 4],
+        let short = Arc::new(PostingsData {
+            doc_ids: Box::new([1, 3, 8]),
+            term_freqs: Box::new([2, 1, 3]),
+            position_deltas: Box::new([0, 2, 5, 1, 2, 4]),
         });
         let mut block = BlockSegmentPostings::from_short_postings(
             &short,
@@ -487,7 +487,7 @@ mod tests {
             .fold(0.0, f32::max);
         assert_eq!(block.block_max_score(&norms, &weight), expected);
         let mut without_freqs = BlockSegmentPostings::from_short_postings(
-            &ShortPostings {
+            &PostingsData {
                 doc_ids: short.doc_ids.clone(),
                 ..Default::default()
             },
@@ -519,7 +519,10 @@ mod tests {
         assert_eq!(cloned.advance(), TERMINATED);
         assert_eq!(postings.doc(), 3);
 
-        for (option, freq) in [(IndexRecordOption::Basic, 1), (IndexRecordOption::WithFreqs, 2)] {
+        for (option, freq) in [
+            (IndexRecordOption::Basic, 1),
+            (IndexRecordOption::WithFreqs, 2),
+        ] {
             let mut block = BlockSegmentPostings::from_short_postings(
                 &short,
                 IndexRecordOption::WithFreqs,
@@ -540,12 +543,12 @@ mod tests {
     fn test_reset_between_short_and_external_postings() {
         use crate::directory::OwnedBytes;
         use crate::postings::serializer::PostingsSerializer;
-        use crate::postings::ShortPostings;
+        use crate::postings::PostingsData;
 
-        let short = ShortPostings {
-            doc_ids: vec![2, 7],
-            term_freqs: vec![3, 2],
-            position_deltas: Vec::new(),
+        let short = PostingsData {
+            doc_ids: Box::new([2, 7]),
+            term_freqs: Box::new([3, 2]),
+            position_deltas: Box::default(),
         };
         let mut block = BlockSegmentPostings::from_short_postings(
             &short,
