@@ -38,6 +38,15 @@ impl BlockEncoder {
         // decompressing. It's required in case the block starts with an actual zero.
         let offset = if offset == 0u32 { None } else { Some(offset) };
 
+        self.compress_block_strictly_sorted(block, offset)
+    }
+
+    // Unlike the disk helper, Some(0) means a predecessor of zero, not -1.
+    pub(crate) fn compress_block_strictly_sorted(
+        &mut self,
+        block: &[u32],
+        offset: Option<u32>,
+    ) -> (u8, &[u8]) {
         let num_bits = self.bitpacker.num_bits_strictly_sorted(offset, block);
         let written_size =
             self.bitpacker
@@ -112,18 +121,28 @@ impl BlockDecoder {
         if strict_delta {
             let offset = std::num::NonZeroU32::new(offset).map(std::num::NonZeroU32::get);
 
-            self.output_len = COMPRESSION_BLOCK_SIZE;
-            self.bitpacker.decompress_strictly_sorted(
-                offset,
-                compressed_data,
-                &mut self.output,
-                num_bits,
-            )
+            self.uncompress_block_strictly_sorted(compressed_data, offset, num_bits)
         } else {
             self.output_len = COMPRESSION_BLOCK_SIZE;
             self.bitpacker
                 .decompress_sorted(offset, compressed_data, &mut self.output, num_bits)
         }
+    }
+
+    // None represents a predecessor of -1; Some(0) must remain distinct.
+    pub(crate) fn uncompress_block_strictly_sorted(
+        &mut self,
+        compressed_data: &[u8],
+        offset: Option<u32>,
+        num_bits: u8,
+    ) -> usize {
+        self.output_len = COMPRESSION_BLOCK_SIZE;
+        self.bitpacker.decompress_strictly_sorted(
+            offset,
+            compressed_data,
+            &mut self.output,
+            num_bits,
+        )
     }
 
     /// Decompress block of unsorted integers.

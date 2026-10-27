@@ -1,6 +1,6 @@
 use std::io;
 
-use common::VInt;
+use common::{BinarySerializable, VInt};
 
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::fieldnorm::FieldNormReader;
@@ -31,6 +31,8 @@ pub struct BlockSegmentPostings {
     doc_freq: u32,
     data: OwnedBytes,
     skip_reader: SkipReader,
+    // Little-endian first document per block in memory mode; absent for disk postings.
+    first_docs: Option<OwnedBytes>,
 }
 
 fn decode_bitpacked_block(
@@ -88,6 +90,35 @@ fn split_into_skips_and_postings(
 }
 
 impl BlockSegmentPostings {
+    /// Opens a transient docs-only set produced by
+    /// [`super::serializer::PostingsSerializer::for_doc_set`].
+    ///
+    /// The first block is decoded immediately. Each block is compressed independently,
+    /// with its first document stored separately from the ordinary Basic skip data and
+    /// payload. Frequencies are always 1. Four zero bytes represent an empty set.
+    ///
+    /// This format is for in-memory use only, not persistence or interchange across
+    /// Tantivy versions. Input must come from the document-set serializer; as with disk
+    /// postings, this does not validate the entire compressed payload.
+    pub fn open_doc_set(mut data: OwnedBytes) -> io::Result<Self> {
+        let doc_freq = u32::deserialize(&mut data)?;
+        let first_docs_len = (doc_freq as usize).div_ceil(COMPRESSION_BLOCK_SIZE) * 4;
+        if data.len() < first_docs_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing block first documents",
+            ));
+        }
+        let (first_docs, bytes) = data.split(first_docs_len);
+        Self::open_bytes(
+            doc_freq,
+            bytes,
+            IndexRecordOption::Basic,
+            IndexRecordOption::Basic,
+            Some(first_docs),
+        )
+    }
+
     /// Opens a `BlockSegmentPostings`.
     /// `doc_freq` is the number of documents in the posting list.
     /// `record_option` represents the amount of data available according to the schema.
@@ -97,10 +128,25 @@ impl BlockSegmentPostings {
     pub(crate) fn open(
         doc_freq: u32,
         data: FileSlice,
-        mut record_option: IndexRecordOption,
+        record_option: IndexRecordOption,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
-        let bytes = data.read_bytes()?;
+        Self::open_bytes(
+            doc_freq,
+            data.read_bytes()?,
+            record_option,
+            requested_option,
+            None,
+        )
+    }
+
+    fn open_bytes(
+        doc_freq: u32,
+        bytes: OwnedBytes,
+        mut record_option: IndexRecordOption,
+        requested_option: IndexRecordOption,
+        first_docs: Option<OwnedBytes>,
+    ) -> io::Result<Self> {
         let (skip_data_opt, postings_data) = split_into_skips_and_postings(doc_freq, bytes)?;
         let skip_reader = match skip_data_opt {
             Some(skip_data) => {
@@ -134,6 +180,7 @@ impl BlockSegmentPostings {
             doc_freq,
             data: postings_data,
             skip_reader,
+            first_docs,
         };
         block_segment_postings.load_block();
         Ok(block_segment_postings)
@@ -196,6 +243,7 @@ impl BlockSegmentPostings {
         let (skip_data_opt, postings_data) =
             split_into_skips_and_postings(doc_freq, postings_data)?;
         self.data = postings_data;
+        self.first_docs = None;
         self.block_max_score_cache = None;
         self.block_loaded = false;
         if let Some(skip_data) = skip_data_opt {
@@ -345,6 +393,17 @@ impl BlockSegmentPostings {
             return;
         }
         let offset = self.skip_reader.byte_offset();
+        let first_doc = self.first_docs.as_ref().and_then(|first_docs| {
+            if !self.skip_reader.has_remaining_docs() {
+                return None;
+            }
+            let block_index = (self.doc_freq - self.skip_reader.remaining_docs()) as usize
+                / COMPRESSION_BLOCK_SIZE;
+            let start = block_index * 4;
+            Some(u32::from_le_bytes(
+                first_docs[start..start + 4].try_into().unwrap(),
+            ))
+        });
         match self.skip_reader.block_info() {
             BlockInfo::BitPacked {
                 doc_num_bits,
@@ -352,19 +411,27 @@ impl BlockSegmentPostings {
                 tf_num_bits,
                 ..
             } => {
-                decode_bitpacked_block(
-                    &mut self.doc_decoder,
-                    if let FreqReadingOption::ReadFreq = self.freq_reading_option {
-                        Some(&mut self.freq_decoder)
-                    } else {
-                        None
-                    },
-                    &self.data.as_slice()[offset..],
-                    self.skip_reader.last_doc_in_previous_block,
-                    doc_num_bits,
-                    tf_num_bits,
-                    strict_delta_encoded,
-                );
+                if let Some(first_doc) = first_doc {
+                    self.doc_decoder.uncompress_block_strictly_sorted(
+                        &self.data.as_slice()[offset..],
+                        first_doc.checked_sub(1),
+                        doc_num_bits,
+                    );
+                } else {
+                    decode_bitpacked_block(
+                        &mut self.doc_decoder,
+                        if let FreqReadingOption::ReadFreq = self.freq_reading_option {
+                            Some(&mut self.freq_decoder)
+                        } else {
+                            None
+                        },
+                        &self.data.as_slice()[offset..],
+                        self.skip_reader.last_doc_in_previous_block,
+                        doc_num_bits,
+                        tf_num_bits,
+                        strict_delta_encoded,
+                    );
+                }
             }
             BlockInfo::VInt { num_docs } => {
                 let data = {
@@ -382,7 +449,7 @@ impl BlockSegmentPostings {
                         None
                     },
                     data,
-                    self.skip_reader.last_doc_in_previous_block,
+                    first_doc.unwrap_or(self.skip_reader.last_doc_in_previous_block),
                     num_docs as usize,
                 );
             }
@@ -409,6 +476,7 @@ impl BlockSegmentPostings {
             doc_freq: 0,
             data: OwnedBytes::empty(),
             skip_reader: SkipReader::new(OwnedBytes::empty(), 0, IndexRecordOption::Basic),
+            first_docs: None,
         }
     }
 

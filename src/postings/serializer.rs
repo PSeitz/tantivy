@@ -302,9 +302,15 @@ impl Block {
     }
 }
 
+#[cfg(test)]
+#[path = "doc_set_tests.rs"]
+mod doc_set_tests;
+
 /// Serializer for postings lists.
 pub struct PostingsSerializer {
     last_doc_id_encoded: u32,
+    // First document of each independently compressed block; None selects the disk format.
+    first_docs: Option<Vec<DocId>>,
 
     block_encoder: BlockEncoder,
     block: Box<Block>,
@@ -322,7 +328,27 @@ pub struct PostingsSerializer {
 }
 
 impl PostingsSerializer {
-    /// Creates a new `PostingsSerializer`.
+    /// Creates a docs-only serializer for transient in-memory document sets.
+    ///
+    /// Feed strictly increasing document IDs smaller than [`crate::TERMINATED`] with
+    /// [`Self::write_doc`] (term frequencies are ignored), then call [`Self::close_term`]
+    /// with their exact count. The serializer can be reused after closing a set.
+    ///
+    /// The output is `[u32 LE count][u32 LE first doc per block][Basic postings envelope]`.
+    /// There are `ceil(count / 128)` first-document entries. The envelope contains a VInt
+    /// skip length and skip bytes when `count >= 128`, followed by the compressed payload.
+    /// Each block contains up to 128 documents and is compressed independently: full blocks
+    /// use strict deltas from `first_doc - 1` (including a virtual -1 for doc 0), while the
+    /// VInt tail uses deltas from `first_doc`. Skip data retains the ordinary Basic format.
+    /// Read it with [`super::BlockSegmentPostings::open_doc_set`]. This is not a persistence
+    /// format and has no compatibility guarantee across Tantivy versions.
+    pub fn for_doc_set() -> Self {
+        let mut serializer = Self::new(0.0, IndexRecordOption::Basic, None);
+        serializer.first_docs = Some(Vec::new());
+        serializer
+    }
+
+    /// Creates a new `PostingsSerializer` for the on-disk postings format.
     /// * avg_fieldnorm - average field norm for the field being serialized.
     /// * mode - indexing options for the field being serialized.
     pub fn new(
@@ -338,6 +364,7 @@ impl PostingsSerializer {
             skip_write: SkipSerializer::new(),
 
             last_doc_id_encoded: 0u32,
+            first_docs: None,
             mode,
 
             fieldnorm_reader,
@@ -378,9 +405,17 @@ impl PostingsSerializer {
     fn write_block(&mut self) {
         {
             // encode the doc ids
-            let (num_bits, block_encoded): (u8, &[u8]) = self
-                .block_encoder
-                .compress_block_sorted(self.block.doc_ids(), self.last_doc_id_encoded);
+            let (num_bits, block_encoded): (u8, &[u8]) = if let Some(first_docs) =
+                self.first_docs.as_mut()
+            {
+                let first_doc = self.block.doc_ids[0];
+                first_docs.push(first_doc);
+                self.block_encoder
+                    .compress_block_strictly_sorted(self.block.doc_ids(), first_doc.checked_sub(1))
+            } else {
+                self.block_encoder
+                    .compress_block_sorted(self.block.doc_ids(), self.last_doc_id_encoded)
+            };
             self.last_doc_id_encoded = self.block.last_doc();
             self.skip_write
                 .write_doc(self.last_doc_id_encoded, num_bits);
@@ -432,7 +467,24 @@ impl PostingsSerializer {
     /// Register that the given document contains the current term.
     /// * doc_id - the document id.
     /// * term_freq - the term frequency within the document.
+    ///
+    /// # Panics
+    /// In document-set mode, panics if IDs are not strictly increasing or if an ID is
+    /// greater than or equal to [`crate::TERMINATED`].
     pub fn write_doc(&mut self, doc_id: DocId, term_freq: u32) {
+        if let Some(first_docs) = self.first_docs.as_ref() {
+            assert!(doc_id < crate::TERMINATED, "invalid document ID");
+            let previous = self
+                .block
+                .doc_ids()
+                .last()
+                .copied()
+                .or_else(|| (!first_docs.is_empty()).then_some(self.last_doc_id_encoded));
+            assert!(
+                previous.is_none_or(|previous| previous < doc_id),
+                "document IDs must be strictly increasing"
+            );
+        }
         self.block.append_doc(doc_id, term_freq);
         if self.block.is_full() {
             self.write_block();
@@ -440,11 +492,23 @@ impl PostingsSerializer {
     }
 
     /// Finish the serialization for this term.
+    ///
+    /// In document-set mode, returns `InvalidInput` if `doc_freq` is not the number of
+    /// documents written. After success, another set may be written with this serializer.
     pub fn close_term(
         &mut self,
         doc_freq: u32,
         output_write: &mut impl std::io::Write,
     ) -> io::Result<()> {
+        if let Some(first_docs) = self.first_docs.as_ref() {
+            let count = first_docs.len() * COMPRESSION_BLOCK_SIZE + self.block.len;
+            if count != doc_freq as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "incorrect document count",
+                ));
+            }
+        }
         if !self.block.is_empty() {
             // we have doc ids waiting to be written
             // this happens when the number of doc ids is
@@ -453,9 +517,16 @@ impl PostingsSerializer {
             // In that case, the remaining part is encoded
             // using variable int encoding.
             {
+                let offset = if let Some(first_docs) = self.first_docs.as_mut() {
+                    let first_doc = self.block.doc_ids[0];
+                    first_docs.push(first_doc);
+                    first_doc
+                } else {
+                    self.last_doc_id_encoded
+                };
                 let block_encoded = self
                     .block_encoder
-                    .compress_vint_sorted(self.block.doc_ids(), self.last_doc_id_encoded);
+                    .compress_vint_sorted(self.block.doc_ids(), offset);
                 self.postings_write.write_all(block_encoded)?;
             }
             // ... Idem for term frequencies
@@ -467,6 +538,12 @@ impl PostingsSerializer {
             }
             self.block.clear();
         }
+        if let Some(first_docs) = self.first_docs.as_ref() {
+            doc_freq.serialize(output_write)?;
+            for first_doc in first_docs {
+                first_doc.serialize(output_write)?;
+            }
+        }
         if doc_freq >= COMPRESSION_BLOCK_SIZE as u32 {
             let skip_data = self.skip_write.data();
             VInt(skip_data.len() as u64).serialize(output_write)?;
@@ -476,11 +553,20 @@ impl PostingsSerializer {
         self.skip_write.clear();
         self.postings_write.clear();
         self.bm25_weight = None;
+        if let Some(first_docs) = self.first_docs.as_mut() {
+            first_docs.clear();
+            self.last_doc_id_encoded = 0;
+        }
         Ok(())
     }
 
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+        if let Some(first_docs) = self.first_docs.as_mut() {
+            first_docs.clear();
+            self.skip_write.clear();
+            self.postings_write.clear();
+        }
     }
 }
