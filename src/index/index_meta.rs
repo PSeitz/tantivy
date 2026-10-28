@@ -250,7 +250,7 @@ pub struct IndexSettings {
     #[serde(default = "default_docstore_blocksize")]
     /// The size of each block that will be compressed and written to disk
     pub docstore_blocksize: usize,
-    /// Maximum documents per posting list stored in the term dictionary (default 0 disables it).
+    /// Maximum documents per postings list stored inline in dictionary (default 0 disables it).
     #[cfg(feature = "quickwit")]
     #[serde(
         default,

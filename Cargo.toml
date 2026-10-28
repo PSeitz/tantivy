@@ -190,10 +190,6 @@ required-features = ["failpoints"]
 name = "aggregation_jitexpr"
 required-features = ["jitexpr"]
 
-[[example]]
-name = "postings_read_plans"
-required-features = ["quickwit"]
-
 [[bench]]
 name = "analyzer"
 harness = false

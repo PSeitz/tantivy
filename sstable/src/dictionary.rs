@@ -17,7 +17,7 @@ use tantivy_fst::automaton::AlwaysMatch;
 use crate::delta::DeltaKeyComparator;
 use crate::streamer::{Streamer, StreamerBuilder};
 use crate::value::ValueReader;
-use crate::{BlockAddr, DeltaReader, Reader, SSTable, SSTableIndex, TermOrdinal, VoidSSTable};
+use crate::{BlockAddr, DeltaReader, SSTable, SSTableIndex, TermOrdinal, VoidSSTable};
 
 /// An SSTable is a sorted map that associates sorted `&[u8]` keys
 /// to any kind of typed values.
@@ -91,16 +91,6 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         Ok(TSSTable::writer(wrt))
     }
 
-    pub(crate) fn sstable_reader_block(
-        &self,
-        block_addr: BlockAddr,
-    ) -> io::Result<Reader<TSSTable::ValueReader>> {
-        let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
-        let mut reader = TSSTable::reader(data);
-        reader.delta_reader = reader.delta_reader.with_value_config(self.value_config)?;
-        Ok(reader)
-    }
-
     pub(crate) async fn sstable_delta_reader_for_key_range_async(
         &self,
         key_range: impl RangeBounds<[u8]>,
@@ -109,10 +99,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         merge_holes_under_bytes: usize,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
-        if match_all {
+        let reader = if match_all {
             let slice = self.file_slice_for_range(key_range, limit);
             let data = slice.read_bytes_async().await?;
-            TSSTable::delta_reader(data).with_value_config(self.value_config)
+            TSSTable::delta_reader(data)
         } else {
             let blocks = stream::iter(self.get_block_iterator_for_range_and_automaton(
                 key_range,
@@ -133,8 +123,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                 .buffered(5)
                 .try_collect::<Vec<_>>()
                 .await?;
-            DeltaReader::from_multiple_blocks(data).with_value_config(self.value_config)
-        }
+            DeltaReader::from_multiple_blocks(data)
+        };
+        reader.with_value_config(self.value_config)
     }
 
     pub(crate) fn sstable_delta_reader_for_key_range(
@@ -144,10 +135,10 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         automaton: &impl Automaton,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
-        if match_all {
+        let reader = if match_all {
             let slice = self.file_slice_for_range(key_range, limit);
             let data = slice.read_bytes()?;
-            TSSTable::delta_reader(data).with_value_config(self.value_config)
+            TSSTable::delta_reader(data)
         } else {
             // if operations are sync, we assume latency is almost null, and there is no point in
             // merging across holes
@@ -160,8 +151,9 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
                         .map(|bytes| (bytes, first_ordinal))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            DeltaReader::from_multiple_blocks(data).with_value_config(self.value_config)
-        }
+            DeltaReader::from_multiple_blocks(data)
+        };
+        reader.with_value_config(self.value_config)
     }
 
     pub(crate) fn sstable_delta_reader_block(
@@ -553,14 +545,14 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         }
     }
 
-    /// Returns the number of terms in the dictionary.
+    /// Returns the value associated with a term ordinal.
     pub fn term_info_from_ord(&self, term_ord: TermOrdinal) -> io::Result<Option<TSSTable::Value>> {
         // find block in which the term would be
         let block_addr = self.sstable_index.get_block_with_ord(term_ord);
         let first_ordinal = block_addr.first_ordinal;
 
         // then search inside that block only
-        let mut sstable_reader = self.sstable_reader_block(block_addr)?;
+        let mut sstable_reader = self.sstable_delta_reader_block(block_addr)?;
         for _ in first_ordinal..=term_ord {
             if !sstable_reader.advance()? {
                 return Ok(None);

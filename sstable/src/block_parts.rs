@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-/// Appends a flag-2 block body with independently encoded metadata, payload, and keys.
+/// Appends encoding flag 2 followed by separately encoded metadata, payload, and keys.
 ///
 /// Each part is `[decoded_len: u32 LE, stored_len: u32 LE, codec: u8, bytes]`.
 /// Metadata and keys use zstd level 3 when the `zstd-compression` feature is enabled
@@ -60,15 +60,15 @@ pub(crate) fn decode_block_parts(mut data: &[u8], output: &mut Vec<u8>) -> io::R
             1 if part_index != 1 => {
                 #[cfg(feature = "zstd-compression")]
                 {
-                    let end = output.len().checked_add(decoded_len).ok_or_else(|| {
+                    let expected_output_len = output.len().checked_add(decoded_len).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "decoded block length overflow")
                     })?;
-                    // Read at most one byte beyond the advertised size. Streaming avoids
-                    // allocating a large buffer solely on the basis of an untrusted header.
+                    // Read at most one byte beyond the declared length to detect a mismatch.
+                    // Streaming grows the buffer as bytes are decoded.
                     zstd::stream::read::Decoder::new(stored)?
                         .take(decoded_len as u64 + 1)
                         .read_to_end(output)?;
-                    if output.len() != end {
+                    if output.len() != expected_output_len {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "decoded part length mismatch",

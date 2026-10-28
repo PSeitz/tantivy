@@ -4,20 +4,19 @@ use std::sync::Arc;
 
 use common::{BinarySerializable, FixedSize};
 
-use super::PostingsData;
+use super::LoadedPostings;
 
-/// `TermInfo` wraps the metadata associated with a Term.
-/// It is segment-local.
+/// A term's document count, file ranges, and inline postings within a segment.
 #[derive(Debug, Default, Eq, PartialEq, Clone)]
 pub struct TermInfo {
     /// Number of documents in the segment containing the term
     pub doc_freq: u32,
     /// Byte range of the posting list within the postings (`.idx`) file.
     pub postings_range: Range<usize>,
-    /// Byte range of the positions of this terms in the positions (`.pos`) file.
+    /// Byte range of the term's positions in the positions (`.pos`) file.
     pub positions_range: Range<usize>,
-    /// Whole postings stored in the dictionary. External ranges are empty when present.
-    pub short_postings: Option<Arc<PostingsData>>,
+    /// Postings stored inline in the term dictionary. File ranges are empty when present.
+    pub inline_postings: Option<Arc<LoadedPostings>>,
 }
 
 impl TermInfo {
@@ -44,10 +43,10 @@ impl FixedSize for TermInfo {
 
 impl BinarySerializable for TermInfo {
     fn serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
-        if self.short_postings.is_some() {
+        if self.inline_postings.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "short postings require an SSTable",
+                "inline postings require an SSTable",
             ));
         }
         self.doc_freq.serialize(writer)?;
@@ -70,7 +69,7 @@ impl BinarySerializable for TermInfo {
             doc_freq,
             postings_range: postings_start_offset..postings_end_offset,
             positions_range: positions_start_offset..positions_end_offset,
-            short_postings: None,
+            inline_postings: None,
         })
     }
 }

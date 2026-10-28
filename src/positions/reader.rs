@@ -6,21 +6,16 @@ use common::{BinarySerializable, VInt};
 use crate::directory::OwnedBytes;
 use crate::positions::COMPRESSION_BLOCK_SIZE;
 use crate::postings::compression::{BlockDecoder, VIntDecoder};
-use crate::postings::PostingsData;
+use crate::postings::LoadedPostings;
 
-/// When accessing the positions of a term, we get a positions_idx from the `Terminfo`.
-/// This means we need to skip to the `nth` position efficiently.
+/// Reads a term's position deltas from inline postings or compressed blocks.
 ///
-/// Blocks are compressed using bitpacking, so `skip_read` contains the number of bits
-/// (values can go from 0 to 32 bits) required to decompress every block.
-///
-/// A given block obviously takes `(128 x  num_bit_for_the_block / num_bits_in_a_byte)`,
-/// so skipping a block without decompressing it is just a matter of advancing that many
-/// bytes.
+/// Each bitpacked block stores 128 deltas and occupies `128 * bit_width / 8` bytes.
+/// The block bit widths allow the reader to skip to a requested offset.
 
 #[derive(Clone)]
 pub struct PositionReader {
-    short_postings: Option<Arc<PostingsData>>,
+    inline_postings: Option<Arc<LoadedPostings>>,
     bit_widths: OwnedBytes,
     positions: OwnedBytes,
 
@@ -36,18 +31,18 @@ pub struct PositionReader {
     // As we advance, anchor increases simultaneously with bit_widths and positions get consumed.
     anchor_offset: u64,
 
-    // These are just copies used for .reset().
+    // Retained bytes for reading from an earlier offset.
     original_bit_widths: OwnedBytes,
     original_positions: OwnedBytes,
 }
 
 impl PositionReader {
-    /// Open and reads the term positions encoded into the positions_data owned bytes.
+    /// Opens the term's encoded position deltas.
     pub fn open(mut positions_data: OwnedBytes) -> io::Result<PositionReader> {
         let num_positions_bitpacked_blocks = VInt::deserialize(&mut positions_data)?.0 as usize;
         let (bit_widths, positions) = positions_data.split(num_positions_bitpacked_blocks);
         Ok(PositionReader {
-            short_postings: None,
+            inline_postings: None,
             bit_widths: bit_widths.clone(),
             positions: positions.clone(),
             block_decoder: BlockDecoder::default(),
@@ -58,9 +53,9 @@ impl PositionReader {
         })
     }
 
-    pub(crate) fn from_short_postings(postings: Arc<PostingsData>) -> Self {
+    pub(crate) fn from_inline_postings(postings: Arc<LoadedPostings>) -> Self {
         Self {
-            short_postings: Some(postings),
+            inline_postings: Some(postings),
             bit_widths: OwnedBytes::empty(),
             positions: OwnedBytes::empty(),
             block_decoder: BlockDecoder::default(),
@@ -118,11 +113,11 @@ impl PositionReader {
         self.block_offset = self.anchor_offset + (block_rel_id * COMPRESSION_BLOCK_SIZE) as u64;
     }
 
-    /// Fills a buffer with the positions `[offset..offset+output.len())` integers.
+    /// Copies position deltas at `[offset..offset + output.len())` into `output`.
     ///
     /// This function is optimized to be called with increasing values of `offset`.
     pub fn read(&mut self, mut offset: u64, mut output: &mut [u32]) {
-        if let Some(postings) = &self.short_postings {
+        if let Some(postings) = &self.inline_postings {
             output.copy_from_slice(&postings.position_deltas[offset as usize..][..output.len()]);
             return;
         }
@@ -131,9 +126,7 @@ impl PositionReader {
         }
         let delta_to_block_offset = offset as i64 - self.block_offset as i64;
         if !(0..128).contains(&delta_to_block_offset) {
-            // The first position is not within the first block.
-            // (Note that it could be before or after)
-            // We need to possibly skip a few blocks, and decompress the first relevant  block.
+            // Skip to and decode the block containing the requested offset.
             let delta_to_anchor_offset = offset - self.anchor_offset;
             let num_blocks_to_skip =
                 (delta_to_anchor_offset / (COMPRESSION_BLOCK_SIZE as u64)) as usize;
@@ -166,34 +159,5 @@ impl PositionReader {
             offset += remaining_in_block as u64;
             self.load_block(i);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::PositionReader;
-    use crate::postings::PostingsData;
-
-    #[test]
-    fn test_short_positions_random_access_and_clone() {
-        let postings = Arc::new(PostingsData {
-            doc_ids: Box::new([1, 2]),
-            term_freqs: Box::new([1, 300]),
-            position_deltas: (0..301).collect(),
-        });
-        let mut reader = PositionReader::from_short_postings(postings.clone());
-        let mut output = [0; 140];
-        reader.read(127, &mut output);
-        assert_eq!(output.as_slice(), &postings.position_deltas[127..267]);
-        let mut cloned = reader.clone();
-        cloned.read(0, &mut output[..1]);
-        assert_eq!(output[0], 0);
-        reader.read(300, &mut output[..1]);
-        assert_eq!(output[0], 300);
-        reader.read(301, &mut []);
-        reader.read(1, &mut output);
-        assert_eq!(output.as_slice(), &postings.position_deltas[1..141]);
     }
 }

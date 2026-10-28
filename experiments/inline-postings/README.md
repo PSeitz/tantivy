@@ -1,9 +1,14 @@
 # Inline postings
 
-Inlining stores whole short postings lists, including frequencies and positions,
-in their term dictionary block. Quickwit's `max_inline_docs` accepts 0–32 and
-defaults to 0 (disabled). The [format documentation](../../src/termdict/sstable_termdict/FORMAT.md)
+Inlining stores postings lists, including frequencies and positions, in their
+term dictionary block. Quickwit's `max_inline_docs` sets the maximum
+number of documents per inline list. It accepts 0–32 and defaults to 0 (disabled).
+The [format documentation](../../src/termdict/sstable_termdict/FORMAT.md)
 describes the encoding and compatibility.
+
+`LoadedPostings` holds arrays of document IDs, term frequencies, and position
+deltas. `LoadedPostingsReader` reads these shared arrays. `SegmentPostings`
+reads postings through block decoders.
 
 Results below cover the `message` field (physical field 3) of split
 `KH4Y_01M5MTJQ3SVHDTK2W3XCB5`, segment `4fea6c896fd045aba3cece0808f3e41e`:
@@ -35,7 +40,7 @@ columns contain only the remaining external data.
 
 Dictionary sizes are serialized sizes. External sizes model byte-preserving
 compaction. Totals exclude the unchanged token-count header, composite metadata,
-component footers, and other fields. No complete rewritten split was measured.
+component footers, and other fields. Measurements cover these components.
 
 ## Document-ID deltas: size and decoding cost
 
@@ -48,7 +53,7 @@ dictionary-size savings with full RAM-resident dictionary-scan timings.
 | 8 | 74.501 | 74.477 | 24,448 | 758.33 [755.14–778.73] | 767.15 [756.87–781.74] | +1.16% |
 | 32 | 129.426 | 124.717 | 4,708,905 | 1,034.70 [1,023.34–1,068.91] | 1,053.27 [1,041.26–1,087.68] | +1.79% |
 
-At cutoff 8, only 9.14% of inline document entries become gaps. At cutoff 32,
+At cutoff 8, 9.14% of inline document IDs become gaps. At cutoff 32,
 68.31% do, making deltas more effective. At cutoffs 1–6, delta dictionaries were
 37–8,114 bytes larger than the absolute-ID controls.
 
@@ -56,7 +61,7 @@ Timings are from an Apple M4 Max with 64 GiB RAM, Rust 1.98 release build, and
 12 alternating measured scans after warmup. They include decompression,
 allocations, validation, positions, and an inline-ID checksum. File I/O and
 opening the dictionary are excluded. Shared-workstation variance limits precision.
-These scans show a small CPU cost for deltas; live-query latency remains unmeasured.
+These scans show a small CPU cost for deltas. Live-query latency remains unmeasured.
 
 ## External reads and request budget
 
@@ -85,7 +90,7 @@ For `*a*`, the byte budget cuts requests from 33 to 11 for 18.48 MB more data
 Sums across these seven independent queries, with equal weight and no cross-query
 caching, show the effect of the inline cutoff. Each query gets its own allowance.
 
-| Cutoff | Useful external bytes | Fixed requests / external bytes | Budgeted requests / external bytes |
+| Cutoff | Postings bytes excluding gaps | Fixed requests / external bytes | Budgeted requests / external bytes |
 |---:|---:|---:|---:|
 | 0 | 50,089,825 | 378 / 596,950,546 | 185 / 743,579,954 |
 | 8 | 40,176,390 | 95 / 87,981,828 | 67 / 111,880,381 |
@@ -95,7 +100,7 @@ caching, show the effect of the inline cutoff. Each query gets its own allowance
 
 These are planned external-postings reads. They exclude dictionary reads,
 external positions, document retrieval, retries, and storage-specific request
-limits. They show cutoff sensitivity rather than a workload forecast. Request
+limits. They show how the cutoff affects these seven queries. Request
 overhead, throughput, concurrency, and caching determine the latency tradeoff.
 
 ## Cold dictionary costs

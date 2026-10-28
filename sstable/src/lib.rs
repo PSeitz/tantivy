@@ -5,7 +5,8 @@
 //! A `sstable` is a map of sorted `&[u8]` keys to values.
 //! The keys are encoded using incremental encoding.
 //!
-//! Values and keys are compressed using zstd with the default feature flag `zstd-compression`.
+//! With the `zstd-compression` feature, blocks use zstd when compression saves space.
+//! Blocks encoded in separate parts store payloads verbatim and apply this rule to metadata and keys.
 //!
 //! # Example
 //!
@@ -408,7 +409,7 @@ mod test {
 
     #[test]
     fn test_long_key_diff() {
-        let long_key = (0..1_024).map(|x| (x % 255) as u8).collect::<Vec<_>>();
+        let long_key = (0..3_000).map(|x| (x % 255) as u8).collect::<Vec<_>>();
         let long_key2 = (1..300).map(|x| (x % 255) as u8).collect::<Vec<_>>();
         let mut buffer = vec![];
         {
@@ -418,6 +419,7 @@ mod test {
             assert!(sstable_writer.insert(&long_key2[..], &()).is_ok());
             assert!(sstable_writer.finish().is_ok());
         }
+        assert_eq!(buffer[4], u8::from(cfg!(feature = "zstd-compression")));
         let buffer = OwnedBytes::new(buffer);
         let mut sstable_reader = VoidSSTable::reader(buffer);
         assert!(sstable_reader.advance().unwrap());

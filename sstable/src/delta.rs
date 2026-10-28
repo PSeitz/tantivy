@@ -125,24 +125,22 @@ where
         let start_offset = self.write.written_bytes() as usize;
 
         let buffer: &mut Vec<u8> = &mut self.stateless_buffer;
-        let uses_block_parts = self
+        let block_serialized_with_keys = self
             .value_writer
             .serialize_block_with_keys(&self.block, buffer)?;
-        if !uses_block_parts {
+        if !block_serialized_with_keys {
             self.value_writer.serialize_block(buffer);
-            self.value_writer.clear();
         }
 
         let block_len = buffer.len() + self.block.len();
 
-        if uses_block_parts {
+        if block_serialized_with_keys {
             let body_len = u32::try_from(buffer.len()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "block body exceeds u32 length")
             })?;
             self.write.write_all(&body_len.to_le_bytes())?;
             self.write.write_all(buffer)?;
             self.version = 4;
-            self.value_writer.clear();
         } else if cfg!(feature = "zstd-compression") && block_len > 2048 {
             #[cfg(feature = "zstd-compression")]
             {
@@ -175,6 +173,7 @@ where
         }
 
         let end_offset = self.write.written_bytes() as usize;
+        self.value_writer.clear();
         self.block.clear();
         buffer.clear();
         Ok(Some(start_offset..end_offset))

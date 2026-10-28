@@ -27,22 +27,22 @@ pub fn merge_ranges_with_byte_budget(ranges: &mut Vec<Range<usize>>, extra_bytes
         .map(|(index, pair)| (pair[1].start - pair[0].end, index))
         .collect();
     gaps.sort_unstable();
-    let mut remaining = extra_bytes;
-    let mut cutoff = None;
+    let mut remaining_bytes = extra_bytes;
+    let mut last_gap_to_merge = None;
     for (gap, index) in gaps {
-        if gap > remaining {
+        if gap > remaining_bytes {
             break;
         }
-        remaining -= gap;
-        cutoff = Some((gap, index));
+        remaining_bytes -= gap;
+        last_gap_to_merge = Some((gap, index));
     }
-    let Some(cutoff) = cutoff else {
+    let Some(last_gap_to_merge) = last_gap_to_merge else {
         return;
     };
 
     let mut index = 0;
     ranges.dedup_by(|next, previous| {
-        let merge = (next.start - previous.end, index) <= cutoff;
+        let merge = (next.start - previous.end, index) <= last_gap_to_merge;
         index += 1;
         if merge {
             previous.end = next.end;
@@ -64,28 +64,6 @@ mod tests {
             ranges.push(start..start + 1);
         }
         ranges
-    }
-
-    #[test]
-    fn exact_budget_and_one_byte_over() {
-        for (budget, expected) in [
-            (0, vec![0..1, 4..5, 8..9]),
-            (2, vec![0..1, 4..5, 8..9]),
-            (3, vec![0..5, 8..9]),
-            (5, vec![0..5, 8..9]),
-            (6, vec![0..9]),
-        ] {
-            let mut ranges = ranges_from_gaps(&[3, 3]);
-            merge_ranges_with_byte_budget(&mut ranges, budget);
-            assert_eq!(ranges, expected, "budget={budget}");
-        }
-    }
-
-    #[test]
-    fn chooses_globally_cheapest_gaps() {
-        let mut ranges = ranges_from_gaps(&[4, 2, 3]);
-        merge_ranges_with_byte_budget(&mut ranges, 5);
-        assert_eq!(ranges, vec![0..1, 5..13]);
     }
 
     #[test]

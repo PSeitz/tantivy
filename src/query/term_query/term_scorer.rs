@@ -1,6 +1,6 @@
 use crate::docset::DocSet;
 use crate::fieldnorm::FieldNormReader;
-use crate::postings::{BlockSegmentPostings, FreqReadingOption, Postings, SegmentPostings};
+use crate::postings::{BlockSegmentPostings, Postings, SegmentPostings};
 use crate::query::bm25::Bm25Weight;
 use crate::query::{Explanation, Scorer};
 use crate::{DocId, Score};
@@ -50,9 +50,8 @@ impl TermScorer {
         TermScorer::new(segment_postings, fieldnorm_reader, similarity_weight)
     }
 
-    /// See `FreqReadingOption`.
-    pub(crate) fn freq_reading_option(&self) -> FreqReadingOption {
-        self.postings.block_cursor.freq_reading_option()
+    pub(crate) fn reads_freqs(&self) -> bool {
+        self.postings.block_cursor.reads_freqs()
     }
 
     /// Returns the maximum score for the current block.

@@ -192,7 +192,9 @@ impl TermDictionary {
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A>
-    where A::State: Clone {
+    where
+        A::State: Clone,
+    {
         self.0.search(automaton)
     }
 
@@ -229,10 +231,14 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
         InnerTermDictBuilder::create(w).map(TermDictionaryBuilder)
     }
 
-    /// Creates a dictionary embedding lists of at most `max_inline_docs` documents.
-    /// Accepts 0 through 32. Zero disables embedding.
+    /// Creates a dictionary storing postings lists of at most `max_inline_docs`
+    /// documents inline.
+    /// Accepts 0 through 32. Zero disables inline postings.
     #[cfg(feature = "quickwit")]
-    pub fn create_with_max_inline_docs(w: W, max_inline_docs: u32) -> io::Result<Self> {
+    pub fn create_with_max_inline_docs(
+        w: W,
+        max_inline_docs: u32,
+    ) -> io::Result<Self> {
         Ok(Self(InnerTermDictBuilder::with_value_writer(
             w,
             termdict::TermInfoBlock::new(max_inline_docs)?,
@@ -243,34 +249,27 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     ///
     /// *Keys have to be inserted in order.*
     pub fn insert<K: AsRef<[u8]>>(&mut self, key_ref: K, value: &TermInfo) -> io::Result<()> {
-        if !cfg!(feature = "quickwit") && value.short_postings.is_some() {
+        if !cfg!(feature = "quickwit") && value.inline_postings.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "short postings require an SSTable",
+                "inline postings require an SSTable",
             ));
         }
         self.0.insert(key_ref, value)
     }
 
-    /// # Warning
-    /// Horribly dangerous internal API
-    ///
-    /// If used, it must be used by systematically alternating calls
-    /// to insert_key and insert_value.
-    ///
-    /// Prefer using `.insert(key, value)`
+    /// Inserts a term key. Follow each call with `insert_value` before inserting another key.
+    /// Prefer `insert(key, value)` to write both together.
     pub fn insert_key(&mut self, key: &[u8]) -> io::Result<()> {
         self.0.insert_key(key)
     }
 
-    /// # Warning
-    ///
-    /// Horribly dangerous internal API. See `.insert_key(...)`.
+    /// Inserts the term metadata for the preceding `insert_key` call.
     pub fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
-        if !cfg!(feature = "quickwit") && term_info.short_postings.is_some() {
+        if !cfg!(feature = "quickwit") && term_info.inline_postings.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "short postings require an SSTable",
+                "inline postings require an SSTable",
             ));
         }
         self.0.insert_value(term_info)

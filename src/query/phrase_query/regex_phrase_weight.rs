@@ -6,7 +6,7 @@ use tantivy_fst::Regex;
 use super::PhraseScorer;
 use crate::fieldnorm::FieldNormReader;
 use crate::index::SegmentReader;
-use crate::postings::{LoadedPostings, Postings, SegmentPostings, TermInfo};
+use crate::postings::{LoadedPostingsReader, Postings, SegmentPostings, TermInfo};
 use crate::query::bm25::Bm25Weight;
 use crate::query::explanation::does_not_match;
 use crate::query::union::{BitSetPostingUnion, SimpleUnion};
@@ -94,81 +94,44 @@ impl RegexPhraseWeight {
         )))
     }
 
-    /// Add all docs of the term to the docset
-    fn add_to_bitset(
-        inverted_index: &InvertedIndexReader,
-        term_info: &TermInfo,
-        doc_bitset: &mut BitSet,
-    ) -> crate::Result<()> {
-        let mut block_segment_postings = inverted_index
-            .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
-        loop {
-            let docs = block_segment_postings.docs();
-            if docs.is_empty() {
-                break;
-            }
-            for &doc in docs {
-                doc_bitset.insert(doc);
-            }
-            block_segment_postings.advance();
-        }
-        Ok(())
-    }
-
-    /// This function generates a union of document sets from multiple term information
-    /// (`TermInfo`).
-    ///
-    /// It uses bucketing based on term frequency to optimize query performance and memory usage.
-    /// The terms are divided into buckets based on their document frequency (the number of
-    /// documents they appear in).
+    /// Builds a union of postings, grouping terms by the number of documents containing them.
     ///
     /// ### Bucketing Strategy:
-    /// Once a bucket contains more than 512 terms, it is moved to the end of the list and replaced
+    /// Once a bucket contains 512 terms, it is moved to the end of the list and replaced
     /// with a new empty bucket.
     ///
     /// - **Sparse Term Buckets**: Terms with document frequency `< 100`.
     ///
     ///   Each sparse bucket contains:
-    ///   - A `BitSet` to efficiently track which document IDs are present in the bucket, which is
-    ///     used to drive the `DocSet`.
-    ///   - A `Vec<LoadedPostings>` to store the postings for each term in that bucket.
+    ///   - A `BitSet` of matching document IDs, used to drive the `DocSet`.
+    ///   - A `Vec<LoadedPostingsReader>` to read shared loaded postings arrays for each term.
     ///
     /// - **Other Term Buckets**:
     ///   - **Bucket 0**: Terms appearing in less than `0.1%` of documents.
     ///   - **Bucket 1**: Terms appearing in `0.1%` to `1%` of documents.
     ///   - **Bucket 2**: Terms appearing in `1%` to `10%` of documents.
-    ///   - **Bucket 3**: Terms appearing in more than `10%` of documents.
+    ///   - **Bucket 3**: Terms appearing in at least `10%` of documents.
     ///
     ///   Each bucket contains:
-    ///   - A `BitSet` to efficiently track which document IDs are present in the bucket.
+    ///   - A `BitSet` of matching document IDs.
     ///   - A `Vec<SegmentPostings>` to store the postings for each term in that bucket.
     ///
     /// ### Design Choices:
-    /// The main cost for a _unbucketed_ regex phrase query with a medium/high amount of terms is
-    /// the `append_positions_with_offset` from `Postings`.
-    /// We don't know which docsets hit, so we need to scan all of them to check if they contain the
-    /// docid.
-    /// The bucketing strategy groups less common DocSets together, so we can rule out the
-    /// whole docset group in many cases.
+    /// The bucket bitset identifies documents that occur in any of its postings lists.
+    /// When a document is absent from that bitset, position collection skips those lists.
     ///
     /// E.g. consider the phrase "th* world"
     /// It contains the term "the", which may occur in almost all documents.
     /// It may also contain 10_000s very rare terms like "theologian".
     ///
-    /// For very low-frequency terms (sparse terms), we use `LoadedPostings` and aggregate
-    /// their document IDs into a `BitSet`, which is more memory-efficient than using
-    /// `SegmentPostings`. E.g. 100_000 terms with SegmentPostings would consume 184MB.
-    /// `SegmentPostings` uses memory equivalent to 460 docids. The 100 docs limit should be
-    /// fine as long as a term doesn't have too many positions per doc.
+    /// Terms appearing in fewer than 100 documents use `LoadedPostingsReader` and share their
+    /// decoded postings. This avoids retaining block decoder buffers for each term.
+    /// Their document IDs are combined in a `BitSet`.
     ///
     /// ### Future Optimization:
-    /// A larger performance improvement would be an additional partitioning of the space
-    /// vertically of u16::MAX blocks, where we mark which docset ord has values in each block.
-    /// E.g. partitioning in a index with 5 million documents this would reduce the number of
-    /// docsets to scan to around 1/20 in the sparse term bucket where the terms only have a few
-    /// docs. For higher cardinality buckets this is irrelevant as they are in most blocks.
-    ///
-    /// Use Roaring Bitmaps for sparse terms. The full bitvec is main memory consumer currently.
+    /// Partitioning document IDs into ranges and tracking which postings lists intersect
+    /// each range could reduce the lists checked during position collection.
+    /// Roaring bitmaps could reduce bitset memory for buckets containing few documents.
     pub(crate) fn get_union_from_term_infos(
         term_infos: &[TermInfo],
         reader: &SegmentReader,
@@ -177,14 +140,14 @@ impl RegexPhraseWeight {
         let max_doc = reader.max_doc();
 
         // Buckets for sparse terms
-        let mut sparse_buckets: Vec<(BitSet, Vec<LoadedPostings>)> =
+        let mut sparse_buckets: Vec<(BitSet, Vec<LoadedPostingsReader>)> =
             vec![(BitSet::with_max_value(max_doc), Vec::new())];
 
         // Buckets for other terms based on document frequency percentages:
         // - Bucket 0: Terms appearing in less than 0.1% of documents
         // - Bucket 1: Terms appearing in 0.1% to 1% of documents
         // - Bucket 2: Terms appearing in 1% to 10% of documents
-        // - Bucket 3: Terms appearing in more than 10% of documents
+        // - Bucket 3: Terms appearing in at least 10% of documents
         let mut buckets: Vec<(BitSet, Vec<SegmentPostings>)> = (0..4)
             .map(|_| (BitSet::with_max_value(max_doc), Vec::new()))
             .collect();
@@ -196,14 +159,14 @@ impl RegexPhraseWeight {
 
             if num_docs < SPARSE_TERM_DOC_THRESHOLD {
                 let current_bucket = &mut sparse_buckets[0];
-                let docset = if let Some(data) = &term_info.short_postings {
-                    LoadedPostings::new(Arc::clone(data))
+                let docset = if let Some(postings) = &term_info.inline_postings {
+                    LoadedPostingsReader::new(Arc::clone(postings))
                 } else {
                     let mut term_posting = inverted_index.read_postings_from_terminfo(
                         term_info,
                         IndexRecordOption::WithFreqsAndPositions,
                     )?;
-                    LoadedPostings::load(&mut term_posting)
+                    LoadedPostingsReader::decode_remaining(&mut term_posting)
                 };
                 for &doc in docset.doc_ids() {
                     current_bucket.0.insert(doc);
@@ -232,12 +195,18 @@ impl RegexPhraseWeight {
                 };
                 let bucket = &mut buckets[bucket_index];
 
-                // Add term postings to the appropriate bucket
-                Self::add_to_bitset(inverted_index, term_info, &mut bucket.0)?;
-                bucket.1.push(inverted_index.read_postings_from_terminfo(
+                let postings = inverted_index.read_postings_from_terminfo(
                     term_info,
                     IndexRecordOption::WithFreqsAndPositions,
-                )?);
+                )?;
+                let mut blocks = postings.block_cursor.clone();
+                while !blocks.docs().is_empty() {
+                    for &doc in blocks.docs() {
+                        bucket.0.insert(doc);
+                    }
+                    blocks.advance();
+                }
+                bucket.1.push(postings);
 
                 // Move the bucket to the end if the term limit is reached
                 if bucket.1.len() == 512 {

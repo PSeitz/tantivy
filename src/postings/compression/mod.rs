@@ -100,8 +100,8 @@ impl BlockDecoder {
 
     /// Initializes a partial block from decoded values and pads the remaining entries.
     pub(crate) fn set_values(&mut self, values: &[u32], padding: u32) {
-        self.output.fill(padding);
         self.output[..values.len()].copy_from_slice(values);
+        self.output[values.len()..].fill(padding);
         self.output_len = values.len();
     }
 

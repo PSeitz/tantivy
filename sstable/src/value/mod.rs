@@ -11,17 +11,16 @@ pub use u64_monotonic::{U64MonotonicValueReader, U64MonotonicValueWriter};
 pub use vec_u32::{VecU32ValueReader, VecU32ValueWriter};
 pub use void::{VoidValueReader, VoidValueWriter};
 
-/// `ValueReader` is a trait describing the contract of something
-/// reading blocks of value, and offering random access within this values.
+/// Reads blocks of values and provides random access within each block.
 pub trait ValueReader: Default {
     /// Type of the value being read.
     type Value;
 
-    /// Access the value at index `idx`, in the last block that was read
-    /// via a call to `ValueReader::read`.
+    /// Returns the value at index `idx` in the block most recently loaded by [`Self::load`].
     fn value(&self, idx: usize) -> &Self::Value;
 
-    /// Applies a dictionary's value-format parameter. Ignored by readers without configuration.
+    /// Applies a dictionary's value-format parameter, whose meaning is defined by the reader.
+    /// The default implementation accepts any parameter and keeps the reader unchanged.
     fn configure(&mut self, _config: u8) -> io::Result<()> {
         Ok(())
     }
@@ -32,21 +31,19 @@ pub trait ValueReader: Default {
     fn load(&mut self, data: &[u8]) -> io::Result<usize>;
 }
 
-/// `ValueWriter` is a trait to make it possible to write blocks
-/// of value.
+/// Writes blocks of values.
 pub trait ValueWriter: Default {
     /// Type of the value being written.
     type Value;
 
-    /// Records a new value.
-    /// This method usually just accumulates data in a `Vec`,
-    /// only to be serialized on the call to `ValueWriter::serialize_block`.
+    /// Accumulates a value for the next call to [`Self::serialize_block`]
+    /// or [`Self::serialize_block_with_keys`].
     fn write(&mut self, val: &Self::Value);
 
     /// Serializes the accumulated values into the output buffer.
     fn serialize_block(&self, output: &mut Vec<u8>);
 
-    /// Optionally serializes a block body containing values, keys, and its encoding flag.
+    /// Optionally serializes a block body containing an encoding flag, values, and keys.
     ///
     /// Returns `true` when `buffer` contains the body to write. Returning `false`
     /// leaves `buffer` unchanged and lets the caller combine `serialize_block` output with keys.

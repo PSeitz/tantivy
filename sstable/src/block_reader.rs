@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 use std::ops::Range;
 
 use common::OwnedBytes;
@@ -101,12 +101,14 @@ impl BlockReader {
                     "failed to read block content",
                 ));
             }
-            let compress = self.reader.read_u8();
+            let encoding_flag = self.reader.read_u8();
             let block_len = block_len - 1;
-            if compress == 2 {
-                crate::block_parts::decode_block_parts(&self.reader[..block_len], &mut self.buffer)?;
-                self.reader.advance(block_len);
-            } else if compress == 1 {
+            if encoding_flag == 2 {
+                crate::block_parts::decode_block_parts(
+                    &self.reader[..block_len],
+                    &mut self.buffer,
+                )?;
+            } else if encoding_flag == 1 {
                 #[cfg(feature = "zstd-compression")]
                 {
                     let required_capacity =
@@ -114,8 +116,6 @@ impl BlockReader {
                     self.buffer.reserve(required_capacity);
                     Decompressor::new()?
                         .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
-
-                    self.reader.advance(block_len);
                 }
 
                 if cfg!(not(feature = "zstd-compression")) {
@@ -124,9 +124,8 @@ impl BlockReader {
                         "zstd-compression feature is not enabled",
                     ));
                 }
-            } else if compress == 0 {
-                self.buffer.resize(block_len, 0u8);
-                self.reader.read_exact(&mut self.buffer[..])?;
+            } else if encoding_flag == 0 {
+                self.buffer.extend_from_slice(&self.reader[..block_len]);
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -134,6 +133,7 @@ impl BlockReader {
                 ));
             }
 
+            self.reader.advance(block_len);
             return Ok(true);
         }
     }
