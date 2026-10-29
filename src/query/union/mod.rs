@@ -50,8 +50,10 @@ mod tests {
         ))
     }
     fn simple_union_from_docs_list(docs_list: &[Vec<DocId>]) -> Box<dyn DocSet> {
+        let num_docs = docs_list.iter().flatten().max().map_or(0, |doc| doc + 1);
         Box::new(SimpleUnion::build(
             vec_doc_set_from_docs_list(docs_list).collect::<Vec<VecDocSet>>(),
+            num_docs,
         ))
     }
 
@@ -75,7 +77,7 @@ mod tests {
     fn assert_scored_simple_union_parity<TScoreCombiner: ScoreCombiner>(
         make_combiner: impl Fn() -> TScoreCombiner,
     ) {
-        let simple = SimpleUnion::build_scored(scored_docsets(), &make_combiner);
+        let simple = SimpleUnion::build_scored(scored_docsets(), &make_combiner, 10);
         let buffered = BufferedUnionScorer::build(scored_docsets(), &make_combiner, 10);
         assert_eq!(collect_scored(simple), collect_scored(buffered));
     }

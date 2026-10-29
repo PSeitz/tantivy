@@ -145,7 +145,11 @@ fn build_union<TScoreCombiner: ScoreCombiner>(
         return SpecializedScorer::TermUnion { scorers, strategy };
     }
     let scorer: Box<dyn Scorer> = match strategy {
-        UnionStrategy::Simple => Box::new(SimpleUnion::build_scored(scorers, score_combiner_fn)),
+        UnionStrategy::Simple => Box::new(SimpleUnion::build_scored(
+            scorers,
+            score_combiner_fn,
+            num_docs,
+        )),
         UnionStrategy::Buffered => Box::new(BufferedUnionScorer::build(
             scorers,
             score_combiner_fn,
@@ -162,7 +166,11 @@ fn term_union_scorer<TScoreCombiner: ScoreCombiner>(
     num_docs: u32,
 ) -> Box<dyn Scorer> {
     match strategy {
-        UnionStrategy::Simple => Box::new(SimpleUnion::build_scored(scorers, score_combiner_fn)),
+        UnionStrategy::Simple => Box::new(SimpleUnion::build_scored(
+            scorers,
+            score_combiner_fn,
+            num_docs,
+        )),
         UnionStrategy::Buffered => Box::new(BufferedUnionScorer::build(
             scorers,
             score_combiner_fn,
@@ -738,7 +746,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             SpecializedScorer::TermUnion { scorers, strategy } => match strategy {
                 UnionStrategy::Simple => {
                     let mut union_scorer =
-                        SimpleUnion::build_scored(scorers, &self.score_combiner_fn);
+                        SimpleUnion::build_scored(scorers, &self.score_combiner_fn, num_docs);
                     for_each_scorer_scored_block(&mut union_scorer, callback);
                 }
                 UnionStrategy::Buffered => {
@@ -771,7 +779,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             SpecializedScorer::TermUnion { scorers, strategy } => match strategy {
                 UnionStrategy::Simple => {
                     let mut union_scorer =
-                        SimpleUnion::build_scored(scorers, &self.score_combiner_fn);
+                        SimpleUnion::build_scored(scorers, &self.score_combiner_fn, num_docs);
                     for_each_scorer_scored_block(&mut union_scorer, &mut |docs, scores| {
                         consumer.consume(ScoredBatch::Sparse { docs, scores })
                     });
@@ -962,6 +970,45 @@ mod tests {
                 super::UnionStrategy::Simple,
             );
         }
+    }
+
+    #[test]
+    fn test_nested_union_density() {
+        use super::SimpleUnion;
+        use crate::query::{BufferedUnionScorer, ConstScorer, Scorer, SumCombiner, VecDocSet};
+
+        let num_docs = 10_000;
+        let groups = (0..8)
+            .map(|group| {
+                let terms = (0..8)
+                    .map(|term| {
+                        let start = (group * 8 + term) * 40;
+                        Box::new(ConstScorer::new(
+                            VecDocSet::from((start..start + 40).collect::<Vec<_>>()),
+                            1.0,
+                        )) as Box<dyn Scorer>
+                    })
+                    .collect();
+                let inner = super::into_box_scorer(
+                    super::scorer_union(terms, SumCombiner::default, num_docs, None),
+                    SumCombiner::default,
+                    num_docs,
+                );
+                assert!(inner.is::<SimpleUnion<Box<dyn Scorer>, SumCombiner>>());
+                assert_eq!(
+                    inner.size_hint(),
+                    super::estimate_union([40; 8].into_iter(), num_docs)
+                );
+                inner
+            })
+            .collect();
+        let mut outer = super::into_box_scorer(
+            super::scorer_union(groups, SumCombiner::default, num_docs, None),
+            SumCombiner::default,
+            num_docs,
+        );
+        assert!(outer.is::<BufferedUnionScorer<Box<dyn Scorer>, SumCombiner>>());
+        assert_eq!(outer.count_including_deleted(), 2_560);
     }
 
     #[test]
