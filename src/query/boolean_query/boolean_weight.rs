@@ -44,6 +44,7 @@ impl SpecializedScorer {
 
 const SPARSE_UNION_HORIZON: u64 = 4_096;
 const SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON: u64 = 128;
+const UNSCORED_ITERATION_MAX_EXPECTED_HITS_PER_HORIZON: u64 = 64;
 // SimpleUnion scans every child for each hit, even at low match density.
 const SIMPLE_UNION_MAX_CLAUSES: usize = 8;
 
@@ -51,12 +52,13 @@ fn union_strategy_for_estimated_hits(
     estimated_hits: u32,
     num_docs: u32,
     num_clauses: usize,
+    max_hits_per_horizon: u64,
 ) -> UnionStrategy {
     if num_docs == 0 || num_clauses > SIMPLE_UNION_MAX_CLAUSES {
         return UnionStrategy::Buffered;
     }
     if u64::from(estimated_hits) * SPARSE_UNION_HORIZON
-        <= u64::from(num_docs) * SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON
+        <= u64::from(num_docs) * max_hits_per_horizon
     {
         UnionStrategy::Simple
     } else {
@@ -126,7 +128,12 @@ where
                 as u32
         })
         .unwrap_or(union_estimated_hits);
-    let strategy = union_strategy_for_estimated_hits(estimated_hits, num_docs, scorers.len());
+    let strategy = union_strategy_for_estimated_hits(
+        estimated_hits,
+        num_docs,
+        scorers.len(),
+        SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON,
+    );
     build_union(scorers, score_combiner_fn, num_docs, strategy)
 }
 
@@ -775,9 +782,27 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
 
         match scorer {
             SpecializedScorer::TermUnion { scorers, .. } => {
-                let mut union_scorer =
-                    BufferedUnionScorer::build(scorers, DoNothingCombiner::default, num_docs);
-                for_each_docset_buffered(&mut union_scorer, &mut buffer, callback);
+                let estimated_hits =
+                    estimate_union(scorers.iter().map(DocSet::size_hint), num_docs);
+                match union_strategy_for_estimated_hits(
+                    estimated_hits,
+                    num_docs,
+                    scorers.len(),
+                    UNSCORED_ITERATION_MAX_EXPECTED_HITS_PER_HORIZON,
+                ) {
+                    UnionStrategy::Simple => {
+                        let mut union = SimpleUnion::build(scorers, num_docs);
+                        for_each_docset_buffered(&mut union, &mut buffer, callback);
+                    }
+                    UnionStrategy::Buffered => {
+                        let mut union = BufferedUnionScorer::build(
+                            scorers,
+                            DoNothingCombiner::default,
+                            num_docs,
+                        );
+                        for_each_docset_buffered(&mut union, &mut buffer, callback);
+                    }
+                }
             }
             SpecializedScorer::TermIntersection(term_scorers) => {
                 let boxed_scorers: Vec<Box<dyn Scorer>> = term_scorers
