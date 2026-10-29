@@ -93,7 +93,7 @@ pub struct TestFruit {
 }
 
 impl TestFruit {
-    /// Returns the collected document addresses.
+    /// Return the list of matching documents exhaustively.
     pub fn docs(&self) -> &[DocAddress] {
         &self.docs[..]
     }

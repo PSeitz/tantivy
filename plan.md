@@ -192,7 +192,7 @@ then, use a looser safe global term bound or perform exact scoring.
   only dense execution through wide match masks and score arrays.
 - [x] Keep buffered dense unions on their 4,096-document horizon and copy dense
   sum-score windows directly to the caller. Avoid a per-match score scatter.
-- [x] Collect all matches with exact scores through aligned document/score batches.
+- [x] Route exhaustive exact collection through aligned document/score batches.
   Keep Count on non-scoring paths and score-only TopDocs on Block-WAND/BMW.
 - [x] Delete deferred score-selection methods, lifecycle state, buffers, tests,
   and terminology once all implementations are eager.

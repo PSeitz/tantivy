@@ -16,13 +16,13 @@ pub trait ScoreCombiner: Default + Clone + Send + Copy + 'static {
     /// Whether this combiner needs child scores while merging matches.
     const REQUIRES_SCORING: bool;
 
-    /// Whether child scores can be combined directly in the dense output score buffer.
+    /// Whether an exhaustive dense window can use its output scores as the native accumulator.
     ///
-    /// Combining scores must require only a `Score` value per document.
+    /// This is intentionally limited to combiners whose complete state is one `Score` value.
     #[doc(hidden)]
     const ACCUMULATES_IN_DENSE_OUTPUT: bool = false;
 
-    /// Combines a child score with the score in the dense output buffer.
+    /// Adds one child score directly to a dense output accumulator.
     ///
     /// Callers may invoke this only when [`Self::ACCUMULATES_IN_DENSE_OUTPUT`] is true.
     #[doc(hidden)]

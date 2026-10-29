@@ -449,7 +449,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             .minimum_number_should_match
             .saturating_sub(should_special_scorer_counts.num_all_scorers);
 
-        // MUST scorers can seek past SHOULD matches that fail a MUST clause.
+        // MUST clauses can seek through the SHOULD union even during exhaustive collection.
         let iterate_all_should_matches = iterate_all_matches && must_scorers.is_empty();
         let should_scorers: ShouldScorersCombinationMethod = {
             let num_of_should_scorers = should_scorers.len();
@@ -497,8 +497,8 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 let combined_all_scorer_count = must_special_scorer_counts.num_all_scorers
                     + should_special_scorer_counts.num_all_scorers;
 
-                // Keep concrete term scorers for scoring all matches and for
-                // intersection Block-WAND when frequencies are available.
+                // Retain concrete term scorers for specialized exhaustive scoring and,
+                // when frequencies are available, intersection Block-WAND.
                 if combined_all_scorer_count == 0
                     && must_scorers.len() >= 2
                     && must_scorers.iter().all(|s| s.is::<TermScorer>())
