@@ -48,7 +48,10 @@ mod streamer;
 pub mod value;
 
 mod index;
+mod pruning;
 pub use index::{BlockAddr, SSTableIndex, SSTableIndexBuilder};
+use pruning::PruningBuilder;
+pub use pruning::PruningOptions;
 pub(crate) mod vint;
 pub use common::{KeyTracking, WithoutKeys};
 pub use dictionary::{Dictionary, TermOrdHit};
@@ -216,14 +219,19 @@ impl<TValueReader> AsRef<[u8]> for Reader<TValueReader> {
     }
 }
 
+type TermWeight<V> = Box<dyn FnMut(&V) -> u64 + Send + Sync>;
+
 pub struct Writer<W, TValueWriter>
-where W: io::Write
+where
+    W: io::Write,
+    TValueWriter: ValueWriter,
 {
     previous_key: Vec<u8>,
     index_builder: SSTableIndexBuilder,
     delta_writer: DeltaWriter<W, TValueWriter>,
     num_terms: u64,
     first_ordinal_of_the_block: u64,
+    pruning: Option<(PruningBuilder, TermWeight<TValueWriter::Value>)>,
 }
 
 impl<W, TValueWriter> Writer<W, TValueWriter>
@@ -247,7 +255,31 @@ where
             index_builder: SSTableIndexBuilder::default(),
             delta_writer: DeltaWriter::new(wrt),
             first_ordinal_of_the_block: 0u64,
+            pruning: None,
         }
+    }
+
+    /// Enables embedded literal block pruning. Call before inserting any terms.
+    ///
+    /// `weight` is called once per value. Its result is summed once per distinct
+    /// trigram in the full key, for example `|info| u64::from(info.doc_freq)`.
+    /// Scores are priorities, not distinct-document counts. Overflow is an error.
+    /// If the budget cannot fit prefixes and byte fallback, no section is written.
+    /// Readers must explicitly call [`Dictionary::load_pruning`] to use it.
+    pub fn enable_pruning(
+        &mut self,
+        options: PruningOptions,
+        weight: impl FnMut(&TValueWriter::Value) -> u64 + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        options.validate()?;
+        if self.num_terms != 0 || !self.previous_key.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "enable pruning before inserting terms",
+            ));
+        }
+        self.pruning = Some((PruningBuilder::new(options), Box::new(weight)));
+        Ok(())
     }
 
     /// Set the target block length.
@@ -318,6 +350,9 @@ where
     #[doc(hidden)]
     #[inline]
     pub fn insert_value(&mut self, value: &TValueWriter::Value) -> io::Result<()> {
+        if let Some((pruning, weight)) = &mut self.pruning {
+            pruning.insert(&self.previous_key, weight(value))?;
+        }
         self.delta_writer.write_value(value);
         self.num_terms += 1u64;
         self.flush_block_if_required()
@@ -325,6 +360,9 @@ where
 
     pub fn flush_block_if_required(&mut self) -> io::Result<()> {
         if let Some(byte_range) = self.delta_writer.flush_block_if_required()? {
+            if let Some((pruning, _)) = &mut self.pruning {
+                pruning.flush_block()?;
+            }
             self.index_builder.add_block(
                 &self.previous_key[..],
                 byte_range,
@@ -353,10 +391,22 @@ where
 
         let fst_len: u64 = self.index_builder.serialize(&mut wrt)?;
         wrt.write_all(&fst_len.to_le_bytes())?;
+        let pruning_bytes = match self.pruning {
+            Some((pruning, _)) => pruning.finish()?,
+            None => Vec::new(),
+        };
+        let version = if pruning_bytes.is_empty() {
+            SSTABLE_VERSION
+        } else {
+            let pruning_offset = wrt.written_bytes();
+            wrt.write_all(&pruning_bytes)?;
+            wrt.write_all(&pruning_offset.to_le_bytes())?;
+            4
+        };
         wrt.write_all(&offset.to_le_bytes())?;
         wrt.write_all(&self.num_terms.to_le_bytes())?;
 
-        SSTABLE_VERSION.serialize(&mut wrt)?;
+        version.serialize(&mut wrt)?;
 
         let wrt = wrt.finish();
         Ok(wrt.into_inner()?)

@@ -39,6 +39,8 @@ use std::io;
 use common::file_slice::FileSlice;
 use common::BinarySerializable;
 pub use common::{KeyTracking, WithoutKeys};
+#[cfg(feature = "quickwit")]
+pub use sstable::PruningOptions;
 use tantivy_fst::Automaton;
 
 use self::termdict::{
@@ -158,6 +160,13 @@ impl TermDictionary {
     }
 
     #[cfg(feature = "quickwit")]
+    /// Loads optional SSTable block pruning metadata. Returns false when absent.
+    /// Ordinary opens leave this section unloaded.
+    pub fn load_pruning(&mut self) -> io::Result<bool> {
+        self.0.load_pruning()
+    }
+
+    #[cfg(feature = "quickwit")]
     /// Lookups the value corresponding to the key.
     pub async fn get_async<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermInfo>> {
         self.0.get_async(key).await
@@ -185,6 +194,17 @@ impl TermDictionary {
 pub struct TermDictionaryBuilder<W: io::Write>(InnerTermDictBuilder<W>);
 
 impl<W: io::Write> TermDictionaryBuilder<W> {
+    #[cfg(feature = "quickwit")]
+    /// Enables optional SSTable block pruning before any terms are inserted.
+    /// Use `|info| u64::from(info.doc_freq)` to rank trigrams by summed term document frequency.
+    pub fn enable_pruning(
+        &mut self,
+        options: PruningOptions,
+        weight: impl FnMut(&TermInfo) -> u64 + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        self.0.enable_pruning(options, weight)
+    }
+
     /// Creates a new `TermDictionaryBuilder`
     pub fn create(w: W) -> io::Result<Self> {
         InnerTermDictBuilder::create(w).map(TermDictionaryBuilder)

@@ -16,6 +16,34 @@ fn make_term_info(term_ord: u64) -> TermInfo {
     }
 }
 
+#[cfg(feature = "quickwit")]
+#[test]
+fn test_term_dictionary_pruning() -> crate::Result<()> {
+    let mut builder = TermDictionaryBuilder::create(Vec::new())?;
+    builder.enable_pruning(
+        super::PruningOptions {
+            budget_bytes: 10_000,
+            max_block_presence: 1.0,
+            max_blocks_per_trigram: 1_024,
+        },
+        |info| u64::from(info.doc_freq),
+    )?;
+    builder.insert(b"abcde", &make_term_info(1))?;
+    builder.insert(b"abcxy", &make_term_info(2))?;
+    let mut dict = TermDictionary::open(FileSlice::from(builder.finish()?))?;
+    assert!(dict.load_pruning()?);
+    let mut stream = dict
+        .search(tantivy_fst::Regex::new(".*bcd.*").unwrap())
+        .prune_with_substring("bcd")
+        .into_stream()?;
+    assert!(stream.advance());
+    assert_eq!(stream.key(), b"abcde");
+    assert_eq!(stream.value(), &make_term_info(1));
+    assert!(!stream.advance());
+    assert!(!TermDictionary::empty().load_pruning()?);
+    Ok(())
+}
+
 #[test]
 fn test_empty_term_dictionary() {
     let empty = TermDictionary::empty();

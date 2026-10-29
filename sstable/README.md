@@ -98,7 +98,7 @@ Note: as the SSTable does not support redundant keys, there is no ambiguity betw
 - StoreOffset(u64): Offset to start of the BlockAddrStore. If zero, see the SingleBlockSStable section
 - IndexOffset(u64): Offset to the start of the SSTFooter
 - NumTerm(u64): number of terms in the sstable
-- Version(u32): Currently equal to 3
+- Version(u32): 3 for ordinary tables, 4 when an embedded pruning section is present
 
 ### Fst
 
@@ -149,6 +149,101 @@ The same computation can be done for ordinal.
 
 Note that `range_derivation` can take negative value. `RangeStartDelta` is just its translation to a positive range.
 
+
+## Optional literal block pruning
+
+Pruning is disabled by default. Enable it before insertion, choosing a serialized
+byte budget, a maximum block-presence fraction, and a maximum block count per trigram:
+
+```rust
+use common::OwnedBytes;
+use tantivy_sstable::{Dictionary, MonotonicU64SSTable, PruningOptions};
+
+let mut writer = Dictionary::<MonotonicU64SSTable>::builder(Vec::new())?;
+writer.enable_pruning(
+    PruningOptions {
+        budget_bytes: 200_000,
+        max_block_presence: 0.2,
+        max_blocks_per_trigram: 1_024,
+    },
+    |value| *value,
+)?;
+writer.insert(b"player", &42)?;
+let mut dictionary = Dictionary::<MonotonicU64SSTable>::from_bytes(
+    OwnedBytes::new(writer.finish()?),
+)?;
+dictionary.load_pruning()?;
+let mut stream = dictionary
+    .search(tantivy_fst::Regex::new(".*player.*").unwrap())
+    .prune_with_substring(b"player")
+    .into_stream()?;
+# Ok::<(), std::io::Error>(())
+```
+
+Choose these limits for the dictionary and queries being indexed. With Tantivy's
+`quickwit` feature, `TermDictionaryBuilder::enable_pruning` and
+`TermDictionary::load_pruning` forward these operations. A term-info callback can
+use `|info| u64::from(info.doc_freq)`.
+
+The callback supplies a score per inserted value. Each distinct trigram in the
+**full term** receives that score once. Scores are summed with checked `u64`
+arithmetic. They rank trigrams and can exceed the document count.
+
+When a block is flushed, the builder removes its longest common prefix from each
+term and collects the block ID for each byte and trigram in the remainders. Once a
+trigram occurs in more than `max_blocks_per_trigram` blocks, the builder frees its
+block-ID vector and stores `None` to stop collection for that trigram. The limit is
+an absolute count, independent of the final block count. Zero skips collection for
+all trigrams; `usize::MAX` disables the collection cap. Skipped trigrams remain
+unknown during queries, preserving correctness while potentially reducing pruning
+effectiveness. Collection continues for every byte. At finish, trigrams above the
+configured block-presence fraction are excluded. The remaining trigrams are
+considered by descending score, then ascending numeric key. Each encoded block-ID
+list is included if it fits the budget, otherwise selection continues with the
+next trigram.
+
+`prune_with_substring` is a **required-substring hint**. Every term accepted by the
+automaton must contain those case-sensitive raw bytes. The caller supplies this
+guarantee. An incorrect hint can exclude valid results. The automaton still checks
+exact matches, and an absent or unloaded section leaves search behavior unchanged.
+Prefix-contained matches and prefix-crossing continuations are handled
+conservatively. Missing trigram block-ID lists mean unknown. Trigram lookups are
+prepared per query, and blocks are pruned before read coalescing. Coalescing can still read across
+rejected gaps. Always-matching automata retain the existing limited range-read path.
+
+### Version 4 layout and budget
+
+Version 4 keeps the data blocks and ordinary v3 index encoding unchanged:
+
+```text
+Blocks | EmptyBlock | Fst | BlockAddrStore | StoreOffset
+       | PruningSection | PruningOffset | IndexOffset | NumTerm | Version=4
+```
+
+`PruningOffset` is an absolute `u64` offset. The final 20 bytes retain their existing
+field positions. Ordinary open reads the extra offset and the ordinary index,
+without reading pruning bytes. `load_pruning` reads and validates the section once.
+Clones made after loading share it. The reader also accepts versions 2 and 3.
+Older readers cannot open version 4 files.
+
+The `BP01` section stores each block's longest common prefix, block-ID lists for
+all 256 bytes, and selected trigram block-ID lists. Each list chooses the smallest
+of fixed-width IDs, delta varints, runs, and a bitmap, using IDs of blocks where the
+byte or trigram is present or absent. Lists are independently addressable. The
+encodings are implemented in this crate. The section format is documented in
+`src/pruning.rs` and `src/pruning/codec.rs`.
+
+The budget charges the entire section and the additional eight-byte footer field.
+If the prefixes and byte block-ID lists do not fit, the writer emits the ordinary
+v3 format. Counts, lengths, and section offsets are limited to `u32`.
+
+**The serialized budget applies to file size.** During construction, the builder
+keeps trigram scores, retained block-ID vectors, map entries for discarded trigrams,
+block prefixes, and current-block keys. The collection cap limits each trigram
+vector's length. Total memory also includes spare vector capacity and these other
+allocations. Prefixes are stored as bytes. Encoding a block-ID list also constructs
+the IDs of blocks where its byte or trigram is absent. These allocations can make
+construction expensive for large dictionaries.
 
 ## SingleBlockSStable
 

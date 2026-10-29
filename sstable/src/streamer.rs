@@ -25,6 +25,7 @@ where
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
     limit: Option<u64>,
+    pruning_literal: Option<Vec<u8>>,
     _key_tracking: PhantomData<K>,
 }
 
@@ -81,6 +82,7 @@ where
             lower: Bound::Unbounded,
             upper: Bound::Unbounded,
             limit: None,
+            pruning_literal: None,
             _key_tracking: PhantomData,
         }
     }
@@ -93,6 +95,7 @@ where
             lower: self.lower,
             upper: self.upper,
             limit: self.limit,
+            pruning_literal: self.pruning_literal,
             _key_tracking: PhantomData,
         }
     }
@@ -139,13 +142,28 @@ where
         self
     }
 
+    /// Adds a case-sensitive raw-byte substring hint for block pruning.
+    ///
+    /// Every term accepted by the automaton must contain `literal`. The caller
+    /// supplies this guarantee. An incorrect hint can exclude matching terms.
+    /// This only filters candidate blocks. Exact matching remains the automaton's
+    /// responsibility, and an absent or unloaded pruning section has no effect.
+    pub fn prune_with_substring(mut self, literal: impl AsRef<[u8]>) -> Self {
+        self.pruning_literal = Some(literal.as_ref().to_vec());
+        self
+    }
+
     fn delta_reader(&self) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let key_range = (
             bound_as_byte_slice(&self.lower),
             bound_as_byte_slice(&self.upper),
         );
-        self.term_dict
-            .sstable_delta_reader_for_key_range(key_range, self.limit, &self.automaton)
+        self.term_dict.sstable_delta_reader_for_key_range(
+            key_range,
+            self.limit,
+            &self.automaton,
+            self.pruning_literal.as_deref(),
+        )
     }
 
     async fn delta_reader_async(
@@ -161,6 +179,7 @@ where
                 key_range,
                 self.limit,
                 &self.automaton,
+                self.pruning_literal.as_deref(),
                 merge_holes_under_bytes,
             )
             .await

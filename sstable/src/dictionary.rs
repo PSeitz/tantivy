@@ -15,6 +15,7 @@ use tantivy_fst::Automaton;
 use tantivy_fst::automaton::AlwaysMatch;
 
 use crate::delta::DeltaKeyComparator;
+use crate::pruning::BlockPruning;
 use crate::streamer::{Streamer, StreamerBuilder};
 use crate::{BlockAddr, DeltaReader, Reader, SSTable, SSTableIndex, TermOrdinal, VoidSSTable};
 
@@ -43,6 +44,8 @@ pub struct Dictionary<TSSTable: SSTable = VoidSSTable> {
     pub sstable_index: SSTableIndex,
     num_bytes: ByteCount,
     num_terms: u64,
+    pruning_slice: Option<FileSlice>,
+    pruning: Option<Arc<BlockPruning>>,
     phantom_data: PhantomData<TSSTable>,
 }
 
@@ -102,6 +105,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
         automaton: &impl Automaton,
+        literal: Option<&[u8]>,
         merge_holes_under_bytes: usize,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
@@ -113,6 +117,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             let blocks = stream::iter(self.get_block_iterator_for_range_and_automaton(
                 key_range,
                 automaton,
+                literal,
                 merge_holes_under_bytes,
             ));
             let data = blocks
@@ -138,6 +143,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
         automaton: &impl Automaton,
+        literal: Option<&[u8]>,
     ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let match_all = automaton.will_always_match(&automaton.start());
         if match_all {
@@ -147,7 +153,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         } else {
             // if operations are sync, we assume latency is almost null, and there is no point in
             // merging across holes
-            let blocks = self.get_block_iterator_for_range_and_automaton(key_range, automaton, 0);
+            let blocks =
+                self.get_block_iterator_for_range_and_automaton(key_range, automaton, literal, 0);
             let data = blocks
                 .map(|block_addr| {
                     let first_ordinal = block_addr.first_ordinal;
@@ -254,6 +261,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &'a self,
         key_range: impl RangeBounds<[u8]>,
         automaton: &'a impl Automaton,
+        literal: Option<&'a [u8]>,
         merge_holes_under_bytes: usize,
     ) -> impl Iterator<Item = BlockAddr> + 'a {
         let lower_bound = match key_range.start_bound() {
@@ -270,9 +278,19 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
             Bound::Unbounded => u64::MAX,
         };
         let block_range = lower_bound..=upper_bound;
+        let pruning = self
+            .pruning
+            .as_ref()
+            .zip(literal)
+            .map(|(pruning, literal)| pruning.prepare(literal));
         self.sstable_index
             .get_block_for_automaton(automaton)
-            .filter(move |(block_id, _)| block_range.contains(block_id))
+            .filter(move |(block_id, _)| {
+                block_range.contains(block_id)
+                    && pruning
+                        .as_ref()
+                        .is_none_or(|query| query.permits(*block_id))
+            })
             .map(|(_, block_addr)| block_addr)
             .coalesce(move |first, second| {
                 if first.byte_range.end + merge_holes_under_bytes >= second.byte_range.start {
@@ -289,23 +307,78 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
         let num_bytes = term_dictionary_file.num_bytes();
+        if num_bytes < 20 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated SSTable footer",
+            ));
+        }
         let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
         let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
         let version = u32::deserialize(&mut footer_len_bytes)?;
+        let (main_slice, pruning_slice, index_version) = if version == 4 {
+            if main_slice.num_bytes() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated pruning footer",
+                ));
+            }
+            let (main_slice, pruning_footer) = main_slice.split_from_end(8);
+            let pruning_offset = u64::deserialize(&mut pruning_footer.read_bytes()?)?;
+            if pruning_offset < index_offset || pruning_offset > main_slice.num_bytes().get_bytes()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid pruning offset",
+                ));
+            }
+            let (main_slice, pruning_slice) = main_slice.split(pruning_offset as usize);
+            (main_slice, Some(pruning_slice), 3)
+        } else {
+            (main_slice, None, version)
+        };
+        if index_offset > main_slice.num_bytes().get_bytes()
+            || (index_version == 3 && main_slice.num_bytes().get_bytes() - index_offset < 8)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid SSTable index offset",
+            ));
+        }
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
         let sstable_index_bytes = index_slice.read_bytes()?;
 
-        let sstable_index = SSTableIndex::open(version, index_offset, sstable_index_bytes)?;
+        let sstable_index = SSTableIndex::open(index_version, index_offset, sstable_index_bytes)?;
 
         Ok(Dictionary {
             sstable_slice,
             sstable_index,
             num_bytes,
             num_terms,
+            pruning_slice,
+            pruning: None,
             phantom_data: PhantomData,
         })
+    }
+
+    /// Loads the optional embedded pruning section. Ordinary opens never read it.
+    /// Returns whether this SSTable contains pruning metadata. Repeated calls are free.
+    /// Clones made after loading share the loaded metadata.
+    pub fn load_pruning(&mut self) -> io::Result<bool> {
+        if self.pruning.is_none() {
+            let Some(slice) = &self.pruning_slice else {
+                return Ok(false);
+            };
+            let blocks = if self.num_terms == 0 {
+                0
+            } else {
+                self.sstable_index.locate_with_ord(self.num_terms - 1) as usize + 1
+            };
+            self.pruning = Some(Arc::new(BlockPruning::open(slice.read_bytes()?, blocks)?));
+        }
+        Ok(true)
     }
 
     /// Creates a term dictionary from the supplied bytes.
