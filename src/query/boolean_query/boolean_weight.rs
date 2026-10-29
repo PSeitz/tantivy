@@ -97,7 +97,7 @@ fn scorer_union<TScoreCombiner>(
     score_combiner_fn: impl Fn() -> TScoreCombiner,
     num_docs: u32,
     parent_estimated_hits: Option<u32>,
-    exhaustive: bool,
+    iterate_all_matches: bool,
 ) -> SpecializedScorer
 where
     TScoreCombiner: ScoreCombiner,
@@ -106,7 +106,7 @@ where
     if scorers.len() == 1 && !scorers[0].is::<TermScorer>() {
         return SpecializedScorer::Other(scorers.into_iter().next().unwrap()); //< we checked the size beforehand
     }
-    if exhaustive {
+    if iterate_all_matches {
         return build_union(
             scorers,
             score_combiner_fn,
@@ -399,7 +399,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         boost: Score,
         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
         parent_estimated_hits: Option<u32>,
-        exhaustive: bool,
+        iterate_all_matches: bool,
     ) -> crate::Result<SpecializedScorer> {
         let num_docs = reader.num_docs();
 
@@ -449,8 +449,8 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             .minimum_number_should_match
             .saturating_sub(should_special_scorer_counts.num_all_scorers);
 
-        // MUST clauses can seek through the SHOULD union even during exhaustive collection.
-        let exhaustive = exhaustive && must_scorers.is_empty();
+        // MUST scorers can seek past SHOULD matches that fail a MUST clause.
+        let iterate_all_should_matches = iterate_all_matches && must_scorers.is_empty();
         let should_scorers: ShouldScorersCombinationMethod = {
             let num_of_should_scorers = should_scorers.len();
             if effective_minimum_number_should_match > num_of_should_scorers {
@@ -465,14 +465,14 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     &score_combiner_fn,
                     num_docs,
                     parent_estimated_hits,
-                    exhaustive,
+                    iterate_all_should_matches,
                 )),
                 1 => ShouldScorersCombinationMethod::Required(scorer_union(
                     should_scorers,
                     &score_combiner_fn,
                     num_docs,
                     parent_estimated_hits,
-                    exhaustive,
+                    iterate_all_should_matches,
                 )),
                 n if num_of_should_scorers == n => {
                     // When num_of_should_scorers equals the number of should clauses,
@@ -497,8 +497,8 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                 let combined_all_scorer_count = must_special_scorer_counts.num_all_scorers
                     + should_special_scorer_counts.num_all_scorers;
 
-                // Retain concrete term scorers for specialized exhaustive scoring and,
-                // when frequencies are available, intersection Block-WAND.
+                // Keep concrete term scorers for scoring all matches and for
+                // intersection Block-WAND when frequencies are available.
                 if combined_all_scorer_count == 0
                     && must_scorers.len() >= 2
                     && must_scorers.iter().all(|s| s.is::<TermScorer>())
