@@ -44,13 +44,18 @@ impl SpecializedScorer {
 
 const SPARSE_UNION_HORIZON: u64 = 4_096;
 const SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON: u64 = 128;
+const COUNT_UNION_MAX_EXPECTED_HITS_PER_HORIZON: u64 = 16;
 
-fn union_strategy_for_estimated_hits(estimated_hits: u32, num_docs: u32) -> UnionStrategy {
+fn union_strategy_for_estimated_hits(
+    estimated_hits: u32,
+    num_docs: u32,
+    max_hits_per_horizon: u64,
+) -> UnionStrategy {
     if num_docs == 0 {
         return UnionStrategy::Buffered;
     }
     if u64::from(estimated_hits) * SPARSE_UNION_HORIZON
-        <= u64::from(num_docs) * SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON
+        <= u64::from(num_docs) * max_hits_per_horizon
     {
         UnionStrategy::Simple
     } else {
@@ -109,7 +114,20 @@ where
                 as u32
         })
         .unwrap_or(union_estimated_hits);
-    let strategy = union_strategy_for_estimated_hits(estimated_hits, num_docs);
+    let strategy = union_strategy_for_estimated_hits(
+        estimated_hits,
+        num_docs,
+        SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON,
+    );
+    build_union(scorers, score_combiner_fn, num_docs, strategy)
+}
+
+fn build_union<TScoreCombiner: ScoreCombiner>(
+    scorers: Vec<Box<dyn Scorer>>,
+    score_combiner_fn: impl Fn() -> TScoreCombiner,
+    num_docs: u32,
+    strategy: UnionStrategy,
+) -> SpecializedScorer {
     if scorers.iter().all(|scorer| scorer.is::<TermScorer>()) {
         let scorers: Vec<TermScorer> = scorers
             .into_iter()
@@ -615,6 +633,47 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
         }
     }
 
+    fn count(&self, reader: &SegmentReader) -> crate::Result<u32> {
+        let should_weights = self.per_occur_weights.get(Occur::Should);
+        let mut scorer = if reader.alive_bitset().is_none()
+            && should_weights.len() >= 2
+            && self.minimum_number_should_match <= 1
+            && self.per_occur_weights.get(Occur::Must).is_empty()
+            && self.per_occur_weights.get(Occur::MustNot).is_empty()
+        {
+            // Bitset/popcount counting becomes worthwhile at a lower density than traversal.
+            // Child scorers retain density selection for nested queries that use seeking.
+            let scorers = should_weights
+                .iter()
+                .map(|weight| weight.scorer(reader, 1.0))
+                .collect::<crate::Result<Vec<_>>>()?;
+            if scorers.iter().any(|scorer| scorer.is::<AllScorer>()) {
+                return Ok(reader.num_docs());
+            }
+            let estimated_hits =
+                estimate_union(scorers.iter().map(DocSet::size_hint), reader.num_docs());
+            let strategy = union_strategy_for_estimated_hits(
+                estimated_hits,
+                reader.num_docs(),
+                COUNT_UNION_MAX_EXPECTED_HITS_PER_HORIZON,
+            );
+            let union = build_union(
+                scorers,
+                DoNothingCombiner::default,
+                reader.num_docs(),
+                strategy,
+            );
+            into_box_scorer(union, DoNothingCombiner::default, reader.num_docs())
+        } else {
+            self.scorer(reader, 1.0)?
+        };
+        if let Some(alive_bitset) = reader.alive_bitset() {
+            Ok(scorer.count(alive_bitset))
+        } else {
+            Ok(scorer.count_including_deleted())
+        }
+    }
+
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation> {
         let mut scorer = self.scorer(reader, 1.0)?;
         if scorer.seek(doc) != doc {
@@ -838,7 +897,7 @@ fn is_include_occur(occur: Occur) -> bool {
 #[cfg(test)]
 mod tests {
     use super::create_aligned_scorers_for_intersection;
-    use crate::query::{EmptyScorer, EnableScoring, Query, TermQuery, Weight};
+    use crate::query::{EmptyScorer, EnableScoring, Query, QueryParser, TermQuery, Weight};
     use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
     use crate::{Index, Searcher, Term, TERMINATED};
 
@@ -865,6 +924,71 @@ mod tests {
     ) -> crate::Result<Box<dyn Weight>> {
         TermQuery::new(Term::from_field_text(field, term), IndexRecordOption::Basic)
             .weight(EnableScoring::disabled_from_searcher(searcher))
+    }
+
+    #[test]
+    fn test_count_union_density() {
+        for (hits, expected) in [
+            (16, super::UnionStrategy::Simple),
+            (17, super::UnionStrategy::Buffered),
+        ] {
+            assert_eq!(
+                super::union_strategy_for_estimated_hits(
+                    hits,
+                    4_096,
+                    super::COUNT_UNION_MAX_EXPECTED_HITS_PER_HORIZON
+                ),
+                expected,
+            );
+            assert_eq!(
+                super::union_strategy_for_estimated_hits(
+                    hits,
+                    4_096,
+                    super::SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON
+                ),
+                super::UnionStrategy::Simple,
+            );
+        }
+    }
+
+    #[test]
+    fn test_count_unions() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema.build());
+        let mut writer = index.writer_for_tests()?;
+        for i in 0..512 {
+            let terms = ["a", "b", "a b", "c"].get(i).copied().unwrap_or("x");
+            writer.add_document(doc!(text => terms))?;
+        }
+        writer.commit()?;
+        let reader = index.reader()?;
+        let parser = QueryParser::for_index(&index, vec![text]);
+        for deleted in 0..2 {
+            if deleted == 1 {
+                writer.delete_term(Term::from_field_text(text, "b"));
+                writer.commit()?;
+                reader.reload()?;
+            }
+            let searcher = reader.searcher();
+            for (query, counts) in [
+                ("a b", [3, 1]),
+                ("a missing", [2, 1]),
+                ("missing absent", [0, 0]),
+                ("a (b c)", [4, 2]),
+                ("a x", [510, 509]),
+                ("a *", [512, 510]),
+                ("+a +b", [1, 0]),
+                ("a -b", [1, 1]),
+            ] {
+                assert_eq!(
+                    parser.parse_query(query)?.count(&searcher)?,
+                    counts[deleted],
+                    "{query}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
