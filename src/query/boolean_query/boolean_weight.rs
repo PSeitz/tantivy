@@ -45,13 +45,16 @@ impl SpecializedScorer {
 const SPARSE_UNION_HORIZON: u64 = 4_096;
 const SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON: u64 = 128;
 const COUNT_UNION_MAX_EXPECTED_HITS_PER_HORIZON: u64 = 16;
+// SimpleUnion scans every child for each hit, even at low match density.
+const SIMPLE_UNION_MAX_CLAUSES: usize = 8;
 
 fn union_strategy_for_estimated_hits(
     estimated_hits: u32,
     num_docs: u32,
+    num_clauses: usize,
     max_hits_per_horizon: u64,
 ) -> UnionStrategy {
-    if num_docs == 0 {
+    if num_docs == 0 || num_clauses > SIMPLE_UNION_MAX_CLAUSES {
         return UnionStrategy::Buffered;
     }
     if u64::from(estimated_hits) * SPARSE_UNION_HORIZON
@@ -117,6 +120,7 @@ where
     let strategy = union_strategy_for_estimated_hits(
         estimated_hits,
         num_docs,
+        scorers.len(),
         SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON,
     );
     build_union(scorers, score_combiner_fn, num_docs, strategy)
@@ -655,6 +659,7 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             let strategy = union_strategy_for_estimated_hits(
                 estimated_hits,
                 reader.num_docs(),
+                scorers.len(),
                 COUNT_UNION_MAX_EXPECTED_HITS_PER_HORIZON,
             );
             let union = build_union(
@@ -928,6 +933,12 @@ mod tests {
 
     #[test]
     fn test_count_union_density() {
+        for threshold in [16, 128] {
+            assert_eq!(
+                super::union_strategy_for_estimated_hits(1, 4_096, 9, threshold),
+                super::UnionStrategy::Buffered,
+            );
+        }
         for (hits, expected) in [
             (16, super::UnionStrategy::Simple),
             (17, super::UnionStrategy::Buffered),
@@ -936,6 +947,7 @@ mod tests {
                 super::union_strategy_for_estimated_hits(
                     hits,
                     4_096,
+                    8,
                     super::COUNT_UNION_MAX_EXPECTED_HITS_PER_HORIZON
                 ),
                 expected,
@@ -944,6 +956,7 @@ mod tests {
                 super::union_strategy_for_estimated_hits(
                     hits,
                     4_096,
+                    8,
                     super::SPARSE_UNION_MAX_EXPECTED_HITS_PER_HORIZON
                 ),
                 super::UnionStrategy::Simple,
