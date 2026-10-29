@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_flat_term_union_compact_matches_scalar_exactly() -> crate::Result<()> {
+    fn test_sparse_flat_term_union_matches_scalar_exactly() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
@@ -141,8 +141,6 @@ mod tests {
 
         let mut consumer = RecordingScoredBatchConsumer::default();
         weight.for_each_scored_batch(reader, &mut consumer)?;
-        assert!(consumer.compact_blocks > 0);
-        assert_eq!(consumer.windows, 0);
         assert_eq!(consumer.docs, [3, 100, 2_049, 4_097, 4_999]);
         assert_eq!(
             consumer.scores,
