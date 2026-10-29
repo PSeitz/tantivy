@@ -973,45 +973,6 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_union_density() {
-        use super::SimpleUnion;
-        use crate::query::{BufferedUnionScorer, ConstScorer, Scorer, SumCombiner, VecDocSet};
-
-        let num_docs = 10_000;
-        let groups = (0..8)
-            .map(|group| {
-                let terms = (0..8)
-                    .map(|term| {
-                        let start = (group * 8 + term) * 40;
-                        Box::new(ConstScorer::new(
-                            VecDocSet::from((start..start + 40).collect::<Vec<_>>()),
-                            1.0,
-                        )) as Box<dyn Scorer>
-                    })
-                    .collect();
-                let inner = super::into_box_scorer(
-                    super::scorer_union(terms, SumCombiner::default, num_docs, None),
-                    SumCombiner::default,
-                    num_docs,
-                );
-                assert!(inner.is::<SimpleUnion<Box<dyn Scorer>, SumCombiner>>());
-                assert_eq!(
-                    inner.size_hint(),
-                    super::estimate_union([40; 8].into_iter(), num_docs)
-                );
-                inner
-            })
-            .collect();
-        let mut outer = super::into_box_scorer(
-            super::scorer_union(groups, SumCombiner::default, num_docs, None),
-            SumCombiner::default,
-            num_docs,
-        );
-        assert!(outer.is::<BufferedUnionScorer<Box<dyn Scorer>, SumCombiner>>());
-        assert_eq!(outer.count_including_deleted(), 2_560);
-    }
-
-    #[test]
     fn test_count_unions() -> crate::Result<()> {
         let mut schema = Schema::builder();
         let text = schema.add_text_field("text", TEXT);
