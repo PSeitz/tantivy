@@ -250,8 +250,10 @@ pub struct IndexSettings {
     #[serde(default = "default_docstore_blocksize")]
     /// The size of each block that will be compressed and written to disk
     pub docstore_blocksize: usize,
-    /// Maximum documents per postings list stored inline in dictionary (default 0 disables it).
-    #[cfg(feature = "quickwit")]
+    /// Maximum documents per postings list stored inline in the term dictionary.
+    /// Accepts 0 through 32. Defaults to 0, which keeps postings external.
+    /// The experimental FST format only inlines one document with one occurrence
+    /// and a position, even when this limit is greater than one.
     #[serde(
         default,
         deserialize_with = "deserialize_max_inline_docs",
@@ -260,12 +262,10 @@ pub struct IndexSettings {
     pub max_inline_docs: u32,
 }
 
-#[cfg(feature = "quickwit")]
 fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
-#[cfg(feature = "quickwit")]
 fn deserialize_max_inline_docs<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u32, D::Error> {
@@ -273,7 +273,6 @@ fn deserialize_max_inline_docs<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
-#[cfg(feature = "quickwit")]
 impl IndexSettings {
     pub(crate) fn validate_max_inline_docs(&self) -> crate::Result<()> {
         crate::termdict::validate_max_inline_docs(self.max_inline_docs)
@@ -295,7 +294,6 @@ impl Default for IndexSettings {
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
-            #[cfg(feature = "quickwit")]
             max_inline_docs: 0,
         }
     }
@@ -624,7 +622,6 @@ mod tests {
                 }),
                 docstore_blocksize: 1_000_000,
                 docstore_compress_dedicated_thread: true,
-                #[cfg(feature = "quickwit")]
                 max_inline_docs: 0,
             },
             persisted_custom_extensions: Vec::new(),
@@ -681,7 +678,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "quickwit")]
     #[test]
     fn test_max_inline_docs_settings() {
         assert_eq!(
@@ -739,7 +735,6 @@ mod tests {
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
-                #[cfg(feature = "quickwit")]
                 max_inline_docs: 0,
             }
         );

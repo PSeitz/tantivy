@@ -18,6 +18,7 @@
 //!
 //! A second datastructure makes it possible to access a
 //! [`TermInfo`](crate::postings::TermInfo).
+mod inline_postings;
 mod merger;
 mod streamer;
 mod term_info_store;

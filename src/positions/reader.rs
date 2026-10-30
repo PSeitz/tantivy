@@ -8,10 +8,17 @@ use crate::positions::COMPRESSION_BLOCK_SIZE;
 use crate::postings::compression::{BlockDecoder, VIntDecoder};
 use crate::postings::LoadedPostings;
 
-/// Reads a term's position deltas from inline postings or compressed blocks.
+/// When accessing the positions of a term, we get a positions_idx from the `Terminfo`.
+/// This means we need to skip to the `nth` position efficiently.
 ///
-/// Each bitpacked block stores 128 deltas and occupies `128 * bit_width / 8` bytes.
-/// The block bit widths allow the reader to skip to a requested offset.
+/// Blocks are compressed using bitpacking, so `skip_read` contains the number of bits
+/// (values can go from 0 to 32 bits) required to decompress every block.
+///
+/// A given block obviously takes `(128 x  num_bit_for_the_block / num_bits_in_a_byte)`,
+/// so skipping a block without decompressing it is just a matter of advancing that many
+/// bytes.
+///
+/// Inline postings provide position deltas directly instead of compressed blocks.
 
 #[derive(Clone)]
 pub struct PositionReader {
@@ -31,13 +38,13 @@ pub struct PositionReader {
     // As we advance, anchor increases simultaneously with bit_widths and positions get consumed.
     anchor_offset: u64,
 
-    // Retained bytes for reading from an earlier offset.
+    // These are just copies used for .reset().
     original_bit_widths: OwnedBytes,
     original_positions: OwnedBytes,
 }
 
 impl PositionReader {
-    /// Opens the term's encoded position deltas.
+    /// Open and reads the term positions encoded into the positions_data owned bytes.
     pub fn open(mut positions_data: OwnedBytes) -> io::Result<PositionReader> {
         let num_positions_bitpacked_blocks = VInt::deserialize(&mut positions_data)?.0 as usize;
         let (bit_widths, positions) = positions_data.split(num_positions_bitpacked_blocks);
@@ -113,7 +120,7 @@ impl PositionReader {
         self.block_offset = self.anchor_offset + (block_rel_id * COMPRESSION_BLOCK_SIZE) as u64;
     }
 
-    /// Copies position deltas at `[offset..offset + output.len())` into `output`.
+    /// Fills a buffer with the positions `[offset..offset+output.len())` integers.
     ///
     /// This function is optimized to be called with increasing values of `offset`.
     pub fn read(&mut self, mut offset: u64, mut output: &mut [u32]) {
@@ -126,7 +133,9 @@ impl PositionReader {
         }
         let delta_to_block_offset = offset as i64 - self.block_offset as i64;
         if !(0..128).contains(&delta_to_block_offset) {
-            // Skip to and decode the block containing the requested offset.
+            // The first position is not within the first block.
+            // (Note that it could be before or after)
+            // We need to possibly skip a few blocks, and decompress the first relevant  block.
             let delta_to_anchor_offset = offset - self.anchor_offset;
             let num_blocks_to_skip =
                 (delta_to_anchor_offset / (COMPRESSION_BLOCK_SIZE as u64)) as usize;

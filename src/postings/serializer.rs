@@ -16,13 +16,31 @@ use crate::schema::{Field, FieldEntry, IndexRecordOption, Schema};
 use crate::termdict::TermDictionaryBuilder;
 use crate::{DocId, Score};
 
-/// Serializes postings into the `.idx` postings file, `.pos` positions file,
-/// and `.term` term dictionary.
+/// `InvertedIndexSerializer` is in charge of serializing
+/// postings on disk, in the
+/// * `.idx` (inverted index)
+/// * `.pos` (positions file)
+/// * `.term` (term dictionary)
 ///
-/// Call `new_field` to obtain a `FieldSerializer`. For each term, call
-/// `new_term`, then `write_doc` for its documents, then `close_term`.
-/// Close the field serializer before starting another field, then close
-/// the inverted index serializer after the last field.
+/// `PostingsWriter` are in charge of pushing the data to the
+/// serializer.
+///
+/// The serializer expects to receive the following calls
+/// in this order :
+/// * `set_field(...)`
+/// * `new_term(...)`
+/// * `write_doc(...)`
+/// * `write_doc(...)`
+/// * `write_doc(...)`
+/// * ...
+/// * `close_term()`
+/// * `new_term(...)`
+/// * `write_doc(...)`
+/// * ...
+/// * `close_term()`
+/// * `set_field(...)`
+/// * ...
+/// * `close()`
 ///
 /// Terms have to be pushed in a lexicographically-sorted order.
 /// Within a term, documents have to be pushed in increasing order.
@@ -41,22 +59,21 @@ impl InvertedIndexSerializer {
     /// Open a new `InvertedIndexSerializer` for the given segment
     pub fn open(segment: &Segment) -> crate::Result<InvertedIndexSerializer> {
         use crate::index::SegmentComponent::{Positions, Postings, Terms};
-        #[cfg(feature = "quickwit")]
         segment.index().settings().validate_max_inline_docs()?;
         let inv_index_serializer = InvertedIndexSerializer {
             terms_write: CompositeWrite::wrap(segment.open_write(Terms)?),
             postings_write: CompositeWrite::wrap(segment.open_write(Postings)?),
             positions_write: CompositeWrite::wrap(segment.open_write(Positions)?),
             schema: segment.schema(),
-            #[cfg(feature = "quickwit")]
             max_inline_docs: segment.index().settings().max_inline_docs,
-            #[cfg(not(feature = "quickwit"))]
-            max_inline_docs: 0,
         };
         Ok(inv_index_serializer)
     }
 
-    /// Starts a field serializer using the field's indexing options.
+    /// Must be called before starting pushing terms of
+    /// a given field.
+    ///
+    /// Loads the indexing options for the given field.
     pub fn new_field(
         &mut self,
         field: Field,
@@ -91,7 +108,8 @@ impl InvertedIndexSerializer {
     }
 }
 
-/// Serializes a field's terms, postings, and positions.
+/// The field serializer is in charge of
+/// the serialization of a specific field.
 pub struct FieldSerializer<'a, W: Write = WritePtr> {
     term_dictionary_builder: TermDictionaryBuilder<&'a mut CountingWriter<W>>,
     postings_serializer: PostingsSerializer,
@@ -106,8 +124,9 @@ pub struct FieldSerializer<'a, W: Write = WritePtr> {
 
 impl<'a, W: Write> FieldSerializer<'a, W> {
     /// Creates a new `FieldSerializer` for the given field type.
-    /// Postings lists with at most `max_inline_docs` documents are stored
-    /// in SSTable dictionaries.
+    /// Quickwit stores lists with at most `max_inline_docs` documents in the
+    /// term dictionary. FST dictionaries inline only a single occurrence with
+    /// a recorded frequency and position when `max_inline_docs` is nonzero.
     pub fn create(
         index_record_option: IndexRecordOption,
         total_num_tokens: u64,
@@ -117,16 +136,12 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         fieldnorm_reader: Option<FieldNormReader>,
         max_inline_docs: u32,
     ) -> io::Result<FieldSerializer<'a, W>> {
-        #[cfg(feature = "quickwit")]
         let term_dictionary_builder = TermDictionaryBuilder::create_with_max_inline_docs(
             term_dictionary_write,
             max_inline_docs,
         )?;
         #[cfg(not(feature = "quickwit"))]
-        let (term_dictionary_builder, max_inline_docs) = {
-            let _ = max_inline_docs;
-            (TermDictionaryBuilder::create(term_dictionary_write)?, 0)
-        };
+        let max_inline_docs = max_inline_docs.min(1);
         total_num_tokens.serialize(postings_write)?;
         let average_fieldnorm = fieldnorm_reader
             .as_ref()
@@ -158,9 +173,26 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
         (self.postings_write.written_bytes() - self.postings_start_offset) as usize
     }
 
+    fn current_term_info(&self) -> TermInfo {
+        let positions_start =
+            if let Some(positions_serializer) = self.positions_serializer_opt.as_ref() {
+                positions_serializer.written_bytes()
+            } else {
+                0u64
+            } as usize;
+        let addr = self.postings_offset();
+        TermInfo {
+            doc_freq: 0,
+            postings_range: addr..addr,
+            positions_range: positions_start..positions_start,
+            inline_postings: None,
+        }
+    }
+
     /// Starts the postings for a new term.
-    /// * `term` must follow the previous term in lexicographic order.
-    /// * `term_doc_freq` is the number of documents containing the term.
+    /// * term - the term. It needs to come after the previous term according to the lexicographical
+    ///   order.
+    /// * term_doc_freq - return the number of document containing the term.
     pub fn new_term(
         &mut self,
         term: &[u8],
@@ -169,19 +201,10 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     ) -> io::Result<()> {
         assert!(
             !self.term_open,
-            "Close the previous term before calling new_term."
+            "Called new_term, while the previous term was not closed."
         );
         self.term_open = true;
-        let postings_start = self.postings_offset();
-        let positions_start = self
-            .positions_serializer_opt
-            .as_ref()
-            .map_or(0, PositionSerializer::written_bytes) as usize;
-        self.current_term_info = TermInfo {
-            postings_range: postings_start..postings_start,
-            positions_range: positions_start..positions_start,
-            ..Default::default()
-        };
+        self.current_term_info = self.current_term_info();
         self.term_dictionary_builder.insert_key(term)?;
         self.postings_serializer
             .new_term(term_doc_freq, record_term_freq);
@@ -220,8 +243,8 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
 
     /// Finishes serializing the term's postings.
     ///
-    /// Lists within the inline document limit are stored in the term dictionary.
-    /// External lists use `VInt` encoding for their final partial block.
+    /// Eligible lists within the inline document limit are stored in the term
+    /// dictionary. External lists use `VInt` encoding for their final partial block.
     pub fn close_term(&mut self) -> io::Result<()> {
         crate::fail_point!("FieldSerializer::close_term", |msg: Option<String>| {
             Err(io::Error::other(format!("{msg:?}")))
@@ -231,7 +254,14 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             return Ok(());
         }
 
-        if (1..=self.max_inline_docs).contains(&self.current_term_info.doc_freq) {
+        let inline = (1..=self.max_inline_docs).contains(&self.current_term_info.doc_freq);
+        #[cfg(not(feature = "quickwit"))]
+        let inline = inline
+            && self.current_term_info.doc_freq == 1
+            && self.postings_serializer.term_has_freq
+            && self.postings_serializer.block.term_freqs() == [1]
+            && self.buffered_position_deltas.len() == 1;
+        if inline {
             let block = &self.postings_serializer.block;
             self.current_term_info.inline_postings = Some(Arc::new(LoadedPostings {
                 doc_ids: block.doc_ids().into(),
@@ -248,6 +278,8 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
                 .close_term(self.current_term_info.doc_freq, self.postings_write)?;
             self.current_term_info.postings_range.end = self.postings_offset();
             if let Some(positions_serializer) = self.positions_serializer_opt.as_mut() {
+                positions_serializer.write_positions_delta(&self.buffered_position_deltas);
+                self.buffered_position_deltas.clear();
                 positions_serializer.close_term()?;
                 self.current_term_info.positions_range.end =
                     positions_serializer.written_bytes() as usize;
@@ -270,15 +302,15 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
     }
 }
 
-struct PostingsBlock {
+struct Block {
     doc_ids: [DocId; COMPRESSION_BLOCK_SIZE],
     term_freqs: [u32; COMPRESSION_BLOCK_SIZE],
     len: usize,
 }
 
-impl PostingsBlock {
+impl Block {
     fn new() -> Self {
-        PostingsBlock {
+        Block {
             doc_ids: [0u32; COMPRESSION_BLOCK_SIZE],
             term_freqs: [0u32; COMPRESSION_BLOCK_SIZE],
             len: 0,
@@ -323,7 +355,7 @@ pub struct PostingsSerializer {
     last_doc_id_encoded: u32,
 
     block_encoder: BlockEncoder,
-    block: Box<PostingsBlock>,
+    block: Box<Block>,
 
     postings_write: Vec<u8>,
     skip_write: SkipSerializer,
@@ -348,7 +380,7 @@ impl PostingsSerializer {
     ) -> PostingsSerializer {
         PostingsSerializer {
             block_encoder: BlockEncoder::new(),
-            block: Box::new(PostingsBlock::new()),
+            block: Box::new(Block::new()),
 
             postings_write: Vec::new(),
             skip_write: SkipSerializer::new(),
@@ -523,9 +555,24 @@ mod tests {
             let mut position_serializer = PositionSerializer::new(&mut expected_positions);
 
             // End with a single-document list to check offsets and resetting after an external list.
-            for (term, count) in [1, 32, 33, 127, 128, 129, 1].into_iter().enumerate() {
+            for (term, (count, first_freq)) in [
+                (1, 1),
+                (1, 2),
+                (1, 130),
+                (1, 1),
+                (32, 1),
+                (33, 1),
+                (127, 1),
+                (128, 1),
+                (129, 1),
+                (1, 1),
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 serializer.new_term(&term.to_be_bytes(), count, true)?;
-                let fits_inline_limit = cfg!(feature = "quickwit") && count <= max_inline_docs;
+                let fits_inline_limit = count <= max_inline_docs
+                    && (cfg!(feature = "quickwit") || (count == 1 && first_freq == 1));
                 let postings_start = expected_postings.len();
                 let positions_start = position_serializer.written_bytes() as usize;
                 let mut external_serializer = PostingsSerializer::new(0.0, mode, None);
@@ -533,7 +580,13 @@ mod tests {
                 for doc in 0..count {
                     let doc_id = doc * 3;
                     // Include a full positions block among the first eight buffered documents.
-                    let freq = if doc % 4 == 3 { 128 } else { doc % 3 + 1 };
+                    let freq = if doc == 0 {
+                        first_freq
+                    } else if doc % 4 == 3 {
+                        128
+                    } else {
+                        doc % 3 + 1
+                    };
                     let deltas: Vec<u32> = (0..freq).map(|position| position % 5).collect();
                     serializer.write_doc(doc_id, freq, &deltas);
                     if !fits_inline_limit {
@@ -565,7 +618,45 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "quickwit")]
+    #[cfg(not(feature = "quickwit"))]
+    #[test]
+    fn test_fst_inline_requires_recorded_frequency_and_position() -> io::Result<()> {
+        for mode in [
+            IndexRecordOption::Basic,
+            IndexRecordOption::WithFreqs,
+            IndexRecordOption::WithFreqsAndPositions,
+        ] {
+            for record_freq in [false, true] {
+                let mut terms = CountingWriter::wrap(Vec::new());
+                let mut postings = CountingWriter::wrap(Vec::new());
+                let mut positions = CountingWriter::wrap(Vec::new());
+                let mut serializer = FieldSerializer::create(
+                    mode,
+                    0,
+                    &mut terms,
+                    &mut postings,
+                    &mut positions,
+                    None,
+                    32,
+                )?;
+                assert_eq!(serializer.max_inline_docs, 1);
+                serializer.new_term(b"term", 1, record_freq)?;
+                serializer.write_doc(7, 1, &[4]);
+                serializer.close_term()?;
+                let inline = &serializer.current_term_info.inline_postings;
+                assert_eq!(inline.is_some(), record_freq && mode.has_positions());
+                if let Some(inline) = inline {
+                    assert_eq!(&*inline.doc_ids, &[7]);
+                    assert_eq!(&*inline.term_freqs, &[1]);
+                    assert_eq!(&*inline.position_deltas, &[4]);
+                }
+                assert!(serializer.buffered_position_deltas.is_empty());
+                serializer.close()?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_invalid_inline_cutoff_writes_nothing() {
         let mut terms = CountingWriter::wrap(Vec::new());

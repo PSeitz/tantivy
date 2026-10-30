@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use super::occur_weights::OccurWeights;
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
+use crate::postings::FreqReadingOption;
 use crate::query::disjunction::Disjunction;
 use crate::query::explanation::does_not_match;
 use crate::query::score_combiner::{DoNothingCombiner, ScoreCombiner};
@@ -66,7 +67,10 @@ where
                 .into_iter()
                 .map(|scorer| *(scorer.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
                 .collect();
-            if scorers.iter().all(TermScorer::reads_freqs) {
+            if scorers
+                .iter()
+                .all(|scorer| scorer.freq_reading_option() == FreqReadingOption::ReadFreq)
+            {
                 // Block wand is only available if we read frequencies.
                 return SpecializedScorer::TermUnion(scorers);
             } else if scorers.len() == 1 {
@@ -413,7 +417,10 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                         .into_iter()
                         .map(|s| *(s.downcast::<TermScorer>().map_err(|_| ()).unwrap()))
                         .collect();
-                    if term_scorers.iter().all(TermScorer::reads_freqs) {
+                    if term_scorers
+                        .iter()
+                        .all(|s| s.freq_reading_option() == FreqReadingOption::ReadFreq)
+                    {
                         SpecializedScorer::TermIntersection(term_scorers)
                     } else {
                         let must_scorers: Vec<Box<dyn Scorer>> = term_scorers

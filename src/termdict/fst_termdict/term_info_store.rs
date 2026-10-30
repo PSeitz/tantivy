@@ -2,9 +2,10 @@ use std::cmp;
 use std::io::{self, Read, Write};
 
 use byteorder::{ByteOrder, LittleEndian};
-use common::{BinarySerializable, FixedSize};
+use common::{BinarySerializable, FixedSize, HasLen};
 use tantivy_bitpacker::{compute_num_bits, BitPacker};
 
+use super::inline_postings::{self, invalid};
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::postings::TermInfo;
 use crate::termdict::TermOrdinal;
@@ -93,11 +94,67 @@ impl TermInfoBlockMeta {
     }
 }
 
+// Each bitmap bit selects one of two independently bitpacked groups.
+#[derive(Default)]
+struct InlineBlockMeta {
+    bitmap: [u64; 4],
+    doc_nbits: u8,
+    position_nbits: u8,
+    min_doc: u32,
+    min_position: u32,
+}
+
+impl InlineBlockMeta {
+    const SIZE: usize = 42;
+
+    fn rank(&self, slot: usize) -> usize {
+        let word = slot / 64;
+        let bits = slot % 64;
+        let preceding: u32 = self.bitmap[..word].iter().map(|v| v.count_ones()).sum();
+        preceding as usize
+            + if bits == 0 {
+                0
+            } else {
+                (self.bitmap[word] & ((1u64 << bits) - 1)).count_ones() as usize
+            }
+    }
+
+    fn contains(&self, slot: usize) -> bool {
+        self.bitmap[slot / 64] & (1 << (slot % 64)) != 0
+    }
+
+    fn serialize(&self, output: &mut Vec<u8>) -> io::Result<()> {
+        for word in self.bitmap {
+            word.serialize(output)?;
+        }
+        output.extend_from_slice(&[self.doc_nbits, self.position_nbits]);
+        self.min_doc.serialize(output)?;
+        self.min_position.serialize(output)?;
+        Ok(())
+    }
+
+    fn deserialize(input: &mut &[u8]) -> io::Result<Self> {
+        let mut meta = Self::default();
+        for word in &mut meta.bitmap {
+            *word = u64::deserialize(input)?;
+        }
+        meta.doc_nbits = u8::deserialize(input)?;
+        meta.position_nbits = u8::deserialize(input)?;
+        meta.min_doc = u32::deserialize(input)?;
+        meta.min_position = u32::deserialize(input)?;
+        if meta.doc_nbits > 31 || meta.position_nbits > 32 {
+            return Err(invalid("invalid inline bit widths"));
+        }
+        Ok(meta)
+    }
+}
+
 #[derive(Clone)]
 pub struct TermInfoStore {
     num_terms: usize,
     block_meta_bytes: OwnedBytes,
     term_info_bytes: OwnedBytes,
+    inline: bool,
 }
 
 fn extract_bits(data: &[u8], addr_bits: usize, num_bits: u8) -> u64 {
@@ -122,35 +179,105 @@ fn extract_bits(data: &[u8], addr_bits: usize, num_bits: u8) -> u64 {
 }
 
 impl TermInfoStore {
-    pub fn open(term_info_store_file: FileSlice) -> io::Result<TermInfoStore> {
+    pub fn open(term_info_store_file: FileSlice, inline: bool) -> io::Result<TermInfoStore> {
+        if term_info_store_file.len() < 16 {
+            return Err(invalid("missing term-info header"));
+        }
         let (len_slice, main_slice) = term_info_store_file.split(16);
         let mut bytes = len_slice.read_bytes()?;
         let len = u64::deserialize(&mut bytes)? as usize;
         let num_terms = u64::deserialize(&mut bytes)? as usize;
+        let meta_size =
+            TermInfoBlockMeta::SIZE_IN_BYTES + if inline { InlineBlockMeta::SIZE } else { 0 };
+        if num_terms.div_ceil(BLOCK_LEN).checked_mul(meta_size) != Some(len)
+            || len > main_slice.len()
+        {
+            return Err(invalid("invalid term-info index size"));
+        }
         let (block_meta_file, term_info_file) = main_slice.split(len);
         let term_info_bytes = term_info_file.read_bytes()?;
         Ok(TermInfoStore {
             num_terms,
             block_meta_bytes: block_meta_file.read_bytes()?,
             term_info_bytes,
+            inline,
         })
     }
 
-    pub fn get(&self, term_ord: TermOrdinal) -> TermInfo {
-        let block_id = (term_ord as usize) / BLOCK_LEN;
-        let buffer = self.block_meta_bytes.as_slice();
-        let mut block_data: &[u8] = &buffer[block_id * TermInfoBlockMeta::SIZE_IN_BYTES..];
-        let term_info_block_data = TermInfoBlockMeta::deserialize(&mut block_data)
-            .expect("Failed to deserialize terminfoblockmeta");
-        let inner_offset = (term_ord as usize) % BLOCK_LEN;
-        if inner_offset == 0 {
-            return term_info_block_data.ref_term_info;
+    pub fn get(&self, term_ord: TermOrdinal) -> io::Result<TermInfo> {
+        if term_ord >= self.num_terms as u64 {
+            return Err(invalid("term ordinal out of bounds"));
         }
-        let term_info_data = self.term_info_bytes.as_slice();
-        term_info_block_data.deserialize_term_info(
-            &term_info_data[term_info_block_data.offset as usize..],
-            inner_offset - 1,
-        )
+        let block_id = term_ord as usize / BLOCK_LEN;
+        let meta_size = TermInfoBlockMeta::SIZE_IN_BYTES
+            + if self.inline {
+                InlineBlockMeta::SIZE
+            } else {
+                0
+            };
+        let mut block_data = &self.block_meta_bytes[block_id * meta_size..];
+        let meta = TermInfoBlockMeta::deserialize(&mut block_data)?;
+        if meta.doc_freq_nbits > 32
+            || meta.postings_offset_nbits > 56
+            || meta.positions_offset_nbits > 56
+        {
+            return Err(invalid("invalid external bit widths"));
+        }
+        let slot = term_ord as usize % BLOCK_LEN;
+        let block_len = (self.num_terms - block_id * BLOCK_LEN).min(BLOCK_LEN);
+        let mut external_count = block_len;
+        let mut external_slot = slot;
+        let inline_meta = if self.inline {
+            let inline = InlineBlockMeta::deserialize(&mut block_data)?;
+            let count = inline.rank(block_len);
+            if count != inline.rank(BLOCK_LEN) {
+                return Err(invalid("inline bitmap extends past block"));
+            }
+            external_count -= count;
+            external_slot -= inline.rank(slot);
+            Some(inline)
+        } else {
+            None
+        };
+        let external_bytes = (external_count.saturating_sub(1) * meta.num_bits() as usize
+            + meta.postings_offset_nbits as usize
+            + meta.positions_offset_nbits as usize)
+            .div_ceil(8);
+        let data = self
+            .term_info_bytes
+            .get(meta.offset as usize..)
+            .ok_or_else(|| invalid("invalid term-info block offset"))?;
+        let external = data
+            .get(..external_bytes)
+            .ok_or_else(|| invalid("truncated external term-info block"))?;
+        if let Some(inline) = inline_meta {
+            if inline.contains(slot) {
+                let bits = inline.doc_nbits as usize + inline.position_nbits as usize;
+                let inline_bytes = ((block_len - external_count) * bits).div_ceil(8);
+                let data = data
+                    .get(external_bytes..external_bytes + inline_bytes)
+                    .ok_or_else(|| invalid("truncated inline term-info block"))?;
+                let offset = inline.rank(slot) * bits;
+                let doc = inline
+                    .min_doc
+                    .checked_add(extract_bits(data, offset, inline.doc_nbits) as u32)
+                    .ok_or_else(|| invalid("inline document ID overflow"))?;
+                let position = inline
+                    .min_position
+                    .checked_add(extract_bits(
+                        data,
+                        offset + inline.doc_nbits as usize,
+                        inline.position_nbits,
+                    ) as u32)
+                    .ok_or_else(|| invalid("inline position overflow"))?;
+                return inline_postings::term_info(doc, position);
+            }
+        }
+        if external_slot == 0 {
+            Ok(meta.ref_term_info)
+        } else {
+            Ok(meta.deserialize_term_info(external, external_slot - 1))
+        }
     }
 
     pub fn num_terms(&self) -> usize {
@@ -163,6 +290,7 @@ pub struct TermInfoStoreWriter {
     buffer_term_infos: Vec<u8>,
     term_infos: Vec<TermInfo>,
     num_terms: u64,
+    inline: bool,
 }
 
 fn bitpack_serialize<W: Write>(
@@ -190,36 +318,56 @@ fn bitpack_serialize<W: Write>(
 }
 
 impl TermInfoStoreWriter {
-    pub fn new() -> TermInfoStoreWriter {
+    pub fn new(inline: bool) -> TermInfoStoreWriter {
         TermInfoStoreWriter {
             buffer_block_metas: Vec::new(),
             buffer_term_infos: Vec::new(),
             term_infos: Vec::with_capacity(BLOCK_LEN),
             num_terms: 0u64,
+            inline,
         }
     }
 
     fn flush_block(&mut self) -> io::Result<()> {
+        let mut inline_meta = InlineBlockMeta::default();
+        let mut inline_values = Vec::new();
+        if self.inline {
+            for (slot, term) in self.term_infos.iter().enumerate() {
+                if term.inline_postings.is_some() {
+                    let (doc, position) = inline_postings::values(term)?;
+                    inline_meta.bitmap[slot / 64] |= 1 << (slot % 64);
+                    inline_values.push((doc, position));
+                }
+            }
+            inline_meta.min_doc = inline_values.iter().map(|&(doc, _)| doc).min().unwrap_or(0);
+            inline_meta.min_position = inline_values.iter().map(|&(_, pos)| pos).min().unwrap_or(0);
+            for (doc, position) in &mut inline_values {
+                *doc -= inline_meta.min_doc;
+                *position -= inline_meta.min_position;
+                inline_meta.doc_nbits =
+                    inline_meta.doc_nbits.max(compute_num_bits(u64::from(*doc)));
+                inline_meta.position_nbits = inline_meta
+                    .position_nbits
+                    .max(compute_num_bits(u64::from(*position)));
+            }
+            self.term_infos
+                .retain(|term| term.inline_postings.is_none());
+        }
         let mut bit_packer = BitPacker::new();
-        let ref_term_info = self.term_infos[0].clone();
-
-        let last_term_info = if let Some(last_term_info) = self.term_infos.last().cloned() {
-            last_term_info
-        } else {
-            return Ok(());
-        };
+        let ref_term_info = self.term_infos.first().cloned().unwrap_or_default();
+        let last_term_info = self.term_infos.last().cloned().unwrap_or_default();
         let postings_end_offset =
             last_term_info.postings_range.end - ref_term_info.postings_range.start;
         let positions_end_offset =
             last_term_info.positions_range.end - ref_term_info.positions_range.start;
-        for term_info in &mut self.term_infos[1..] {
+        for term_info in self.term_infos.iter_mut().skip(1) {
             term_info.postings_range.start -= ref_term_info.postings_range.start;
             term_info.positions_range.start -= ref_term_info.positions_range.start;
         }
 
         let mut max_doc_freq: u32 = 0u32;
 
-        for term_info in &self.term_infos[1..] {
+        for term_info in self.term_infos.iter().skip(1) {
             max_doc_freq = cmp::max(max_doc_freq, term_info.doc_freq);
         }
 
@@ -236,7 +384,10 @@ impl TermInfoStoreWriter {
         };
 
         term_info_block_meta.serialize(&mut self.buffer_block_metas)?;
-        for term_info in &self.term_infos[1..] {
+        if self.inline {
+            inline_meta.serialize(&mut self.buffer_block_metas)?;
+        }
+        for term_info in self.term_infos.iter().skip(1) {
             bitpack_serialize(
                 &mut self.buffer_term_infos,
                 &mut bit_packer,
@@ -259,12 +410,31 @@ impl TermInfoStoreWriter {
 
         // Block need end up at the end of a byte.
         bit_packer.flush(&mut self.buffer_term_infos)?;
+        for (doc, position) in inline_values {
+            bit_packer.write(
+                u64::from(doc),
+                inline_meta.doc_nbits,
+                &mut self.buffer_term_infos,
+            )?;
+            bit_packer.write(
+                u64::from(position),
+                inline_meta.position_nbits,
+                &mut self.buffer_term_infos,
+            )?;
+        }
+        bit_packer.flush(&mut self.buffer_term_infos)?;
         self.term_infos.clear();
 
         Ok(())
     }
 
     pub fn write_term_info(&mut self, term_info: &TermInfo) -> io::Result<()> {
+        if term_info.inline_postings.is_some() {
+            if !self.inline {
+                return Err(invalid("inline postings are disabled"));
+            }
+            inline_postings::values(term_info)?;
+        }
         self.num_terms += 1u64;
         self.term_infos.push(term_info.clone());
         if self.term_infos.len() >= BLOCK_LEN {
@@ -295,6 +465,181 @@ mod tests {
     use super::{extract_bits, TermInfoBlockMeta, TermInfoStore, TermInfoStoreWriter};
     use crate::directory::FileSlice;
     use crate::postings::TermInfo;
+
+    #[test]
+    fn test_inline_groups_and_corruption() -> crate::Result<()> {
+        use super::{inline_postings, InlineBlockMeta};
+        use crate::TERMINATED;
+        use common::FixedSize;
+
+        for pattern in 0..4 {
+            let mut writer = TermInfoStoreWriter::new(true);
+            let mut expected = Vec::new();
+            let mut offset = 0;
+            // Include full/partial blocks, every bitmap word boundary, and empty groups.
+            for slot in 0..777 {
+                let inline = match pattern {
+                    0 => false,
+                    1 => true,
+                    2 => slot % 2 == 0,
+                    _ => slot % 256 == 0 || slot % 256 == 255,
+                };
+                let term = if inline {
+                    let (doc, position) = if slot % 3 == 0 {
+                        (0, 0)
+                    } else {
+                        (TERMINATED - 1, u32::MAX)
+                    };
+                    inline_postings::term_info(doc, position)?
+                } else {
+                    let term = TermInfo {
+                        doc_freq: 2,
+                        postings_range: offset..offset + 3,
+                        positions_range: offset * 2..(offset + 3) * 2,
+                        inline_postings: None,
+                    };
+                    offset += 3;
+                    term
+                };
+                writer.write_term_info(&term)?;
+                expected.push(term);
+            }
+            let mut bytes = Vec::new();
+            writer.serialize(&mut bytes)?;
+            let store = TermInfoStore::open(FileSlice::from(bytes.clone()), true)?;
+            for (ordinal, term) in expected.iter().enumerate() {
+                assert_eq!(&store.get(ordinal as u64)?, term);
+            }
+            assert!(store.get(777).is_err());
+            let mut header = &bytes[16..];
+            let external = TermInfoBlockMeta::deserialize(&mut header)?;
+            let inline = InlineBlockMeta::deserialize(&mut header)?;
+            assert!(external.postings_offset_nbits <= 10);
+            assert!(external.positions_offset_nbits <= 11);
+            if pattern == 1 || pattern == 2 {
+                assert_eq!((inline.doc_nbits, inline.position_nbits), (31, 32));
+            }
+            let mut truncated = bytes.clone();
+            truncated.pop();
+            let store = TermInfoStore::open(FileSlice::from(truncated), true)?;
+            assert!(store.get(776).is_err());
+
+            let mut invalid_width = bytes.clone();
+            invalid_width[16 + TermInfoBlockMeta::SIZE_IN_BYTES + 32] = 32;
+            assert!(TermInfoStore::open(FileSlice::from(invalid_width), true)?
+                .get(0)
+                .is_err());
+            // The final block has nine terms. Bit 63 must remain clear.
+            let last_header = 16 + 3 * (TermInfoBlockMeta::SIZE_IN_BYTES + InlineBlockMeta::SIZE);
+            bytes[last_header + TermInfoBlockMeta::SIZE_IN_BYTES + 7] |= 128;
+            assert!(TermInfoStore::open(FileSlice::from(bytes), true)?
+                .get(768)
+                .is_err());
+        }
+        // Every singleton needs zero payload bits, even at the largest values.
+        for (doc, position) in [(0, 0), (42, 17), (TERMINATED - 1, u32::MAX)] {
+            let mut writer = TermInfoStoreWriter::new(true);
+            writer.write_term_info(&inline_postings::term_info(doc, position)?)?;
+            let mut bytes = Vec::new();
+            writer.serialize(&mut bytes)?;
+            assert_eq!(
+                bytes.len(),
+                16 + TermInfoBlockMeta::SIZE_IN_BYTES + InlineBlockMeta::SIZE
+            );
+            assert_eq!(
+                TermInfoStore::open(FileSlice::from(bytes), true)?.get(0)?,
+                inline_postings::term_info(doc, position)?
+            );
+        }
+        for length in 0..16 {
+            assert!(TermInfoStore::open(FileSlice::from(vec![0; length]), true).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_inline_reference_values() -> crate::Result<()> {
+        use super::{inline_postings, InlineBlockMeta};
+        use crate::TERMINATED;
+        use common::FixedSize;
+
+        let cases = [
+            (
+                vec![(1005, 5000), (1000, 5007), (1007, 5004)],
+                (1000, 5000, 3, 3),
+            ),
+            (
+                vec![(TERMINATED - 1, u32::MAX - 1), (TERMINATED - 8, u32::MAX)],
+                (TERMINATED - 8, u32::MAX - 1, 3, 1),
+            ),
+            (
+                vec![(0, u32::MAX), (0, u32::MAX - 2)],
+                (0, u32::MAX - 2, 0, 2),
+            ),
+            (
+                vec![(TERMINATED - 1, 0), (TERMINATED - 2, 0)],
+                (TERMINATED - 2, 0, 1, 0),
+            ),
+            (
+                vec![(TERMINATED - 1, u32::MAX); 256],
+                (TERMINATED - 1, u32::MAX, 0, 0),
+            ),
+        ];
+        for (values, expected) in cases {
+            let mut writer = TermInfoStoreWriter::new(true);
+            for &(doc, position) in &values {
+                writer.write_term_info(&inline_postings::term_info(doc, position)?)?;
+            }
+            let mut bytes = Vec::new();
+            writer.serialize(&mut bytes)?;
+            let mut header = &bytes[16 + TermInfoBlockMeta::SIZE_IN_BYTES..];
+            let meta = InlineBlockMeta::deserialize(&mut header)?;
+            assert_eq!(
+                (
+                    meta.min_doc,
+                    meta.min_position,
+                    meta.doc_nbits,
+                    meta.position_nbits
+                ),
+                expected
+            );
+            assert_eq!(
+                bytes.len(),
+                16 + TermInfoBlockMeta::SIZE_IN_BYTES
+                    + InlineBlockMeta::SIZE
+                    + (values.len() * (meta.doc_nbits + meta.position_nbits) as usize).div_ceil(8)
+            );
+            let store = TermInfoStore::open(FileSlice::from(bytes), true)?;
+            for (ordinal, (doc, position)) in values.into_iter().enumerate() {
+                assert_eq!(
+                    store.get(ordinal as u64)?,
+                    inline_postings::term_info(doc, position)?
+                );
+            }
+        }
+
+        let mut writer = TermInfoStoreWriter::new(true);
+        for (doc, position) in [(10, 20), (11, 21)] {
+            writer.write_term_info(&inline_postings::term_info(doc, position)?)?;
+        }
+        let mut bytes = Vec::new();
+        writer.serialize(&mut bytes)?;
+        let min_doc_offset = 16 + TermInfoBlockMeta::SIZE_IN_BYTES + 34;
+        for (offset, base) in [
+            (min_doc_offset, u32::MAX),
+            (min_doc_offset + 4, u32::MAX),
+            (min_doc_offset, TERMINATED - 1),
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset..offset + 4].copy_from_slice(&base.to_le_bytes());
+            let store = TermInfoStore::open(FileSlice::from(corrupt), true)?;
+            assert_eq!(
+                store.get(1).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_term_info_block() {
@@ -341,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_pack() -> crate::Result<()> {
-        let mut store_writer = TermInfoStoreWriter::new();
+        let mut store_writer = TermInfoStoreWriter::new(false);
         let mut term_infos = vec![];
         let offset = |i| i * 13 + i * i;
         for i in 0usize..1000usize {
@@ -356,10 +701,10 @@ mod tests {
         }
         let mut buffer = Vec::new();
         store_writer.serialize(&mut buffer)?;
-        let term_info_store = TermInfoStore::open(FileSlice::from(buffer))?;
+        let term_info_store = TermInfoStore::open(FileSlice::from(buffer), false)?;
         for i in 0..1000 {
             assert_eq!(
-                term_info_store.get(i as u64),
+                term_info_store.get(i as u64)?,
                 term_infos[i],
                 "term info {i}"
             );

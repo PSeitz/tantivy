@@ -48,7 +48,6 @@ use self::termdict::{
 pub use self::termdict::{TermMerger, TermStreamer};
 use crate::postings::TermInfo;
 
-#[cfg(feature = "quickwit")]
 pub(crate) fn validate_max_inline_docs(maximum: u32) -> Result<u32, &'static str> {
     match maximum {
         0..=32 => Ok(maximum),
@@ -192,9 +191,7 @@ impl TermDictionary {
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A>
-    where
-        A::State: Clone,
-    {
+    where A::State: Clone {
         self.0.search(automaton)
     }
 
@@ -234,44 +231,41 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     /// Creates a dictionary storing postings lists of at most `max_inline_docs`
     /// documents inline.
     /// Accepts 0 through 32. Zero disables inline postings.
-    #[cfg(feature = "quickwit")]
-    pub fn create_with_max_inline_docs(
-        w: W,
-        max_inline_docs: u32,
-    ) -> io::Result<Self> {
-        Ok(Self(InnerTermDictBuilder::with_value_writer(
-            w,
-            termdict::TermInfoBlock::new(max_inline_docs)?,
-        )))
+    /// The experimental FST format supports only one document and one position.
+    pub fn create_with_max_inline_docs(w: W, max_inline_docs: u32) -> io::Result<Self> {
+        #[cfg(feature = "quickwit")]
+        {
+            Ok(Self(InnerTermDictBuilder::with_value_writer(
+                w,
+                termdict::TermInfoBlock::new(max_inline_docs)?,
+            )))
+        }
+        #[cfg(not(feature = "quickwit"))]
+        InnerTermDictBuilder::create_with_max_inline_docs(w, max_inline_docs).map(Self)
     }
 
     /// Inserts a `(key, value)` pair in the term dictionary.
     ///
     /// *Keys have to be inserted in order.*
     pub fn insert<K: AsRef<[u8]>>(&mut self, key_ref: K, value: &TermInfo) -> io::Result<()> {
-        if !cfg!(feature = "quickwit") && value.inline_postings.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "inline postings require an SSTable",
-            ));
-        }
         self.0.insert(key_ref, value)
     }
 
-    /// Inserts a term key. Follow each call with `insert_value` before inserting another key.
-    /// Prefer `insert(key, value)` to write both together.
+    /// # Warning
+    /// Horribly dangerous internal API
+    ///
+    /// If used, it must be used by systematically alternating calls
+    /// to insert_key and insert_value.
+    ///
+    /// Prefer using `.insert(key, value)`
     pub fn insert_key(&mut self, key: &[u8]) -> io::Result<()> {
         self.0.insert_key(key)
     }
 
-    /// Inserts the term metadata for the preceding `insert_key` call.
+    /// # Warning
+    ///
+    /// Horribly dangerous internal API. See `.insert_key(...)`.
     pub fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
-        if !cfg!(feature = "quickwit") && term_info.inline_postings.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "inline postings require an SSTable",
-            ));
-        }
         self.0.insert_value(term_info)
     }
 

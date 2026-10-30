@@ -15,7 +15,7 @@ use crate::{DocId, DocSet, Score, TERMINATED};
 ///
 /// # Preconditions
 /// - `scorers` has at least 2 elements
-/// - All scorers read frequencies
+/// - All scorers read frequencies (`FreqReadingOption::ReadFreq`)
 pub(crate) fn block_wand_intersection(
     mut scorers: Vec<TermScorer>,
     mut threshold: Score,
@@ -101,7 +101,7 @@ pub(crate) fn block_wand_intersection(
             .min(block_cursor.block_len());
 
         let block_docs = &block_cursor.doc_decoder.output_array()[start_idx..end_idx];
-        let block_freqs = &block_cursor.freqs()[start_idx..end_idx];
+        let block_freqs = &block_cursor.freq_output_array()[start_idx..end_idx];
 
         // Pass 1: Batch-compute leader BM25 scores and branchlessly filter
         // candidates that can't beat the threshold.

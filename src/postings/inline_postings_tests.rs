@@ -7,6 +7,153 @@ use crate::schema::{IndexRecordOption, Schema, TextFieldIndexing, TextOptions, T
 use crate::{DocSet, Index, Term, TERMINATED};
 
 #[test]
+fn test_inline_postings_mixed_legacy_merge() -> crate::Result<()> {
+    for destination_cutoff in [1, 0] {
+        let mut schema = Schema::builder();
+        let field = schema.add_text_field("text", TEXT);
+        let mut index = Index::create_in_ram(schema.build());
+        let mut segments = Vec::new();
+        for (cutoff, text, token) in [
+            (0, "legacy shared shared tail", "legacy"),
+            (1, "modern shared tail", "modern"),
+        ] {
+            index.settings_mut().max_inline_docs = cutoff;
+            let mut writer = index.writer_for_tests()?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            writer.add_document(doc!(field => text))?;
+            writer.commit()?;
+            writer.wait_merging_threads()?;
+            let id = index
+                .searchable_segment_ids()?
+                .into_iter()
+                .find(|id| !segments.contains(id))
+                .unwrap();
+            segments.push(id);
+            let searcher = index.reader()?.searcher();
+            let segment = searcher
+                .segment_readers()
+                .iter()
+                .find(|segment| segment.segment_id() == id)
+                .unwrap();
+            let info = segment
+                .inverted_index(field)?
+                .get_term_info(&Term::from_field_text(field, token))?
+                .unwrap();
+            assert_eq!(info.inline_postings.is_some(), cutoff == 1);
+        }
+        index.settings_mut().max_inline_docs = destination_cutoff;
+        let mut writer = index.writer_for_tests::<crate::TantivyDocument>()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.merge(&segments).wait()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert_eq!(searcher.num_docs(), 2);
+        let inverted = searcher.segment_reader(0).inverted_index(field)?;
+        let legacy_doc = inverted
+            .read_postings(
+                &Term::from_field_text(field, "legacy"),
+                IndexRecordOption::Basic,
+            )?
+            .unwrap()
+            .doc();
+        for (token, count) in [("legacy", 1), ("modern", 1), ("shared", 2), ("tail", 2)] {
+            let term = Term::from_field_text(field, token);
+            let info = inverted.get_term_info(&term)?.unwrap();
+            assert_eq!(info.doc_freq, count);
+            assert_eq!(
+                info.inline_postings.is_some(),
+                destination_cutoff == 1 && count == 1
+            );
+            let mut postings = inverted
+                .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)?
+                .unwrap();
+            for ordinal in 0..count {
+                let doc = match token {
+                    "legacy" => legacy_doc,
+                    "modern" => 1 - legacy_doc,
+                    _ => ordinal,
+                };
+                assert_eq!(postings.doc(), doc);
+                let expected = match token {
+                    "shared" if doc == legacy_doc => vec![1, 2],
+                    "shared" => vec![1],
+                    "tail" if doc == legacy_doc => vec![3],
+                    "tail" => vec![2],
+                    _ => vec![0],
+                };
+                assert_eq!(postings.term_freq(), expected.len() as u32);
+                let mut positions = Vec::new();
+                postings.positions(&mut positions);
+                assert_eq!(positions, expected);
+                postings.advance();
+            }
+            assert_eq!(postings.doc(), TERMINATED);
+            assert_eq!(
+                searcher.search(&TermQuery::new(term, IndexRecordOption::WithFreqs), &Count)?,
+                count as usize
+            );
+        }
+        let phrase = PhraseQuery::new(vec![
+            Term::from_field_text(field, "shared"),
+            Term::from_field_text(field, "tail"),
+        ]);
+        assert_eq!(searcher.search(&phrase, &Count)?, 2);
+        let regex = RegexPhraseQuery::new(field, vec!["shared".into(), "tail".into()]);
+        assert_eq!(searcher.search(&regex, &Count)?, 2);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_inline_singleton_block_reader_reset() -> crate::Result<()> {
+    let mut schema = Schema::builder();
+    let field = schema.add_text_field("text", TEXT);
+    let mut index = Index::create_in_ram(schema.build());
+    index.settings_mut().max_inline_docs = 1;
+    let mut writer = index.writer_for_tests()?;
+    writer.add_document(doc!(field => "external external"))?;
+    writer.add_document(doc!(field => "external external singleton external"))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+    let inverted = searcher.segment_reader(0).inverted_index(field)?;
+    let singleton = Term::from_field_text(field, "singleton");
+    let external = Term::from_field_text(field, "external");
+    assert!(inverted
+        .get_term_info(&singleton)?
+        .unwrap()
+        .inline_postings
+        .is_some());
+    assert!(inverted
+        .get_term_info(&external)?
+        .unwrap()
+        .inline_postings
+        .is_none());
+    let mut block = inverted
+        .read_block_postings(&singleton, IndexRecordOption::WithFreqsAndPositions)?
+        .unwrap();
+    for (term, docs, freqs) in [
+        (&singleton, &[1][..], &[1][..]),
+        (&external, &[0, 1][..], &[2, 3][..]),
+        (&singleton, &[1][..], &[1][..]),
+    ] {
+        let info = inverted.get_term_info(term)?.unwrap();
+        inverted.reset_block_postings_from_terminfo(&info, &mut block)?;
+        assert_eq!(block.docs(), docs);
+        assert_eq!(block.freqs(), freqs);
+        assert_eq!(block.doc_freq(), docs.len() as u32);
+        assert!(block.reads_freqs());
+        assert_eq!(block.position_offset(), 0);
+        for (i, &freq) in freqs.iter().enumerate() {
+            assert_eq!(block.freq(i), freq);
+        }
+        block.advance();
+        assert!(block.docs().is_empty());
+        assert_eq!(block.doc(0), TERMINATED);
+    }
+    Ok(())
+}
+
+#[test]
 fn test_inline_postings_json_top_score_and_numeric_frequency_resets() -> crate::Result<()> {
     use crate::query::QueryParser;
 
@@ -132,7 +279,11 @@ fn test_inline_postings_record_options_at_inline_boundaries() -> crate::Result<(
                 assert_eq!(info.doc_freq, count);
                 assert_eq!(
                     info.inline_postings.is_some(),
-                    count <= max_inline_docs,
+                    count <= max_inline_docs
+                        && (cfg!(feature = "quickwit")
+                            || (count == 1
+                                && indexed_option.has_positions()
+                                && term_freqs[0] == 1)),
                     "limit={max_inline_docs}, count={count}, option={indexed_option:?}"
                 );
                 for requested_option in options {
@@ -210,7 +361,7 @@ fn test_inline_postings_phrase_matches_and_bm25_scores() -> crate::Result<()> {
         let hits = searcher.search(&phrase, &top_docs)?;
         assert_eq!(hits.len(), 2);
         assert_eq!(searcher.search(&regex, &top_docs)?, hits);
-        // At cutoff 2, this union mixes inline "filler" with external "alpha" and "beta".
+        // With Quickwit at cutoff 2, this mixes inline "filler" with external terms.
         let regex = RegexPhraseQuery::new(field, vec![".*".into(), ".*".into()]);
         assert_eq!(searcher.search(&regex, &Count)?, 3);
         let query = TermQuery::new(alpha, IndexRecordOption::WithFreqs);
@@ -220,6 +371,147 @@ fn test_inline_postings_phrase_matches_and_bm25_scores() -> crate::Result<()> {
         // Inline and mixed dictionaries must preserve external-postings scores and ordering.
         assert_eq!(&hits, expected_hits.get_or_insert_with(|| hits.clone()));
     }
+    Ok(())
+}
+
+#[test]
+fn test_inline_single_occurrence_and_fallbacks() -> crate::Result<()> {
+    for option in [
+        IndexRecordOption::Basic,
+        IndexRecordOption::WithFreqs,
+        IndexRecordOption::WithFreqsAndPositions,
+    ] {
+        for cutoff in [0, 8] {
+            let mut schema = Schema::builder();
+            let field = schema.add_text_field(
+                "text",
+                TextOptions::default()
+                    .set_indexing_options(TextFieldIndexing::default().set_index_option(option)),
+            );
+            let mut index = Index::create_in_ram(schema.build());
+            index.settings_mut().max_inline_docs = cutoff;
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(field => "filler"))?;
+            writer.add_document(doc!(field => "prefix once repeated repeated suffix"))?;
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            let inverted = searcher.segment_reader(0).inverted_index(field)?;
+            // Read in dictionary order to cover external lists between inline lists.
+            for (token, expected_positions) in [
+                ("once", vec![1]),
+                ("prefix", vec![0]),
+                ("repeated", vec![2, 3]),
+                ("suffix", vec![4]),
+            ] {
+                let term = Term::from_field_text(field, token);
+                let info = inverted.get_term_info(&term)?.unwrap();
+                assert_eq!(info.doc_freq, 1);
+                assert_eq!(
+                    info.inline_postings.is_some(),
+                    cutoff > 0
+                        && (cfg!(feature = "quickwit")
+                            || (option.has_positions() && expected_positions.len() == 1)),
+                    "term={token}, option={option:?}, cutoff={cutoff}"
+                );
+                let mut postings = inverted
+                    .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)?
+                    .unwrap();
+                assert_eq!(postings.doc(), 1);
+                assert_eq!(
+                    postings.term_freq(),
+                    if option.has_freq() {
+                        expected_positions.len() as u32
+                    } else {
+                        1
+                    }
+                );
+                let mut positions = Vec::new();
+                postings.positions(&mut positions);
+                if option.has_positions() {
+                    assert_eq!(positions, expected_positions);
+                } else {
+                    assert!(positions.is_empty());
+                }
+                assert_eq!(postings.advance(), TERMINATED);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_inline_single_occurrence_merge_and_delete_conversion() -> crate::Result<()> {
+    let mut schema = Schema::builder();
+    let field = schema.add_text_field("text", TEXT);
+    let mut index = Index::create_in_ram(schema.build());
+    index.settings_mut().max_inline_docs = 8;
+    let mut writer = index.writer_for_tests()?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    writer.add_document(doc!(field => "shrink remove"))?;
+    writer.add_document(doc!(field => "prefix shrink grow"))?;
+    writer.commit()?;
+    writer.add_document(doc!(field => "prefix grow"))?;
+    writer.commit()?;
+    let reader = index.reader()?;
+    let shrink = Term::from_field_text(field, "shrink");
+    let grow = Term::from_field_text(field, "grow");
+    let searcher = reader.searcher();
+    assert_eq!(searcher.segment_readers().len(), 2);
+    for segment in searcher.segment_readers() {
+        let inverted = segment.inverted_index(field)?;
+        let info = inverted.get_term_info(&grow)?.unwrap();
+        assert_eq!(info.doc_freq, 1);
+        assert!(info.inline_postings.is_some());
+        if let Some(info) = inverted.get_term_info(&shrink)? {
+            assert_eq!(info.doc_freq, 2);
+            assert_eq!(info.inline_postings.is_some(), cfg!(feature = "quickwit"));
+        }
+    }
+    writer.delete_term(Term::from_field_text(field, "remove"));
+    writer.commit()?;
+    writer.merge(&index.searchable_segment_ids()?).wait()?;
+    reader.reload()?;
+    let searcher = reader.searcher();
+    assert_eq!(searcher.segment_readers().len(), 1);
+    assert_eq!(searcher.num_docs(), 2);
+    let inverted = searcher.segment_reader(0).inverted_index(field)?;
+    // Find the surviving first-segment document through "shrink" so position
+    // assertions are independent of the merge's segment ordering.
+    let shrink_doc = inverted
+        .read_postings(&shrink, IndexRecordOption::Basic)?
+        .unwrap()
+        .doc();
+    // Deletion turns the FST's external "shrink" into inline postings. Merging
+    // the two inline "grow" lists turns them into one external list.
+    for (term, count, inline) in [(&shrink, 1, true), (&grow, 2, cfg!(feature = "quickwit"))] {
+        let info = inverted.get_term_info(term)?.unwrap();
+        assert_eq!(info.doc_freq, count);
+        assert_eq!(info.inline_postings.is_some(), inline);
+        let mut postings = inverted
+            .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
+            .unwrap();
+        for _ in 0..count {
+            assert!(postings.doc() < 2);
+            assert_eq!(postings.term_freq(), 1);
+            let mut positions = Vec::new();
+            postings.positions(&mut positions);
+            let position = if term == &grow && postings.doc() == shrink_doc {
+                2
+            } else {
+                1
+            };
+            assert_eq!(positions, vec![position]);
+            postings.advance();
+        }
+        assert_eq!(postings.doc(), TERMINATED);
+    }
+    assert!(inverted
+        .get_term_info(&Term::from_field_text(field, "remove"))?
+        .is_none());
+    assert_eq!(
+        searcher.search(&PhraseQuery::new(vec![shrink, grow]), &Count)?,
+        1
+    );
     Ok(())
 }
 
@@ -276,7 +568,10 @@ fn test_inline_postings_merge_and_delete_remapping() -> crate::Result<()> {
         let term = Term::from_field_text(field, token);
         let info = inverted.get_term_info(&term)?.unwrap();
         assert_eq!(info.doc_freq, count);
-        assert_eq!(info.inline_postings.is_some(), count == 8);
+        assert_eq!(
+            info.inline_postings.is_some(),
+            cfg!(feature = "quickwit") && count == 8
+        );
         let mut postings = inverted
             .read_postings_from_terminfo(&info, IndexRecordOption::WithFreqsAndPositions)?;
         if field == basic {

@@ -1,29 +1,31 @@
 # SSTable
 
-The `tantivy-sstable` crate stores sorted byte-string keys and typed values.
+The `tantivy-sstable` crate is yet another sstable crate.
 
-It was designed for use in `quickwit`:
+It has been designed to be used in `quickwit`:
 - as an alternative to the default tantivy fst dictionary.
 - as a way to store the column index for dynamic fast fields.
 
 The benefit compared to the fst crate is locality.
-Searching for a key with the fst crate requires downloading the entire dictionary.
+Searching a key in the fst crate requires downloading the entire dictionary.
 
 Once the sstable index is downloaded, running a `get` in the sstable
 crate only requires a single fetch.
 
-The block index and default block size were chosen for Quickwit.
-Point lookups can be slow with these settings.
+Right now, the block index and the default block size have been thought
+for quickwit, and the performance of a get is very bad.
 
 # Sorted strings?
 
 SSTable stands for Sorted String Table.
-Keys must be inserted in sorted order.
+Strings have to be insert in sorted order.
 
-That sorted order supports:
-- point lookups and streaming ranges of keys
-- incremental encoding using shared key prefixes
-- automaton intersection that skips shared key prefixes
+That sorted order is used in different ways:
+- it makes gets and streaming ranges of keys
+possible.
+- it allows incremental encoding of the keys
+- the front compression is leveraged to optimize
+the intersection with an automaton
 
 # On disk format
 
@@ -36,7 +38,7 @@ Overview of the SSTable format. Unless noted otherwise, numbers are little-endia
 +-------+-------+-----+--------+
 |----( # of blocks)---|
 ```
-- Block(`SSTBlock`): a sequence of independent blocks, terminated by a zero block length.
+- Block(`SSTBlock`): list of independent block, terminated by a single empty block.
 - Footer(`SSTFooter`)
 
 ### SSTBlock
@@ -48,7 +50,7 @@ Overview of the SSTable format. Unless noted otherwise, numbers are little-endia
 - BlockLen(u32): length of EncodingFlag and Body. Zero marks the end of the blocks.
 - EncodingFlag(u8): 0 for raw bytes, 1 for whole-block zstd, 2 for separately encoded parts.
 - Body: for flags 0 and 1, a sequence of Values followed by key Deltas, stored raw or compressed with zstd.
-- Values: an application-defined sequence of values whose decoder determines its length.
+- Values: an application defined format storing a sequence of value, capable of determining it own length
 
 Flag 2 stores three parts in order: metadata, payload, and keys. Each part has this layout:
 ```
@@ -76,7 +78,7 @@ Decoding concatenates metadata, payload, and keys for the value and key readers.
 - Suffix: KeepAdd.add bytes of key suffix
 
 ### KeepAdd
-KeepAdd uses one byte when both lengths fit in four bits, and variable-length integers otherwise.
+KeepAdd can be represented in two different representation, a very compact 1byte one which is enough for most usage, and a longer variable-len one when required
 
 When keep < 16 and add < 16
 ```
@@ -85,7 +87,7 @@ When keep < 16 and add < 16
 +-----+------+
 ```
 - Add(u4): number of bytes to push
-- Keep(u4): number of prefix bytes to retain from the previous key
+- Keep(u4): number of bytes to pop
 
 Otherwise:
 ```
@@ -94,11 +96,10 @@ Otherwise:
 +------+------+-----+
 ```
 - Add(VInt): number of bytes to push
-- Keep(VInt): number of prefix bytes to retain from the previous key
+- Keep(VInt): number of bytes to pop
 
 
-Keys are unique, so Add is positive after the first key. The first key has Keep equal to zero.
-These constraints distinguish the one-byte representation from the 0x01 marker.
+Note: as the SSTable does not support redundant keys, there is no ambiguity between both representation. Add is always guaranteed to be non-zero, except for the very first key of an SSTable, where Keep is guaranteed to be zero.
 
 ### SSTFooter
 ```
@@ -154,18 +155,20 @@ Fst is in the format of tantivy\_fst
 - FirstOrdinalDelta(var): FirstOrdinalNBits *bits* of little endian number. See below for decoding
 - FinalRangeEnd(var): RangeStartNBits *bits* of integer. See below for decoding
 
-Convert BlockData at index Index and its BlockAddrBlockMetadata to a block address as follows:
-range\_prediction := RangeStart + Index * RangeSlope;
+converting a BlockData of index Index and a BlockAddrBlockMetadata to an actual block address is done as follow:
+range\_prediction := RangeStart + Index * RangeSlop;
 range\_derivation := RangeStartDelta - (1 << (RangeStartNBits-1));
 range\_start := range\_prediction + range\_derivation
 
-The same computation applies to ordinals.
+The same computation can be done for ordinal.
 
-`range_derivation` can be negative. `RangeStartDelta` shifts it into an unsigned range.
+Note that `range_derivation` can take negative value. `RangeStartDelta` is just its translation to a positive range.
 
 
 ## SingleBlockSStable
 
-The index has a fixed cost of around 70 bytes, which can be significant for a table with few keys.
-Single-block SSTables omit Fst and BlockAddrStore to save that space.
-Lookups use an implicit block with first ordinal 0, range start 0, and range end IndexOffset.
+The format used for the index is meant to be compact, however it has a constant cost of around 70
+bytes, which isn't negligible for a table containing very few keys.
+To limit the impact of that constant cost, single block sstable omit the Fst and BlockAddrStore from
+their index. Instead a block with first ordinal of 0, range start of 0 and range end of IndexOffset
+is implicitly used for every operations.
