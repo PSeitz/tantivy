@@ -12,7 +12,6 @@ pub mod file_slice;
 mod group_by;
 pub mod json_path_writer;
 mod key_tracking;
-mod read_ranges;
 mod serialize;
 mod versatile_buffer;
 mod vint;
@@ -24,7 +23,6 @@ pub use group_by::GroupByIteratorExtended;
 pub use json_path_writer::JsonPathWriter;
 pub use key_tracking::{KeyTracking, WithoutKeys};
 pub use ownedbytes::{OwnedBytes, StableDeref};
-pub use read_ranges::merge_ranges_with_byte_budget;
 pub use serialize::{BinarySerializable, DeserializeFrom, FixedSize};
 pub use versatile_buffer::VersatileBuffer;
 pub use vint::{

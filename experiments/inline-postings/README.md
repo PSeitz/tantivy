@@ -63,52 +63,12 @@ allocations, validation, positions, and an inline-ID checksum. File I/O and
 opening the dictionary are excluded. Shared-workstation variance limits precision.
 These scans show a small CPU cost for deltas. Live-query latency remains unmeasured.
 
-## External reads and request budget
-
-The planner first merges gaps up to 512 KiB, then fills the cheapest remaining
-gaps within an additional allowance of `max(2 MiB, initial_read_bytes / 4)` per
-field, segment, and call. This minimizes requests within that allowance. Small
-plans can grow by more than 25% because of the 2 MiB minimum.
-
-At cutoff 8, each policy cell below is **requests / external bytes**. Bytes include
-coalesced gaps. These plans apply to both absolute and delta encodings because
-their external ranges are identical.
-
-| Query | Matching lists | External lists | Fixed 512 KiB | With byte budget |
-|---|---:|---:|---:|---:|
-| `*a*` | 1,921,269 | 3,870 | 33 / 79,121,102 | 11 / 97,597,707 |
-| `*ab*` | 75,774 | 203 | 30 / 1,947,701 | 28 / 3,401,299 |
-| `*aba*` | 2,817 | 16 | 5 / 657,307 | 4 / 2,015,570 |
-| `*traaa*` | 2 | 0 | 0 / 0 | 0 / 0 |
-| `traaa*` | 0 | 0 | 0 / 0 | 0 / 0 |
-| `*player*` | 21 | 21 | 11 / 4,699,006 | 10 / 5,943,196 |
-| `*ms*` | 50,585 | 27 | 16 / 1,556,712 | 14 / 2,922,609 |
-
-For `*a*`, the byte budget cuts requests from 33 to 11 for 18.48 MB more data
-(23.4%). Both `*traaa*` matches are inline. The prefix `traaa*` has no matches.
-
-Sums across these seven independent queries, with equal weight and no cross-query
-caching, show the effect of the inline cutoff. Each query gets its own allowance.
-
-| Cutoff | Postings bytes excluding gaps | Fixed requests / external bytes | Budgeted requests / external bytes |
-|---:|---:|---:|---:|
-| 0 | 50,089,825 | 378 / 596,950,546 | 185 / 743,579,954 |
-| 8 | 40,176,390 | 95 / 87,981,828 | 67 / 111,880,381 |
-| 32 | 39,993,334 | 73 / 59,797,495 | 53 / 77,019,020 |
-| 64 | 39,959,502 | 54 / 54,016,768 | 37 / 69,984,821 |
-| 128 | 39,950,059 | 47 / 53,577,891 | 32 / 67,019,221 |
-
-These are planned external-postings reads. They exclude dictionary reads,
-external positions, document retrieval, retries, and storage-specific request
-limits. They show how the cutoff affects these seven queries. Request
-overhead, throughput, concurrency, and caching determine the latency tradeoff.
-
 ## Cold dictionary costs
 
 This historical measurement uses the earlier absolute-ID, fixed-four-bit layout
-at cutoff 8. Both columns use fixed 512 KiB coalescing, without the extra-byte
-budget. Values include dictionary-block reads plus external postings, with the
-dictionary index already open.
+at cutoff 8. Both columns use experimental fixed 512 KiB coalescing. The current
+reader retains the existing 4 MiB threshold. Values include dictionary-block
+reads plus external postings, with the dictionary index already open.
 
 | Query | No inlining, cold total MB | Cutoff 8, cold total MB |
 |---|---:|---:|

@@ -11,7 +11,8 @@ pub use u64_monotonic::{U64MonotonicValueReader, U64MonotonicValueWriter};
 pub use vec_u32::{VecU32ValueReader, VecU32ValueWriter};
 pub use void::{VoidValueReader, VoidValueWriter};
 
-/// Reads blocks of values and provides random access within each block.
+/// `ValueReader` is a trait describing the contract of something
+/// reading blocks of value, and offering random access within this values.
 pub trait ValueReader: Default {
     /// Type of the value being read.
     type Value;
@@ -31,7 +32,8 @@ pub trait ValueReader: Default {
     fn load(&mut self, data: &[u8]) -> io::Result<usize>;
 }
 
-/// Writes blocks of values.
+/// `ValueWriter` is a trait to make it possible to write blocks
+/// of value.
 pub trait ValueWriter: Default {
     /// Type of the value being written.
     type Value;

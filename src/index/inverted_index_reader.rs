@@ -19,36 +19,24 @@ use crate::termdict::TermDictionary;
 #[cfg(feature = "quickwit")]
 use crate::Executor;
 
-// Merge gaps up to this size before spending the additional postings byte budget.
-// Dictionary reads use this threshold alone.
 #[cfg(feature = "quickwit")]
-const MERGE_HOLES_UNDER_BYTES: usize = 512 * 1024;
-
-// Minimum allowance for extra bytes used to reduce postings requests.
-#[cfg(feature = "quickwit")]
-const MIN_EXTRA_POSTINGS_BYTES: usize = 2 * 1024 * 1024;
+// This is how many bytes we can hope to receive during a TTFB from S3 (~80MiB/s, 50ms).
+const MERGE_HOLES_UNDER_BYTES: usize = (80 * 1024 * 1024 * 50) / 1000;
 
 #[cfg(feature = "quickwit")]
 fn send_coalesced_posting_ranges(
     posting_ranges: impl Iterator<Item = std::ops::Range<usize>>,
     sender: futures_channel::mpsc::UnboundedSender<std::ops::Range<usize>>,
 ) -> io::Result<()> {
-    let mut posting_ranges: Vec<_> = posting_ranges
-        .filter(|range| !range.is_empty())
-        .coalesce(|range1, range2| {
-            if range2.start.saturating_sub(range1.end) <= MERGE_HOLES_UNDER_BYTES {
-                Ok(range1.start..range1.end.max(range2.end))
-            } else {
-                Err((range1, range2))
-            }
-        })
-        .collect();
-    let initial_bytes: usize = posting_ranges.iter().map(|range| range.len()).sum();
-    // Minimize requests, spending at most 25% more bytes or 2 MiB, whichever is larger.
-    // Preserve the initial merges so the request count can only decrease.
-    let extra_bytes = (initial_bytes / 4).max(MIN_EXTRA_POSTINGS_BYTES);
-    common::merge_ranges_with_byte_budget(&mut posting_ranges, extra_bytes);
-    for posting_range in posting_ranges {
+    let posting_ranges = posting_ranges.filter(|range| !range.is_empty());
+    let merged_posting_ranges = posting_ranges.coalesce(|range1, range2| {
+        if range1.end + MERGE_HOLES_UNDER_BYTES >= range2.start {
+            Ok(range1.start..range2.end)
+        } else {
+            Err((range1, range2))
+        }
+    });
+    for posting_range in merged_posting_ranges {
         sender
             .unbounded_send(posting_range)
             .map_err(|_| io::Error::other("failed to send posting range back"))?;
@@ -472,7 +460,7 @@ impl InvertedIndexReader {
     ///
     /// returns a boolean, whether a term matching the range was found in the dictionary
     pub async fn warm_postings_automaton<
-        A: Automaton + Send + 'static,
+        A: Automaton + Clone + Send + 'static,
         E: FnOnce(Box<dyn FnOnce() -> io::Result<()> + Send>) -> F,
         F: std::future::Future<Output = io::Result<()>>,
     >(
@@ -488,7 +476,7 @@ impl InvertedIndexReader {
         // We build a first iterator to download everything. Simply calling the function already
         // download everything we need from the sstable, but doesn't start iterating over it.
         let mut term_info_iter = self
-            .get_term_range_async(.., &automaton, None, MERGE_HOLES_UNDER_BYTES)
+            .get_term_range_async(.., automaton.clone(), None, MERGE_HOLES_UNDER_BYTES)
             .await?;
         // Inline-only matches also count, even though they require no external postings reads.
         let terms_found = term_info_iter.next().is_some();
@@ -542,7 +530,6 @@ impl InvertedIndexReader {
         let term_info_stream = self
             .termdict
             .search(&automaton)
-            .without_keys()
             .into_stream_async_merging_holes(MERGE_HOLES_UNDER_BYTES)
             .await?;
         drop(term_info_stream);
@@ -650,7 +637,7 @@ mod tests {
     use tantivy_fst::automaton::AlwaysMatch;
     use tantivy_fst::Regex;
 
-    use super::{send_coalesced_posting_ranges, InvertedIndexReader};
+    use super::InvertedIndexReader;
     use crate::directory::{FileHandle, FileSlice, OwnedBytes};
     use crate::query::BitSetDocSet;
     use crate::schema::{Schema, STRING};
@@ -692,30 +679,6 @@ mod tests {
             positions_file_slice: wrap(&reader.positions_file_slice),
             record_option: reader.record_option,
             total_num_tokens: reader.total_num_tokens,
-        }
-    }
-
-    #[test]
-    fn test_postings_byte_budget_minimizes_requests() {
-        // Four lists with gaps of 1000, 700, and 900 KiB. The 2 MiB allowance buys
-        // the two cheapest gaps. Larger lists get a 25% allowance that buys all three.
-        for (list_bytes, expected_requests, gap_bytes) in
-            [(1, 2, 1600 * 1024), (4 * 1024 * 1024, 1, 2600 * 1024)]
-        {
-            let mut input = vec![0..0, 0..list_bytes];
-            for gap in [1000, 700, 900] {
-                let start = input.last().unwrap().end + gap * 1024;
-                input.push(start..start + list_bytes);
-            }
-            let (sender, receiver) = futures_channel::mpsc::unbounded();
-            send_coalesced_posting_ranges(input.into_iter(), sender).unwrap();
-            let ranges =
-                futures::executor::block_on(futures_util::StreamExt::collect::<Vec<_>>(receiver));
-            assert_eq!(ranges.len(), expected_requests);
-            assert_eq!(
-                ranges.iter().map(Range::len).sum::<usize>(),
-                4 * list_bytes + gap_bytes
-            );
         }
     }
 

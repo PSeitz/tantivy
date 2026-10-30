@@ -6,14 +6,15 @@ use common::{BinarySerializable, FixedSize};
 
 use super::LoadedPostings;
 
-/// A term's document count, file ranges, and inline postings within a segment.
+/// `TermInfo` wraps the metadata associated with a Term.
+/// It is segment-local.
 #[derive(Debug, Default, Eq, PartialEq, Clone)]
 pub struct TermInfo {
     /// Number of documents in the segment containing the term
     pub doc_freq: u32,
     /// Byte range of the posting list within the postings (`.idx`) file.
     pub postings_range: Range<usize>,
-    /// Byte range of the term's positions in the positions (`.pos`) file.
+    /// Byte range of the positions of this terms in the positions (`.pos`) file.
     pub positions_range: Range<usize>,
     /// Postings stored inline in the term dictionary. File ranges are empty when present.
     pub inline_postings: Option<Arc<LoadedPostings>>,

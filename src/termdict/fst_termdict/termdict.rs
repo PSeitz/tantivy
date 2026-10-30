@@ -31,8 +31,7 @@ pub struct TermDictionaryBuilder<W> {
 }
 
 impl<W> TermDictionaryBuilder<W>
-where
-    W: Write,
+where W: Write
 {
     /// Creates a new `TermDictionaryBuilder`
     pub fn create(w: W) -> io::Result<Self> {
@@ -80,7 +79,8 @@ where
     ///
     /// Horribly dangerous internal API. See `.insert_key(...)`.
     pub fn insert_value(&mut self, term_info: &TermInfo) -> io::Result<()> {
-        self.term_info_store_writer.write_term_info(term_info)
+        self.term_info_store_writer.write_term_info(term_info)?;
+        Ok(())
     }
 
     /// Finalize writing the builder, and returns the underlying
@@ -126,7 +126,9 @@ static EMPTY_TERM_DICT_FILE: Lazy<FileSlice> = Lazy::new(|| {
 /// The term dictionary contains all of the terms in
 /// `tantivy index` in a sorted manner.
 ///
-/// FST values are sorted term ordinals indexing `TermInfoStore`.
+/// The `Fst` crate is used to associate terms to their
+/// respective `TermOrdinal`. The `TermInfoStore` then makes it
+/// possible to fetch the associated `TermInfo`.
 #[derive(Clone)]
 pub struct TermDictionary {
     fst_index: Arc<tantivy_fst::Map<OwnedBytes>>,
