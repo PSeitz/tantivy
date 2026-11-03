@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1460" height="1410" viewBox="0 0 1460 1410" role="img" aria-labelledby="title desc">
+<title id="title">Warm-up steps by entry point</title>
+<desc id="desc">Each row is a separate method invocation, not a branch of a shared execution. Fast-field handle listing reads metadata and returns handles. Column data is a separate caller read. Individual postings methods, full postings, and full dictionary warm-up each have different internal steps.</desc>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#64748b"/></marker>
+  <style>
+    text { font-family: system-ui, -apple-system, sans-serif; fill: #172554; }
+    .title { font-size: 30px; font-weight: 750; }
+    .method { font-family: ui-monospace, monospace; font-size: 18px; font-weight: 700; }
+    .body { font-size: 17px; }
+    .small { font-size: 14px; fill: #475569; }
+    .meta { fill: #dbeafe; stroke: #60a5fa; }
+    .data { fill: #dcfce7; stroke: #4ade80; }
+    .cpu { fill: #f1f5f9; stroke: #94a3b8; }
+    .row { fill: white; stroke: #cbd5e1; }
+    .flow { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }
+  </style>
+</defs>
+<rect width="1460" height="1410" fill="#f8fafc"/>
+<text x="40" y="50" class="title">Warm-up steps by entry point</text>
+<text x="40" y="81" class="body">Each row is ONE method invocation. Rows do not imply a shared schedule, execution order, or concurrency.</text>
+<text x="40" y="108" class="small">Readers are already open. Blue = dictionary read · green = payload read · gray = local work / return. Cache hits can avoid network requests.</text>
+
+<rect x="30" y="132" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="162" class="method">FastFieldReaders::list_dynamic_column_handles(field_name)</text>
+<rect x="50" y="179" width="250" height="43" rx="6" class="cpu"/><text x="67" y="206" class="body">Resolve field name</text>
+<path d="M300 200H358" class="flow"/>
+<rect x="360" y="179" width="470" height="43" rx="6" class="meta"/><text x="377" y="206" class="body">READ column-dictionary prefix range</text>
+<path d="M830 200H888" class="flow"/>
+<rect x="890" y="179" width="510" height="43" rx="6" class="cpu"/><text x="907" y="206" class="body">Decode and return handles. No column-data read.</text>
+
+<rect x="30" y="254" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="284" class="method">FastFieldReaders::list_subpath_dynamic_column_handles(root_path)</text>
+<rect x="50" y="301" width="250" height="43" rx="6" class="cpu"/><text x="67" y="328" class="body">Resolve root path</text>
+<path d="M300 322H358" class="flow"/>
+<rect x="360" y="301" width="470" height="43" rx="6" class="meta"/><text x="377" y="328" class="body">READ descendant-dictionary prefix range</text>
+<path d="M830 322H888" class="flow"/>
+<rect x="890" y="301" width="510" height="43" rx="6" class="cpu"/><text x="907" y="328" class="body">Decode and return handles. No column-data read.</text>
+
+<rect x="30" y="376" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="406" class="method">handle.file_slice().read_bytes_async() — separate caller operation</text>
+<rect x="50" y="423" width="250" height="43" rx="6" class="cpu"/><text x="67" y="450" class="body">Existing column handle</text>
+<path d="M300 444H358" class="flow"/>
+<rect x="360" y="423" width="470" height="43" rx="6" class="data"/><text x="377" y="450" class="body">READ whole column slice</text>
+<path d="M830 444H888" class="flow"/>
+<rect x="890" y="423" width="510" height="43" rx="6" class="cpu"/><text x="907" y="450" class="body">Return bytes</text>
+
+<rect x="30" y="498" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="528" class="method">InvertedIndexReader::warm_postings(term, with_positions)</text>
+<rect x="50" y="545" width="390" height="43" rx="6" class="meta"/><text x="67" y="572" class="body">READ term-dictionary block</text>
+<path d="M440 566H498" class="flow"/>
+<rect x="500" y="545" width="290" height="43" rx="6" class="cpu"/><text x="517" y="572" class="body">Find term and decode offsets</text>
+<path d="M790 566H848" class="flow"/>
+<rect x="850" y="545" width="550" height="43" rx="6" class="data"/><text x="867" y="572" class="body">READ postings ∥ optional positions, if term exists</text>
+
+<rect x="30" y="620" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="650" class="method">InvertedIndexReader::warm_postings_range(terms, limit, with_positions)</text>
+<rect x="50" y="667" width="390" height="43" rx="6" class="meta"/><text x="67" y="694" class="body">READ dictionary-block span</text>
+<path d="M440 688H498" class="flow"/>
+<rect x="500" y="667" width="290" height="43" rx="6" class="cpu"/><text x="517" y="694" class="body">Find first/last selected terms</text>
+<path d="M790 688H848" class="flow"/>
+<rect x="850" y="667" width="550" height="43" rx="6" class="data"/><text x="867" y="694" class="body">READ postings span ∥ optional positions span</text>
+
+<rect x="30" y="742" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="772" class="method">InvertedIndexReader::warm_postings_automaton(automaton, executor)</text>
+<rect x="50" y="789" width="390" height="43" rx="6" class="meta"/><text x="67" y="816" class="body">READ selected dictionary ranges</text>
+<path d="M440 810H498" class="flow"/>
+<rect x="500" y="789" width="390" height="43" rx="6" class="cpu"/><text x="517" y="816" class="body">Enumerate + coalesce postings ranges</text>
+<text x="905" y="816" class="body">⇄</text>
+<rect x="950" y="789" width="450" height="43" rx="6" class="data"/><text x="967" y="816" class="body">READ postings ranges (overlapping CPU)</text>
+
+<rect x="30" y="864" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="894" class="method">InvertedIndexReader::warm_postings_automaton_with_bitset(automaton, max_doc, executor)</text>
+<rect x="50" y="911" width="310" height="43" rx="6" class="meta"/><text x="67" y="938" class="body">READ dictionary ranges</text>
+<path d="M360 932H408" class="flow"/>
+<rect x="410" y="911" width="495" height="43" rx="6" class="data"/><text x="427" y="938" class="body">Enumerate ⇄ READ coalesced postings ranges</text>
+<path d="M905 932H953" class="flow"/>
+<rect x="955" y="911" width="445" height="43" rx="6" class="cpu"/><text x="972" y="938" class="body">Decode cached postings → return bitset</text>
+
+<rect x="30" y="986" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="1016" class="method">InvertedIndexReader::warm_postings_full(with_positions)</text>
+<rect x="50" y="1033" width="470" height="43" rx="6" class="data"/><text x="67" y="1060" class="body">READ whole field postings body</text>
+<path d="M520 1054H578" class="flow"/>
+<rect x="580" y="1033" width="820" height="43" rx="6" class="data"/><text x="597" y="1060" class="body">If requested: READ whole positions body — sequential after postings</text>
+
+<rect x="30" y="1108" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="1138" class="method">InvertedIndexReader::doc_freq_async(term)</text>
+<rect x="50" y="1155" width="470" height="43" rx="6" class="meta"/><text x="67" y="1182" class="body">READ candidate term-dictionary block, if any</text>
+<path d="M520 1176H578" class="flow"/>
+<rect x="580" y="1155" width="820" height="43" rx="6" class="cpu"/><text x="597" y="1182" class="body">Return document frequency, or 0 if absent. No postings read.</text>
+
+<rect x="30" y="1230" width="1400" height="110" rx="10" class="row"/>
+<text x="50" y="1260" class="method">TermDictionary::warm_up_dictionary() → Dictionary::warm_up_dictionary()</text>
+<rect x="50" y="1277" width="470" height="43" rx="6" class="meta"/><text x="67" y="1304" class="body">READ whole dictionary data body</text>
+<path d="M520 1298H578" class="flow"/>
+<rect x="580" y="1277" width="820" height="43" rx="6" class="cpu"/><text x="597" y="1304" class="body">Return (). No dictionary-opening step or postings read inside this method.</text>
+
+<text x="40" y="1370" class="small">Tantivy 9f2f1b2f6 · Automaton range downloads: up to 5 in flight per stage/invocation · Missing terms skip payload reads.</text>
+<text x="40" y="1394" class="small">See ../warmup.md for call chains, early returns, prerequisites, and the separation between entry points and caller orchestration.</text>
+</svg>
