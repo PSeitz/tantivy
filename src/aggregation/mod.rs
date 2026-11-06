@@ -129,6 +129,7 @@
 
 mod accessor_helpers;
 mod agg_data;
+mod execution_plan;
 mod agg_limits;
 pub mod agg_req;
 pub mod agg_result;

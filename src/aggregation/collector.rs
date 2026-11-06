@@ -1,5 +1,6 @@
 use super::agg_req::Aggregations;
 use super::agg_result::AggregationResults;
+use super::execution_plan::AggregationExecutionPlan;
 use super::buffered_sub_aggs::LowCardBufferedSubAggs;
 use super::intermediate_agg_result::IntermediateAggregationResults;
 use super::AggContextParams;
@@ -137,6 +138,7 @@ fn merge_fruits(
 pub struct AggregationSegmentCollector {
     aggs_with_accessor: AggregationsSegmentCtx,
     agg_collector: LowCardBufferedSubAggs,
+    execution_plan: AggregationExecutionPlan,
     error: Option<TantivyError>,
 }
 
@@ -149,8 +151,13 @@ impl AggregationSegmentCollector {
         segment_ordinal: SegmentOrdinal,
         context: &AggContextParams,
     ) -> crate::Result<Self> {
-        let mut agg_data =
-            build_aggregations_data_from_req(agg, reader, segment_ordinal, context.clone())?;
+        let execution_plan = AggregationExecutionPlan::analyze(agg);
+        let mut agg_data = build_aggregations_data_from_req(
+            execution_plan.physical_aggs(),
+            reader,
+            segment_ordinal,
+            context.clone(),
+        )?;
         let mut result =
             LowCardBufferedSubAggs::new(build_segment_agg_collectors_root(&mut agg_data)?);
         result
@@ -160,6 +167,7 @@ impl AggregationSegmentCollector {
         Ok(AggregationSegmentCollector {
             aggs_with_accessor: agg_data,
             agg_collector: result,
+            execution_plan,
             error: None,
         })
     }
@@ -215,6 +223,8 @@ impl SegmentCollector for AggregationSegmentCollector {
                 &mut sub_aggregation_res,
                 0,
             )?;
+        self.execution_plan
+            .materialize_logical_results(&mut sub_aggregation_res)?;
 
         Ok(sub_aggregation_res)
     }
