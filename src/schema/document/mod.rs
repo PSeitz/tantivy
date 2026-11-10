@@ -26,8 +26,9 @@
 //! significant amount of time when indexing by avoiding the additional allocations.
 //!
 //! ### Important Note
-//! The implementer of the `Document` trait must be `'static` and safe to send across
-//! thread boundaries.
+//! Documents must be safe to send across thread boundaries. Writer entry points and
+//! type-erased plugin access additionally require `'static`. Internal document views
+//! may borrow storage during synchronous indexing.
 //!
 //! ## Reusing existing types
 //! The API design of the document traits allow you to reuse as much of as little of the
@@ -170,22 +171,22 @@ mod value;
 use std::collections::BTreeMap;
 use std::mem;
 
-pub(crate) use self::de::BinaryDocumentDeserializer;
 pub use self::de::{
     ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
     ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,
 };
+pub(crate) use self::de::{BinaryDocumentDeserializer, BinaryValueDeserializer};
 pub use self::default_document::{
     CompactDocArrayIter, CompactDocObjectIter, CompactDocValue, DocParsingError, TantivyDocument,
 };
 pub use self::erased::{ErasedDocument, ErasedValue};
 pub use self::owned_value::OwnedValue;
-pub(crate) use self::se::BinaryDocumentSerializer;
+pub(crate) use self::se::{BinaryDocumentSerializer, BinaryValueSerializer};
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
 use super::*;
 
 /// The core trait representing a document within the index.
-pub trait Document: Send + Sync + 'static {
+pub trait Document: Send + Sync {
     /// The value of the field.
     type Value<'a>: Value<'a> + Clone
     where Self: 'a;

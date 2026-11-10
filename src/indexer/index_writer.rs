@@ -68,7 +68,7 @@ pub struct IndexWriterOptions {
 /// indexing queue.
 /// Each indexing thread builds its own independent [`Segment`], via
 /// a `SegmentWriter` object.
-pub struct IndexWriter<D: Document = TantivyDocument> {
+pub struct IndexWriter<D: Document + 'static = TantivyDocument> {
     // the lock is just used to bind the
     // lifetime of the lock with that of the IndexWriter.
     _directory_lock: Option<DirectoryLock>,
@@ -179,7 +179,7 @@ pub fn advance_deletes(
     Ok(())
 }
 
-fn index_documents<D: Document>(
+fn index_documents<D: Document + 'static>(
     memory_budget: usize,
     segment: Segment,
     grouped_document_iterator: &mut dyn Iterator<Item = AddBatch<D>>,
@@ -262,7 +262,7 @@ fn apply_deletes(
     })
 }
 
-impl<D: Document> IndexWriter<D> {
+impl<D: Document + 'static> IndexWriter<D> {
     /// Create a new index writer. Attempts to acquire a lockfile.
     ///
     /// The lockfile should be deleted on drop, but it is possible
@@ -818,7 +818,7 @@ impl<D: Document> IndexWriter<D> {
     }
 }
 
-impl<D: Document> Drop for IndexWriter<D> {
+impl<D: Document + 'static> Drop for IndexWriter<D> {
     fn drop(&mut self) {
         self.segment_updater.kill();
         self.drop_sender();

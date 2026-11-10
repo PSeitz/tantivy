@@ -8,6 +8,8 @@
 pub(crate) mod delete_queue;
 pub(crate) mod path_to_unordered_id;
 
+mod doc_clustering;
+mod doc_compression;
 pub mod doc_id_mapping;
 mod doc_opstamp_mapping;
 mod flat_map_with_buffer;
@@ -32,6 +34,8 @@ mod stamper;
 use crossbeam_channel as channel;
 use smallvec::SmallVec;
 
+pub use self::doc_clustering::{ClusteringConfig, DocIdGroups};
+pub use self::doc_compression::CompressionConfig;
 pub use self::doc_id_mapping::DocIdMapping;
 pub use self::index_writer::{advance_deletes, IndexWriter, IndexWriterOptions};
 pub use self::log_merge_policy::LogMergePolicy;
@@ -46,6 +50,14 @@ pub use self::single_segment_index_writer::SingleSegmentIndexWriter;
 
 /// Alias for the default merge policy, which is the `LogMergePolicy`.
 pub type DefaultMergePolicy = LogMergePolicy;
+
+/// A schema field and the JSON path within it.
+/// For `json.http.message`, the path segments are `["http", "message"]`.
+struct FieldPath {
+    field: crate::schema::Field,
+    /// Decoded path segments. Empty for a top-level field.
+    json_path: Vec<String>,
+}
 
 // Batch of documents.
 // Most of the time, users will send operation one-by-one, but it can be useful to

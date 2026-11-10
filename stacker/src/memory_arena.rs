@@ -36,7 +36,7 @@ const PAGE_SIZE: usize = 1 << NUM_BITS_PAGE_ADDR; // pages are 1 MB large
 /// page of memory.
 ///
 /// The last 20 bits are an address within this page of memory.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Addr(u32);
 
 impl Addr {
@@ -187,6 +187,13 @@ impl MemoryArena {
         Addr::new(new_page_id, 0)
     }
 
+    /// Whether `len` bytes fit in the current page or a new page within the 32-bit address space.
+    #[inline]
+    pub fn can_allocate(&self, len: usize) -> bool {
+        len <= PAGE_SIZE
+            && (self.pages.last().unwrap().is_available(len) || self.pages.len() < 4096)
+    }
+
     /// Allocates `len` bytes and returns the allocated address.
     #[inline]
     pub fn allocate_space(&mut self, len: usize) -> Addr {
@@ -261,6 +268,20 @@ mod tests {
 
     use super::MemoryArena;
     use crate::memory_arena::PAGE_SIZE;
+
+    #[test]
+    fn test_can_allocate() {
+        let mut arena = MemoryArena::default();
+        assert!(arena.can_allocate(PAGE_SIZE));
+        assert!(!arena.can_allocate(PAGE_SIZE + 1));
+        assert!(!arena.can_allocate(usize::MAX));
+        arena.allocate_space(PAGE_SIZE - 1);
+        assert!(arena.can_allocate(1));
+        assert!(arena.can_allocate(PAGE_SIZE));
+        arena.allocate_space(1);
+        assert!(arena.can_allocate(PAGE_SIZE));
+        assert_eq!(arena.mem_usage(), PAGE_SIZE);
+    }
 
     #[test]
     fn test_arena_allocate_slice() {

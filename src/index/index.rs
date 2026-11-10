@@ -252,7 +252,7 @@ impl IndexBuilder {
     ///
     /// It expects an originally empty directory, and will not run any GC operation.
     #[doc(hidden)]
-    pub fn single_segment_index_writer<D: Document>(
+    pub fn single_segment_index_writer<D: Document + 'static>(
         self,
         dir: impl Into<Box<dyn Directory>>,
         mem_budget: usize,
@@ -676,7 +676,7 @@ impl Index {
     /// If the lockfile already exists, returns `TantivyError::LockFailure`.
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
-    pub fn writer_with_options<D: Document>(
+    pub fn writer_with_options<D: Document + 'static>(
         &self,
         options: IndexWriterOptions,
     ) -> crate::Result<IndexWriter<D>> {
@@ -717,7 +717,7 @@ impl Index {
     /// If the lockfile already exists, returns `Error::DirectoryLockBusy` or an `Error::IoError`.
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
-    pub fn writer_with_num_threads<D: Document>(
+    pub fn writer_with_num_threads<D: Document + 'static>(
         &self,
         num_threads: usize,
         overall_memory_budget_in_bytes: usize,
@@ -735,7 +735,7 @@ impl Index {
     /// That index writer only simply has a single thread and a memory budget of 15 MB.
     /// Using a single thread gives us a deterministic allocation of DocId.
     #[cfg(test)]
-    pub fn writer_for_tests<D: Document>(&self) -> crate::Result<IndexWriter<D>> {
+    pub fn writer_for_tests<D: Document + 'static>(&self) -> crate::Result<IndexWriter<D>> {
         self.writer_with_num_threads(1, MEMORY_BUDGET_NUM_BYTES_MIN)
     }
 
@@ -750,7 +750,7 @@ impl Index {
     /// If the lockfile already exists, returns `Error::FileAlreadyExists`.
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
-    pub fn writer<D: Document>(
+    pub fn writer<D: Document + 'static>(
         &self,
         memory_budget_in_bytes: usize,
     ) -> crate::Result<IndexWriter<D>> {

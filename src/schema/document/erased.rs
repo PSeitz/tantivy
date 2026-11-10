@@ -28,15 +28,15 @@ pub enum ErasedValue<'a> {
 
 /// Object-safe counterpart to [`Document`].
 ///
-/// A blanket impl covers every `Document`, so `&document as &dyn ErasedDocument` always
-/// works. Consumers either downcast via [`as_any`](ErasedDocument::as_any) (zero cost, when
+/// A blanket impl covers every `Document + 'static`. Consumers either downcast via
+/// [`as_any`](ErasedDocument::as_any) (zero cost, when
 /// they know the concrete type) or walk [`erased_fields`](ErasedDocument::erased_fields).
 pub trait ErasedDocument {
     /// Iterates the document's `(field, value)` pairs in erased form.
     fn erased_fields<'a>(&'a self) -> Box<dyn Iterator<Item = (Field, ErasedValue<'a>)> + 'a>;
 
-    /// Recovers the concrete document. `Document: 'static`, so this is free — a consumer that
-    /// knows the type can `as_any().downcast_ref::<ConcreteDoc>()` and avoid the erased walk.
+    /// Recovers the concrete document. The blanket impl requires `'static`, so a consumer
+    /// that knows the type can `as_any().downcast_ref::<ConcreteDoc>()` and avoid the erased walk.
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -52,7 +52,7 @@ fn erase_value<'a, V: Value<'a> + 'a>(value: ReferenceValue<'a, V>) -> ErasedVal
     }
 }
 
-impl<D: Document> ErasedDocument for D {
+impl<D: Document + 'static> ErasedDocument for D {
     fn erased_fields<'a>(&'a self) -> Box<dyn Iterator<Item = (Field, ErasedValue<'a>)> + 'a> {
         Box::new(
             self.iter_fields_and_values()

@@ -1,9 +1,10 @@
 use std::marker::PhantomData;
 
 use crate::index::list_segment_files;
+use crate::indexer::doc_clustering::DocGroups;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
-use crate::indexer::{DocIdMapping, SegmentWriter};
+use crate::indexer::{ClusteringConfig, DocIdMapping, SegmentWriter};
 use crate::schema::document::Document;
 use crate::{Directory, Index, IndexMeta, Opstamp, Segment, TantivyDocument};
 
@@ -12,10 +13,11 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     segment_writer: SegmentWriter,
     segment: Segment,
     opstamp: Opstamp,
+    doc_groups: Option<DocGroups>,
     _phantom: PhantomData<D>,
 }
 
-impl<D: Document> SingleSegmentIndexWriter<D> {
+impl<D: Document + 'static> SingleSegmentIndexWriter<D> {
     pub(crate) fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
         let segment = index.new_segment();
         let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
@@ -23,27 +25,90 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
             segment_writer,
             segment,
             opstamp: 0,
+            doc_groups: None,
             _phantom: PhantomData,
         })
     }
 
+    /// Compress documents in nested groups, then index them in group order at finalization.
+    /// The caller's documents are released during ingestion. Fields and values are
+    /// borrowed from staged storage for built-in indexing and reconstructed losslessly as
+    /// [`TantivyDocument`] for custom plugins, including keys stored inline by compression.
+    /// Pre-tokenized strings are rejected, including inside arrays and objects.
+    /// Staging uses a shared arena with a 4 GiB address space. Encoded documents and
+    /// individual reconstructed messages are limited to 1 MiB. Allocation limits
+    /// produce errors. Use [`Self::mem_usage`] to decide when to finalize.
+    /// Must be configured before adding any documents. Indexing errors are deferred
+    /// until finalization.
+    /// An existing `sort_by_field` setting still applies after clustering.
+    ///
+    /// ```no_run
+    /// # use tantivy::{ClusteringConfig, Index, TantivyDocument};
+    /// # use tantivy::schema::{Schema, STRING, STORED};
+    /// # use tantivy::directory::RamDirectory;
+    /// # let mut schema = Schema::builder();
+    /// # schema.add_text_field("status", STRING);
+    /// # schema.add_json_field("json", STORED);
+    /// # let writer = Index::builder().schema(schema.build())
+    /// #     .single_segment_index_writer::<TantivyDocument>(RamDirectory::default(), 15_000_000)?;
+    /// let writer = writer.with_clustering(ClusteringConfig {
+    ///     fields: vec!["status".into(), "json.service".into()],
+    ///     compression: Default::default(),
+    /// })?;
+    /// // Add documents and use mem_usage() to decide when to finalize.
+    /// let index = writer.finalize()?;
+    /// # Ok::<(), tantivy::TantivyError>(())
+    /// ```
+    pub fn with_clustering(mut self, config: ClusteringConfig) -> crate::Result<Self> {
+        if self.opstamp != 0 {
+            return Err(crate::TantivyError::InvalidArgument(
+                "clustering must be configured before adding documents".to_owned(),
+            ));
+        }
+        if self.segment.index().settings().manual_doc_id_mapping {
+            return Err(crate::TantivyError::InvalidArgument(
+                "clustering cannot be combined with manual doc ID mapping".to_owned(),
+            ));
+        }
+        self.doc_groups = Some(DocGroups::new(config, &self.segment.schema())?);
+        Ok(self)
+    }
+
+    /// Counts of leaf groups in traversal order, without exposing keys.
+    /// Returns `None` when clustering is disabled. This allocates the result on demand.
+    pub fn clustering_group_sizes(&self) -> Option<Vec<usize>> {
+        self.doc_groups.as_ref().map(DocGroups::group_sizes)
+    }
+
+    /// Estimated memory usage, including buffered documents and headroom for indexing them.
+    /// The caller decides when to finalize; this writer does not flush automatically.
     pub fn mem_usage(&self) -> usize {
-        self.segment_writer.mem_usage()
+        self.segment_writer
+            .mem_usage()
+            .saturating_add(self.doc_groups.as_ref().map_or(0, DocGroups::mem_usage))
     }
 
     pub fn add_document(&mut self, document: D) -> crate::Result<()> {
         let opstamp = self.opstamp;
         self.opstamp += 1;
-        self.segment_writer
-            .add_document(AddOperation { opstamp, document })
+        if let Some(groups) = &mut self.doc_groups {
+            groups.push(document)
+        } else {
+            self.segment_writer
+                .add_document(AddOperation { opstamp, document })
+        }
     }
 
     pub fn finalize(self) -> crate::Result<Index> {
         let Self {
             segment,
-            segment_writer,
+            mut segment_writer,
+            doc_groups,
             ..
         } = self;
+        if let Some(groups) = doc_groups {
+            groups.drain(&mut segment_writer)?;
+        }
         let max_doc = segment_writer.max_doc();
         segment_writer.finalize()?;
         let did_remapping = segment.index().settings().sort_by_field.is_some();
@@ -51,6 +116,11 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     }
 
     pub fn finalize_with_doc_id_mapping(self, mapping: &DocIdMapping) -> crate::Result<Index> {
+        if self.doc_groups.is_some() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "a manual doc ID mapping cannot be applied to buffered clustering".to_owned(),
+            ));
+        }
         let Self {
             segment,
             segment_writer,

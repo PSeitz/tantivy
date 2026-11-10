@@ -276,6 +276,36 @@ mod tests {
     }
 
     #[test]
+    fn clustered_documents_preserve_plugin_downcasts() -> crate::Result<()> {
+        let mut schema = Schema::builder();
+        let text = schema.add_text_field("text", TEXT | STORED);
+        let payload = schema.add_custom_field("payload", "marker_payload", json!({}));
+        let mut writer = Index::builder()
+            .schema(schema.build())
+            .register_plugin(Arc::new(MarkerPlugin))
+            .single_segment_index_writer(crate::directory::RamDirectory::default(), 15_000_000)?
+            .with_clustering(crate::ClusteringConfig {
+                fields: vec!["text".into()],
+                compression: Default::default(),
+            })?;
+        let mut document = TantivyDocument::new();
+        document.add_text(text, "group");
+        document.add_custom(payload, b"clustered payload");
+        writer.add_document(document)?;
+        let index = writer.finalize()?;
+        let searcher = index.reader()?.searcher();
+        let data = searcher
+            .segment_reader(0)
+            .open_read(SegmentComponent::Custom("marker".into()))?
+            .read_bytes()?;
+        assert_eq!(
+            parse_marker_payloads(&data),
+            vec![b"clustered payload".to_vec()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_plugin_full_lifecycle() -> crate::Result<()> {
         use crate::indexer::NoMergePolicy;
 
