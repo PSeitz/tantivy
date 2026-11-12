@@ -1,5 +1,8 @@
 use std::io;
 
+#[cfg(feature = "quickwit")]
+mod automaton_bitset;
+
 use common::json_path_writer::JSON_END_OF_PATH;
 use common::{BinarySerializable, ByteCount};
 #[cfg(feature = "quickwit")]
