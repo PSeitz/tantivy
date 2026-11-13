@@ -91,30 +91,35 @@ Negative percentages mean less storage. `+` combines fields into one fingerprint
 
 | Dataset | Tests |
 |---|---|
-| CloudPrem / org 2: 100,000 documents | 24 field-ordering configurations; Zstd8, 1 MB blocks. Selected results below. |
+| CloudPrem / org 2: 100,000 documents | Field sorting and hierarchical grouping; Zstd8, 1 MB blocks. |
 | Yahoo-sim: 100,000 replayed stored documents | 18 field-ordering configurations; Zstd8, 1 MB blocks. Selected results below. |
 
-### CloudPrem / org 2: selected field-ordering results
+### CloudPrem / org 2
 
-| Ordering | Index MB | Size change vs status/service grouping |
-|---|---:|---:|
-| **source → service → tag.pod_name; arrival order within groups** | **62.755** | **−5.21%** |
-| source → service → tag.pod_name → message | 63.057 | −4.75% |
-| source → service → message | 63.484 | −4.11% |
-| tag.pod_name | 63.896 | −3.48% |
-| service | 64.979 | −1.85% |
-| Existing status/service grouping — reference | 66.203 | 0.00% |
-| message | 68.493 | +3.46% |
-| timestamp | 79.976 | +20.81% |
-| Arrival order, no clustering | 80.769 | +22.00% |
+Within equal keys or final groups, documents retain arrival order. Full structure fingerprints the document's leaf paths.
 
-### CloudPrem / org 2: ordering implementation matters
-
-| Ordering | Exact index bytes | Size change vs status/service grouping |
-|---|---:|---:|
-| source/service/pod, lexicographic group order | 62,755,454 | −5.21% |
-| source/service/pod, descending-size group traversal | 63,349,913 | −4.31% |
-| status/service grouping — reference | 66,202,734 | 0.00% |
+| Fields / grouping | Ordering | Index MB | Size change vs status/service grouping |
+|---|---|---:|---:|
+| **source → service → tag.pod_name** | Lexicographic | **62.755** | **−5.21%** |
+| source → service → tag.pod_name → message | Lexicographic | 63.057 | −4.75% |
+| source → service → status → full structure | Largest group first | 63.223 | −4.50% |
+| service → source → tag.pod_name | Lexicographic | 63.339 | −4.33% |
+| source → service → tag.pod_name | Largest group first | 63.350 | −4.31% |
+| source → service → message | Lexicographic | 63.484 | −4.11% |
+| tag.pod_name | Lexicographic | 63.896 | −3.48% |
+| service → source → status → full structure | Largest group first | 64.398 | −2.73% |
+| service → full structure → source | Largest group first | 64.479 | −2.60% |
+| service → full structure | Largest group first | 64.480 | −2.60% |
+| service → source → tag.pod_name | Largest group first | 64.560 | −2.48% |
+| service | Lexicographic | 64.979 | −1.85% |
+| service → source → status | Largest group first | 65.232 | −1.47% |
+| service → source | Largest group first | 65.340 | −1.30% |
+| service → status | Largest group first | 65.575 | −0.95% |
+| service | Largest group first | 65.747 | −0.69% |
+| status → service — reference | Largest group first | 66.203 | 0.00% |
+| message | Lexicographic | 68.493 | +3.46% |
+| timestamp | Lexicographic | 79.976 | +20.81% |
+| No clustering | Arrival | 80.769 | +22.00% |
 
 ### Yahoo-sim: selected field-ordering results
 
@@ -128,40 +133,13 @@ Negative percentages mean less storage. `+` combines fields into one fingerprint
 | message | 21.080 | +6.21% |
 | timestamp | 22.133 | +11.52% |
 
-## Service-first follow-up: CloudPrem / org 2
-
-100,000 documents, Zstd8, 1 MB blocks. Hierarchical groups are visited largest first; documents within each final group retain arrival order. Structure uses the historical full leaf-path fingerprint.
-
-| Grouping | Index MB | Size change vs status/service grouping |
-|---|---:|---:|
-| source → service → status → full structure — control | 63.223 | −4.50% |
-| **service → source → status → full structure** | **64.398** | **−2.73%** |
-| service → full structure → source | 64.479 | −2.60% |
-| service → full structure | 64.480 | −2.60% |
-| service → source → tag.pod_name | 64.560 | −2.48% |
-| service → source → status | 65.232 | −1.47% |
-| service → source | 65.340 | −1.30% |
-| service → status | 65.575 | −0.95% |
-| service | 65.747 | −0.69% |
-| status → service — reference | 66.203 | 0.00% |
-| Arrival order | 80.769 | +22.00% |
-
-### Lexicographic sorting controls
-
-| Ordering | Index MB | Size change vs status/service grouping |
-|---|---:|---:|
-| source → service → tag.pod_name | 62.755 | −5.21% |
-| service → source → tag.pod_name | 63.339 | −4.33% |
-
-Service-first improved on status/service, while source-first remained smaller in both comparisons. All 13 configurations passed full stored-document and index-content validation. Repeats of the best service-first, source-first and lexicographic layouts matched exactly in component sizes. Fresh controls reproduced the previous sizes exactly.
-
 ## Sources and comparison boundaries
 
 | Item | Source / qualification |
 |---|---|
 | August Pomsky tables | Recovered from benchmark session `2026-08-14T01-48-35-775Z_019ffdf4-f03f-787a-938e-5ff3a983926c.jsonl`, including recorded normalized results, completed August 18 structure-first matrix and three completed 100-file results. These experiments were not rerun for this document. |
 | Later Tantivy tables | [DOC_CLUSTERING_BENCHMARKS.md — Sorting by other fields](DOC_CLUSTERING_BENCHMARKS.md#sorting-by-other-fields), its source/service/pod follow-up, and the CPU-profile section's descending-size traversal result. |
-| Service-first follow-up | Fresh local runs using Tantivy `07de87394` and the original Pomsky mapper/tokenizers. Harness, exact results and validation: `/tmp/service-grouping.j83nWu/`. |
+| Service-first runs | Tantivy `07de87394`, original Pomsky mapper/tokenizers. All 13 layouts passed stored-document and index-content validation; winner repeats and previous control sizes matched. Harness and exact results: `/tmp/service-grouping.j83nWu/`. |
 | Percentage derivation | Historical stored-size reductions retained where recorded. New comparisons use exact bytes when available, otherwise compression-ratio quotients for identical input. Rounded displayed sizes may not reproduce the last decimal. |
 | Different experiments | Pomsky hashes fingerprint groups and traverses largest groups first. The later field-sort sweep uses lexicographic values. Dataset sizes, inputs and indexing paths also differ; compare rows within each table. |
 | Scope | Compression tables only. CPU, allocation/RSS, staging representations and timestamp-codec prototypes remain in the full Tantivy benchmark report. |
