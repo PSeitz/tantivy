@@ -1,18 +1,6 @@
 # Document clustering compression results
 
-## Reading the tables
-
-| Item | Meaning |
-|---|---|
-| Size change | `(stored bytes / reference stored bytes − 1) × 100`. **Negative means less storage.** |
-| Compression | Uncompressed input bytes / stored index bytes. Higher is better. |
-| Units | Decimal GB and MB. Displayed sizes are rounded. |
-| `A + B` | One composite fingerprint combining A and B. |
-| `A → B` | Successive grouping levels. B refines each A group. |
-| Full structure | Fingerprint of the document's sorted leaf paths, including all fields. |
-| Reduced structure | Structure excluding `custom`, `error`, `tag`, and `tags`. |
-| Message(N) | Token-shape fingerprint of the message prefix, with `max_tokens: N`. |
-| Scope | Historical measured results, not a universal ranking. Different datasets, shard settings and ordering methods are separate comparisons. |
+Negative percentages mean less storage. `+` combines fields into one fingerprint; `→` adds a grouping level.
 
 ## August 2026: Pomsky fingerprint clustering
 
