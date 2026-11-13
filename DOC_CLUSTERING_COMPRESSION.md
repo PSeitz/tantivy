@@ -18,17 +18,10 @@
 
 ### What was tested
 
-| Setting | 10-file normalized comparison | 20 MB/s shard comparison | 100-file comparison | Structure-first comparison |
-|---|---|---|---|---|
-| Dataset | First 10 staging files | Same 10 files | First 100 staging files | Same 10 files |
-| Documents | 4,053,363 | 4,053,363 | 40,689,412 | 4,053,363 |
-| Input | 31.58 GB | 31.58 GB | 317.167 GB | 31.58 GB |
-| Pomsky | v0.1.33 | v0.1.33 | v0.1.33 | v0.1.33 |
-| Per-shard throughput target | Default 5 MiB/s | `20mb` (20 MB/s) | Default 5 MiB/s | Default 5 MiB/s |
-| Client ingestion | Unthrottled | Unthrottled | Unthrottled | Unthrottled |
-| Finalization | Standalone compactor | Standalone compactor | Standalone compactor | Standalone compactor |
-| Final splits per run | 1 | 1 | 3 | 1 |
-| Coverage | Completed configurations from several batches; repeated controls averaged by stored bytes | 10 candidates plus matching baseline | 3 completed candidates; remaining 2 intentionally stopped | All 12 configurations completed |
+| Dataset | Tests |
+|---|---|
+| 10 staging files: 4.05M documents, 31.58 GB | Field, message-shape and structure grouping; 5 MiB/s or 20 MB/s per shard; one final split. |
+| 100 staging files: 40.69M documents, 317.17 GB | Three finalists at 5 MiB/s per shard; three final splits. |
 
 ### 10 files: dimensions, message shape and structure
 
@@ -108,18 +101,10 @@
 
 ### What was tested
 
-| Setting | CloudPrem / org 2 | Yahoo-sim |
-|---|---|---|
-| Input | First 100,000 org 2 staging records, adapted through actual CloudPrem mapper/tokenizers | First 100,000 stored documents from a Published Yahoo-sim split, replayed through captured mapper/tokenizers |
-| Storage | `RamDirectory`, Zstd level 8, 1,000,000-byte store blocks | Same |
-| Initial sweep | 23 configurations, including controls | 18 configurations, including controls |
-| Follow-up | source → service → tag.pod_name, without message; 24 configurations total | No additional field-sort configuration reported |
-| Ordering | Global ascending lexicographic keys, leftmost first; original ordinal breaks ties | Same |
-| Missing / array keys | Missing or non-scalar keys last; arrays use first value | Same |
-| Reference | Existing descending-size status/service grouping | Original split document order |
-| Structure fingerprints | Not tested in this field-ordering sweep | Not tested in this field-ordering sweep |
-| Coverage below | Selected results preserved in the benchmark report; full ranking artifacts under `/tmp` were unavailable when this summary was assembled | Same |
-| Input limitations | Original stored tags and runtime metadata absent; no stored-tags proxy | Stored-document replay omits nonstored inputs, including typed tags |
+| Dataset | Tests |
+|---|---|
+| CloudPrem / org 2: 100,000 documents | 24 field-ordering configurations; Zstd8, 1 MB blocks. Selected results below. |
+| Yahoo-sim: 100,000 replayed stored documents | 18 field-ordering configurations; Zstd8, 1 MB blocks. Selected results below. |
 
 ### CloudPrem / org 2: selected field-ordering results
 
