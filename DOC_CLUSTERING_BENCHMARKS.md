@@ -601,3 +601,66 @@ current grouping source matches the benchmark candidate snapshot. No rebuild was
 performed. New artifacts: `/tmp/clustering-keys-rerun.jGnKZe/README.md`,
 `results.json`, `runs.jsonl`, `results-matrix/` and `run.log`. Earlier artifacts
 remain unchanged.
+
+## Current implementation and repeated UTF-8 checks — 2026-11-10
+
+Tantivy `07de873945af80c49c1b3d8b3f57079b6b509ee1`, original Pomsky mapper and
+both tokenizer managers from `8ea72225e9e236670c41e504d8343d52a838919c`. The same
+100,000-record org 2 prefix, factual input adaptations, status/service grouping,
+RAM directory, Zstd8, 1,000,000-byte store blocks and dedicated compression thread.
+Writer construction budget is 64,000,000 bytes. Message-token encoding and the
+stored-tags proxy are off. Original message indexing remains enabled.
+
+Three serial fresh processes per mode, alternating comparison order. Wall-time
+medians in seconds, with setup and validation excluded:
+
+| Mode | Collection | Finalization | Total |
+|---|---:|---:|---:|
+| Current clustering | 4.416624 | 4.923031 | **9.339655** |
+| Manual remapping, production `DocIdGroups` | 8.067740 | 1.986679 | **10.044102** |
+| Clustering with repeated UTF-8 checks added | 4.247967 | 5.348116 | **9.596083** |
+
+Current clustering's median total is **7.01% lower** than manual remapping in
+this run. Both paths include actual parsing/mapping and grouping. Manual indexing
+occurs during collection; clustered indexing occurs during finalization. Mapping
+construction and disposal are included in manual finalization. Phase and total
+medians are computed independently from the per-process measurements.
+
+The UTF-8 control changes exactly one source line: `text()` uses checked
+`std::str::from_utf8(...).expect(...)` instead of unchecked conversion. It retains
+all current early validation. This measures the cost of adding repeated checks
+to the current implementation, rather than reproducing historical source.
+Current finalization is **0.425 s (7.95%) lower**, and median total **2.67% lower**,
+than this control. Its different collection timings reflect run-to-run variation
+with an unchanged collection algorithm.
+
+All nine outputs have identical component sizes totaling **66,202,734 bytes**.
+Three full 1k smoke runs passed. The first 100k run per mode passed exact stored
+comparisons against freshly mapped source, an independent grouping-order oracle,
+and matching ordinal-addressed semantic fingerprints covering terms, postings,
+frequencies, positions, fast values, fieldnorms and token totals. Repeats checked
+every stored ordinal, completeness/uniqueness, stored/order checksums and component
+sizes. Fingerprints are non-cryptographic; serialized indexes are not claimed
+byte-identical.
+
+The old `/tmp` benchmark binaries and some harness files were unavailable. The
+harness was recovered from session records and rebuilt against isolated source
+snapshots. Missing fingerprint-validator logic was reconstructed and documented.
+Input-prefix SHA-256 was freshly verified as
+`b218130c2db5fd927cc07378bf86c2b67bfcfa90e7655590759f09cca3c5873d`
+(774,713,632 bytes including newlines). Original configuration and tokenizer hashes
+also match historical provenance. The new build has its own dependency lockfile;
+these timings are a matched current-code comparison, not an unchanged-binary
+rerun of the historical experiments.
+
+Host: Apple M4 Max, 64 GiB, macOS 26.7.2, Rust 1.98.0. Release builds with
+`RUSTFLAGS='--cfg tokio_unstable'`, no allocator instrumentation or profiler.
+OS caches were warm. CPU placement, background load and temperature were
+uncontrolled. Three repetitions establish local observations, not statistical
+significance. This run adds no allocation/RSS measurements.
+
+Artifacts: `/tmp/clustering-rerun.mHkBB6/REPORT.md`, `runs.json`, `results/*.json`,
+`medians.json`, `provenance.json`, `added-check.patch`, and `pomsky-changes.patch`.
+The report records raw timings, validation scope, source/binary hashes, dependency
+compatibility changes, reconstructed validator logic and build/run commands.
+Production code and surviving historical artifacts were preserved.
