@@ -128,12 +128,40 @@ Negative percentages mean less storage. `+` combines fields into one fingerprint
 | message | 21.080 | +6.21% |
 | timestamp | 22.133 | +11.52% |
 
+## Service-first follow-up: CloudPrem / org 2
+
+100,000 documents, Zstd8, 1 MB blocks. Hierarchical groups are visited largest first; documents within each final group retain arrival order. Structure uses the historical full leaf-path fingerprint.
+
+| Grouping | Index MB | Size change vs status/service grouping |
+|---|---:|---:|
+| source → service → status → full structure — control | 63.223 | −4.50% |
+| **service → source → status → full structure** | **64.398** | **−2.73%** |
+| service → full structure → source | 64.479 | −2.60% |
+| service → full structure | 64.480 | −2.60% |
+| service → source → tag.pod_name | 64.560 | −2.48% |
+| service → source → status | 65.232 | −1.47% |
+| service → source | 65.340 | −1.30% |
+| service → status | 65.575 | −0.95% |
+| service | 65.747 | −0.69% |
+| status → service — reference | 66.203 | 0.00% |
+| Arrival order | 80.769 | +22.00% |
+
+### Lexicographic sorting controls
+
+| Ordering | Index MB | Size change vs status/service grouping |
+|---|---:|---:|
+| source → service → tag.pod_name | 62.755 | −5.21% |
+| service → source → tag.pod_name | 63.339 | −4.33% |
+
+Service-first improved on status/service, while source-first remained smaller in both comparisons. All 13 configurations passed full stored-document and index-content validation. Repeats of the best service-first, source-first and lexicographic layouts matched exactly in component sizes. Fresh controls reproduced the previous sizes exactly.
+
 ## Sources and comparison boundaries
 
 | Item | Source / qualification |
 |---|---|
 | August Pomsky tables | Recovered from benchmark session `2026-08-14T01-48-35-775Z_019ffdf4-f03f-787a-938e-5ff3a983926c.jsonl`, including recorded normalized results, completed August 18 structure-first matrix and three completed 100-file results. These experiments were not rerun for this document. |
 | Later Tantivy tables | [DOC_CLUSTERING_BENCHMARKS.md — Sorting by other fields](DOC_CLUSTERING_BENCHMARKS.md#sorting-by-other-fields), its source/service/pod follow-up, and the CPU-profile section's descending-size traversal result. |
+| Service-first follow-up | Fresh local runs using Tantivy `07de87394` and the original Pomsky mapper/tokenizers. Harness, exact results and validation: `/tmp/service-grouping.j83nWu/`. |
 | Percentage derivation | Historical stored-size reductions retained where recorded. New comparisons use exact bytes when available, otherwise compression-ratio quotients for identical input. Rounded displayed sizes may not reproduce the last decimal. |
 | Different experiments | Pomsky hashes fingerprint groups and traverses largest groups first. The later field-sort sweep uses lexicographic values. Dataset sizes, inputs and indexing paths also differ; compare rows within each table. |
 | Scope | Compression tables only. CPU, allocation/RSS, staging representations and timestamp-codec prototypes remain in the full Tantivy benchmark report. |
