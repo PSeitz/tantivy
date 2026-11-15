@@ -14,7 +14,6 @@ use crate::{Directory, DocAddress, Index, SingleSegmentIndexWriter, TantivyDocum
 fn config(fields: &[&str]) -> ClusteringConfig {
     ClusteringConfig {
         fields: fields.iter().map(|name| (*name).to_owned()).collect(),
-        compression: CompressionConfig::default(),
     }
 }
 
@@ -31,8 +30,7 @@ proptest! {
         let json = schema.add_json_field("json", TEXT | STORED);
         let body = schema.add_text_field("body", TEXT | STORED);
         let schema = schema.build();
-        let mut clustering = config(&["status", r"json.labels.service\.name"]);
-        clustering.compression.message_fields.push("body".into());
+        let clustering = config(&["status", r"json.labels.service\.name"]);
         let mut groups = DocIdGroups::new(&schema, &clustering.fields).unwrap();
         let mut writer = Index::builder().schema(schema.clone())
             .single_segment_index_writer(RamDirectory::default(), 15_000_000).unwrap()
@@ -119,78 +117,6 @@ proptest! {
 }
 
 #[test]
-fn clustering_indexes_keys_after_admission_stops() -> crate::Result<()> {
-    let mut schema = Schema::builder();
-    let id = schema.add_u64_field("id", INDEXED | FAST | STORED);
-    let json = schema.add_json_field("json", TEXT | STORED);
-    let message = schema.add_text_field("message", TEXT | STORED);
-    let mut options = config(&["json.service"]);
-    options.compression = CompressionConfig {
-        max_fields_per_path: 3,
-        message_fields: vec!["message".into()],
-    };
-    let mut writer = Index::builder()
-        .schema(schema.build())
-        .single_segment_index_writer(RamDirectory::default(), 15_000_000)?
-        .with_clustering(options)?;
-    let document = |i: u64| {
-        doc!(
-            id => i,
-            json => serde_json::json!({
-                "service": if i.is_multiple_of(2) { "api" } else { "worker" },
-                "customer": "acme corp",
-                "dynamic": {"keep": "common", "other": "user value", format!("id_{i}"): "needle"}
-            }),
-            message => "request for customer acme corp succeeded"
-        )
-    };
-    for i in 0..10_001 {
-        writer.add_document(document(i))?;
-    }
-    let index = writer.finalize()?;
-    let searcher = index.reader()?.searcher();
-    assert_eq!(searcher.num_docs(), 10_001);
-    let ids = searcher.segment_reader(0).fast_fields().u64("id")?;
-    // The service key is stored inline and still determines cluster order.
-    for doc_id in 0..5001 {
-        assert_eq!(ids.first(doc_id).unwrap() % 2, 0);
-    }
-    let parser = crate::query::QueryParser::for_index(&index, vec![json]);
-    for i in [0, 9999, 10_000] {
-        let query = parser.parse_query(&format!("json.dynamic.id_{i}:needle"))?;
-        let addresses = searcher.search(&query, &DocSetCollector)?;
-        assert_eq!(addresses.len(), 1);
-        let stored: TantivyDocument = searcher.doc(*addresses.iter().next().unwrap())?;
-        assert_eq!(stored, document(i));
-    }
-    let phrase = PhraseQuery::new(vec![
-        Term::from_field_text(message, "acme"),
-        Term::from_field_text(message, "corp"),
-    ]);
-    assert_eq!(searcher.search(&phrase, &Count)?, 10_001);
-    Ok(())
-}
-
-#[test]
-fn clustering_keeps_document_addresses_unchanged() -> crate::Result<()> {
-    let mut schema = Schema::builder();
-    let service = schema.add_text_field("service", STRING);
-    let json = schema.add_json_field("json", STORED);
-    let mut options = config(&["service"]);
-    options.compression.max_fields_per_path = 2;
-    let mut groups = DocGroups::new(options, &schema.build())?;
-    groups.push(doc!(service => "api", json => serde_json::json!({"first": "original"})))?;
-    let original = groups.root.children["api"].documents[0];
-    for _ in 1..10_001 {
-        groups.push(doc!(service => "api", json => serde_json::json!({"later": "frequent"})))?;
-    }
-    let documents = &groups.root.children["api"].documents;
-    assert_eq!(documents.len(), 10_001);
-    assert_eq!(documents[0], original);
-    Ok(())
-}
-
-#[test]
 fn clustering_borrows_string_keys() {
     let mut groups = GroupNode::<()>::default();
     for text in ["", "api", "日本語"] {
@@ -198,53 +124,27 @@ fn clustering_borrows_string_keys() {
         for _ in 0..2 {
             let key = GroupKey::from_value(&value, &[]);
             assert!(matches!(key, GroupKey::Str(Cow::Borrowed(_))));
-            groups.push(std::iter::once(key), ());
+            groups.leaf(std::iter::once(key), &mut 0).push(());
         }
         assert_eq!(groups.children[text].num_docs, 2);
     }
-    groups.push(std::iter::once(GroupKey::Ignored), ());
+    groups
+        .leaf(std::iter::once(GroupKey::Ignored), &mut 0)
+        .push(());
     assert_eq!(groups.group_sizes(), vec![2, 2, 2, 1]);
 }
 
 #[test]
-fn clustering_estimate_reserves_expanded_input() -> crate::Result<()> {
-    let mut schema = Schema::builder();
-    let service = schema.add_text_field("service", STRING);
-    let message = schema.add_text_field("message", TEXT);
-    let mut groups = DocGroups::new(config(&["service"]), &schema.build())?;
-    let empty_retained =
-        groups.mem_usage + groups.compressor.mem_usage() - size_of::<DocumentCompressor>();
-    assert_eq!(
-        groups.mem_usage(),
-        empty_retained * 2 + groups.compressor.indexing_headroom_bytes()
-    );
-    let text = "repeated text ".repeat(4_000);
-    for _ in 0..100 {
-        groups.push(doc!(service => "api", message => text.as_str()))?;
-    }
-    let retained =
-        groups.mem_usage + groups.compressor.mem_usage() - size_of::<DocumentCompressor>();
-    let expanded = groups.compressor.expanded_document_bytes();
-    assert!(expanded > retained * 2);
-    assert_eq!(
-        groups.mem_usage(),
-        retained + expanded + groups.compressor.indexing_headroom_bytes()
-    );
-    assert!(groups.mem_usage() >= 100 * text.len());
-    Ok(())
-}
-
-#[test]
-fn clustering_compression_releases_unused_document_capacity() -> crate::Result<()> {
+fn clustering_accounts_for_retained_document_capacity() -> crate::Result<()> {
     let mut schema = Schema::builder();
     schema.add_text_field("service", STRING);
     let mut groups = DocGroups::new(config(&["service"]), &schema.build())?;
     let before = groups.mem_usage();
     let document = TantivyDocument::with_capacity(1_000_000);
     assert!(document.mem_usage() >= 1_000_000);
-    groups.push(document)?;
-    assert!(groups.mem_usage() > before);
-    assert!(groups.mem_usage() - before < 1_000_000);
+    let document_memory = document.mem_usage();
+    groups.push(document);
+    assert!(groups.mem_usage() >= before + document_memory);
     Ok(())
 }
 
@@ -291,19 +191,6 @@ fn clustering_rejects_manual_mapping_before_buffering() -> crate::Result<()> {
     Ok(())
 }
 
-#[test]
-fn clustering_config_defaults_and_rejects_removed_options() -> crate::Result<()> {
-    let options: ClusteringConfig = serde_json::from_str(r#"{"fields":["group"]}"#)?;
-    assert_eq!(options, config(&["group"]));
-    for json in [
-        r#"{"fields":["group"],"sort_group_by":"timestamp"}"#,
-        r#"{"fields":["group"],"min_group_size":6}"#,
-    ] {
-        assert!(serde_json::from_str::<ClusteringConfig>(json).is_err());
-    }
-    Ok(())
-}
-
 struct TrackedDocument {
     document: TantivyDocument,
     dropped: Arc<AtomicUsize>,
@@ -325,7 +212,7 @@ impl Drop for TrackedDocument {
 }
 
 #[test]
-fn clustering_compresses_and_releases_caller_documents_during_ingestion() -> crate::Result<()> {
+fn clustering_converts_custom_documents_during_ingestion() -> crate::Result<()> {
     let mut schema = Schema::builder();
     let service = schema.add_text_field("service", STRING | STORED);
     let mut writer = Index::builder()

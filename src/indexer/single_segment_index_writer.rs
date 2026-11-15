@@ -17,7 +17,7 @@ pub struct SingleSegmentIndexWriter<D: Document = TantivyDocument> {
     _phantom: PhantomData<D>,
 }
 
-impl<D: Document + 'static> SingleSegmentIndexWriter<D> {
+impl<D: Document> SingleSegmentIndexWriter<D> {
     pub(crate) fn new(index: Index, mem_budget: usize) -> crate::Result<Self> {
         let segment = index.new_segment();
         let segment_writer = SegmentWriter::for_segment(mem_budget, segment.clone())?;
@@ -30,16 +30,12 @@ impl<D: Document + 'static> SingleSegmentIndexWriter<D> {
         })
     }
 
-    /// Compress documents in nested groups, then index them in group order at finalization.
-    /// The caller's documents are released during ingestion. Fields and values are
-    /// borrowed from staged storage for built-in indexing and reconstructed losslessly as
-    /// [`TantivyDocument`] for custom plugins, including keys stored inline by compression.
-    /// Pre-tokenized strings are rejected, including inside arrays and objects.
-    /// Staging uses a shared arena with a 4 GiB address space. Encoded documents and
-    /// individual reconstructed messages are limited to 1 MiB. Allocation limits
-    /// produce errors. Use [`Self::mem_usage`] to decide when to finalize.
+    /// Retain documents in nested groups, then index them in group order at finalization.
+    /// Documents are kept as [`TantivyDocument`]. Inputs of that type are moved without copying;
+    /// other document types are converted once during ingestion.
     /// Must be configured before adding any documents. Indexing errors are deferred
-    /// until finalization.
+    /// until finalization. Use [`Self::mem_usage`] to track retained memory and leave
+    /// headroom for indexing. The caller decides when to finalize.
     /// An existing `sort_by_field` setting still applies after clustering.
     ///
     /// ```no_run
@@ -53,7 +49,6 @@ impl<D: Document + 'static> SingleSegmentIndexWriter<D> {
     /// #     .single_segment_index_writer::<TantivyDocument>(RamDirectory::default(), 15_000_000)?;
     /// let writer = writer.with_clustering(ClusteringConfig {
     ///     fields: vec!["status".into(), "json.service".into()],
-    ///     compression: Default::default(),
     /// })?;
     /// // Add documents and use mem_usage() to decide when to finalize.
     /// let index = writer.finalize()?;
@@ -80,19 +75,18 @@ impl<D: Document + 'static> SingleSegmentIndexWriter<D> {
         self.doc_groups.as_ref().map(DocGroups::group_sizes)
     }
 
-    /// Estimated memory usage, including buffered documents and headroom for indexing them.
-    /// The caller decides when to finalize; this writer does not flush automatically.
+    /// Estimated retained memory, including buffered documents and grouping allocations.
+    /// Leave headroom for indexing during finalization. This writer does not flush automatically.
     pub fn mem_usage(&self) -> usize {
-        self.segment_writer
-            .mem_usage()
-            .saturating_add(self.doc_groups.as_ref().map_or(0, DocGroups::mem_usage))
+        self.segment_writer.mem_usage() + self.doc_groups.as_ref().map_or(0, DocGroups::mem_usage)
     }
 
     pub fn add_document(&mut self, document: D) -> crate::Result<()> {
         let opstamp = self.opstamp;
         self.opstamp += 1;
         if let Some(groups) = &mut self.doc_groups {
-            groups.push(document)
+            groups.push(document.into_tantivy_document());
+            Ok(())
         } else {
             self.segment_writer
                 .add_document(AddOperation { opstamp, document })

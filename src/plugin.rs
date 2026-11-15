@@ -286,7 +286,6 @@ mod tests {
             .single_segment_index_writer(crate::directory::RamDirectory::default(), 15_000_000)?
             .with_clustering(crate::ClusteringConfig {
                 fields: vec!["text".into()],
-                compression: Default::default(),
             })?;
         let mut document = TantivyDocument::new();
         document.add_text(text, "group");

@@ -360,7 +360,7 @@ impl<'de, R> BinaryValueDeserializer<'de, R>
 where R: Read
 {
     /// Attempts to create a new value deserializer from a given reader.
-    pub(crate) fn from_reader(
+    fn from_reader(
         reader: &'de mut R,
         doc_store_version: DocStoreVersion,
     ) -> Result<Self, DeserializeError> {

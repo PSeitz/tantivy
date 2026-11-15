@@ -173,37 +173,23 @@ impl SegmentWriter {
     /// Indexes a new document
     ///
     /// As a user, you should rather use `IndexWriter`'s add_document.
-    pub fn add_document<D: Document + 'static>(
+    pub fn add_document<D: Document>(
         &mut self,
         add_operation: AddOperation<D>,
     ) -> crate::Result<()> {
         let AddOperation { document, opstamp } = add_operation;
-        self.add_document_ref(opstamp, &document, Some(&document))
-    }
-
-    pub(crate) fn has_custom_plugins(&self) -> bool {
-        !self.custom_plugins.is_empty()
-    }
-
-    pub(crate) fn add_document_ref<D: Document>(
-        &mut self,
-        opstamp: Opstamp,
-        document: &D,
-        // Borrowed staging views use None. Their custom-plugin path materializes a document.
-        erased_document: Option<&dyn ErasedDocument>,
-    ) -> crate::Result<()> {
         let doc_id = self.max_doc;
         self.doc_opstamps.push(opstamp);
 
         // Built-in writers index the document generically — zero-copy for any `Document` type.
-        self.inverted_index.index_document(doc_id, document)?;
-        self.fast_fields.index_document(document)?;
-        self.store_writer.store(document, &self.schema)?;
+        self.inverted_index.index_document(doc_id, &document)?;
+        self.fast_fields.index_document(&document)?;
+        self.store_writer.store(&document, &self.schema)?;
 
         // Custom plugins are trait objects, so they take the document type-erased. Leaves stay
         // borrowed; a plugin that knows the concrete type recovers it for free via `as_any`.
         if !self.custom_plugins.is_empty() {
-            let erased = erased_document.expect("custom plugins require a 'static document type");
+            let erased: &dyn ErasedDocument = &document;
             for writer in &mut self.custom_plugins {
                 writer.add_document(doc_id, erased, &self.schema)?;
             }

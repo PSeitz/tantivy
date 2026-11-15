@@ -26,9 +26,8 @@
 //! significant amount of time when indexing by avoiding the additional allocations.
 //!
 //! ### Important Note
-//! Documents must be safe to send across thread boundaries. Writer entry points and
-//! type-erased plugin access additionally require `'static`. Internal document views
-//! may borrow storage during synchronous indexing.
+//! The implementer of the `Document` trait must be `'static` and safe to send across
+//! thread boundaries.
 //!
 //! ## Reusing existing types
 //! The API design of the document traits allow you to reuse as much of as little of the
@@ -171,22 +170,22 @@ mod value;
 use std::collections::BTreeMap;
 use std::mem;
 
+pub(crate) use self::de::BinaryDocumentDeserializer;
 pub use self::de::{
     ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
     ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,
 };
-pub(crate) use self::de::{BinaryDocumentDeserializer, BinaryValueDeserializer};
 pub use self::default_document::{
     CompactDocArrayIter, CompactDocObjectIter, CompactDocValue, DocParsingError, TantivyDocument,
 };
 pub use self::erased::{ErasedDocument, ErasedValue};
 pub use self::owned_value::OwnedValue;
-pub(crate) use self::se::{BinaryDocumentSerializer, BinaryValueSerializer};
+pub(crate) use self::se::BinaryDocumentSerializer;
 pub use self::value::{ReferenceValue, ReferenceValueLeaf, Value};
 use super::*;
 
 /// The core trait representing a document within the index.
-pub trait Document: Send + Sync {
+pub trait Document: Send + Sync + 'static {
     /// The value of the field.
     type Value<'a>: Value<'a> + Clone
     where Self: 'a;
@@ -200,10 +199,9 @@ pub trait Document: Send + Sync {
 
     /// Convert this document into the canonical [`TantivyDocument`] representation.
     ///
-    /// The indexer calls this once per document so it can hand a single concrete type to
-    /// every [`PluginWriter`](crate::plugin::PluginWriter). The default materializes a new
-    /// `TantivyDocument`; `TantivyDocument` overrides it to return itself, so indexing the
-    /// default document type costs nothing extra.
+    /// Clustering uses this to retain a single concrete document type. The default
+    /// materializes a new `TantivyDocument`; `TantivyDocument` overrides it to return
+    /// itself without copying.
     fn into_tantivy_document(self) -> TantivyDocument
     where Self: Sized {
         let mut doc = TantivyDocument::new();

@@ -64,7 +64,6 @@ impl CompactDoc {
         self.field_values.shrink_to_fit();
     }
 
-    #[cfg(test)]
     pub(crate) fn mem_usage(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.node_data.capacity()

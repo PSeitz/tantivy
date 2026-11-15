@@ -11,12 +11,16 @@ use std::mem::size_of;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use super::doc_compression::{ByteRange, CompressionConfig, DocumentCompressor};
-use super::{AddOperation, FieldPath, SegmentWriter};
+use super::{AddOperation, SegmentWriter};
 use crate::core::json_utils::split_json_path;
 use crate::schema::document::{Document, ReferenceValue, ReferenceValueLeaf, Value};
 use crate::schema::{FieldType, Schema};
-use crate::{DocId, TantivyError};
+use crate::{DocId, TantivyDocument, TantivyError};
+
+struct FieldPath {
+    field: crate::schema::Field,
+    json_path: Vec<String>,
+}
 
 /// Fields used to group documents, from outermost to innermost.
 ///
@@ -33,9 +37,6 @@ use crate::{DocId, TantivyError};
 pub struct ClusteringConfig {
     /// One field path per level. Must not be empty.
     pub fields: Vec<String>,
-    /// Lossless storage for staged documents, shared across all groups.
-    #[serde(default)]
-    pub compression: CompressionConfig,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash)]
@@ -92,43 +93,50 @@ impl<T> Default for GroupNode<T> {
 }
 
 impl<T> GroupNode<T> {
-    // Return collection/key memory growth. The caller accounts for payload allocations.
-    fn push<'a>(&mut self, mut group_keys: impl Iterator<Item = GroupKey<'a>>, document: T) -> usize {
+    // Locate the leaf before moving the document whose keys we borrow.
+    fn leaf<'a>(
+        &mut self,
+        mut group_keys: impl Iterator<Item = GroupKey<'a>>,
+        mem_usage: &mut usize,
+    ) -> &mut Vec<T> {
         self.num_docs += 1;
         let Some(key) = group_keys.next() else {
-            let capacity = self.documents.capacity();
-            self.documents.push(document);
-            return (self.documents.capacity() - capacity) * size_of::<T>();
+            return &mut self.documents;
         };
         let first_arrival = self.children.len() + usize::from(self.ignored.is_some());
         let GroupKey::Str(key) = key else {
-            let mut added_memory = 0;
-            let child = self.ignored.get_or_insert_with(|| {
-                added_memory = size_of::<Self>();
-                Box::new(Self {
+            return self
+                .ignored
+                .get_or_insert_with(|| {
+                    *mem_usage += size_of::<Self>();
+                    Box::new(Self {
+                        first_arrival,
+                        ..Self::default()
+                    })
+                })
+                .leaf(group_keys, mem_usage);
+        };
+        if !self.children.contains_key(key.as_ref()) {
+            let capacity = self.children.capacity();
+            let key = key.clone().into_owned();
+            *mem_usage += key.capacity();
+            self.children.insert(
+                key,
+                Self {
                     first_arrival,
                     ..Self::default()
-                })
-            });
-            return added_memory + child.push(group_keys, document);
-        };
-        if let Some(child) = self.children.get_mut(key.as_ref()) {
-            return child.push(group_keys, document);
+                },
+            );
+            // Include empty buckets and the trailing control-byte group.
+            let bucket_growth =
+                (self.children.capacity() * 8).div_ceil(7) - (capacity * 8).div_ceil(7);
+            *mem_usage += bucket_growth * (size_of::<(String, Self)>() + 1)
+                + if capacity == 0 { 16 } else { 0 };
         }
-        let capacity = self.children.capacity();
-        let key = key.into_owned();
-        let mut added_memory = key.capacity();
-        let child = self.children.entry(key).or_insert_with(|| Self {
-            first_arrival,
-            ..Self::default()
-        });
-        added_memory += child.push(group_keys, document);
-        // Insertion capacity excludes empty buckets (roughly one eighth of the table).
-        // Include their storage and the trailing control-byte group in the estimate.
-        let bucket_growth = (self.children.capacity() * 8).div_ceil(7) - (capacity * 8).div_ceil(7);
-        added_memory
-            + bucket_growth * (size_of::<(String, Self)>() + 1)
-            + if capacity == 0 { 16 } else { 0 }
+        self.children
+            .get_mut(key.as_ref())
+            .unwrap()
+            .leaf(group_keys, mem_usage)
     }
 
     fn order_key(&self) -> (Reverse<usize>, usize) {
@@ -243,7 +251,8 @@ impl DocIdGroups {
     /// Add an ID without retaining the document.
     pub fn push<D: Document>(&mut self, document: &D, doc_id: DocId) -> crate::Result<()> {
         self.root
-            .push(group_keys(&self.grouping_paths, document), doc_id);
+            .leaf(group_keys(&self.grouping_paths, document), &mut 0)
+            .push(doc_id);
         Ok(())
     }
 
@@ -271,15 +280,13 @@ impl DocIdGroups {
 
 pub(crate) struct DocGroups {
     grouping_paths: Vec<FieldPath>,
-    root: GroupNode<ByteRange>,
-    compressor: DocumentCompressor,
+    root: GroupNode<TantivyDocument>,
     mem_usage: usize,
 }
 
 impl DocGroups {
     pub fn new(config: ClusteringConfig, schema: &Schema) -> crate::Result<Self> {
         let grouping_paths = grouping_paths(schema, &config.fields)?;
-        let compressor = DocumentCompressor::new(config.compression, schema)?;
         let mem_usage = size_of::<Self>()
             + grouping_paths.capacity() * size_of::<FieldPath>()
             + grouping_paths
@@ -292,16 +299,19 @@ impl DocGroups {
         Ok(Self {
             grouping_paths,
             root: GroupNode::default(),
-            compressor,
             mem_usage,
         })
     }
 
-    pub fn push<D: Document>(&mut self, document: D) -> crate::Result<()> {
-        let group_keys = group_keys(&self.grouping_paths, &document);
-        let encoded_document = self.compressor.compress(&document)?;
-        self.mem_usage += self.root.push(group_keys, encoded_document);
-        Ok(())
+    pub fn push(&mut self, document: TantivyDocument) {
+        self.mem_usage += document.mem_usage() - size_of::<TantivyDocument>();
+        let leaf = self.root.leaf(
+            group_keys(&self.grouping_paths, &document),
+            &mut self.mem_usage,
+        );
+        let capacity = leaf.capacity();
+        leaf.push(document);
+        self.mem_usage += (leaf.capacity() - capacity) * size_of::<TantivyDocument>();
     }
 
     pub fn group_sizes(&self) -> Vec<usize> {
@@ -309,32 +319,16 @@ impl DocGroups {
     }
 
     pub fn mem_usage(&self) -> usize {
-        let retained =
-            self.mem_usage + self.compressor.mem_usage() - size_of::<DocumentCompressor>();
-        // Indexing grows with expanded input, even when staging compresses well.
-        // Keep at least the previous retained-size reservation. This is a heuristic:
-        // tokenizers, schema, plugins, and output storage affect the actual peak.
-        retained
-            + retained.max(self.compressor.expanded_document_bytes())
-            + self.compressor.indexing_headroom_bytes()
+        self.mem_usage
     }
 
     pub fn drain(self, writer: &mut SegmentWriter) -> crate::Result<()> {
-        let mut staged = self.compressor.into_staged_document();
         self.root.drain(&mut |document| {
-            staged.load(document)?;
-            // Preserve the concrete document type expected by existing plugins.
             // Single-segment indexing has no deletes, so opstamps are unused.
-            if writer.has_custom_plugins() {
-                writer.add_document(AddOperation {
-                    opstamp: 0,
-                    document: staged.to_tantivy_document(),
-                })?;
-            } else {
-                writer.add_document_ref(0, &staged, None)?;
-            }
-            staged.clear();
-            Ok(())
+            writer.add_document(AddOperation {
+                opstamp: 0,
+                document,
+            })
         })
     }
 }

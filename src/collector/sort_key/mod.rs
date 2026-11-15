@@ -56,7 +56,7 @@ pub(crate) mod tests {
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
 
-        fn create_segment(index: &Index, docs: Vec<impl Document + 'static>) -> crate::Result<()> {
+        fn create_segment(index: &Index, docs: Vec<impl Document>) -> crate::Result<()> {
             let mut index_writer = index.writer_for_tests()?;
             index_writer.set_merge_policy(Box::new(NoMergePolicy));
             for doc in docs {

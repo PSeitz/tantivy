@@ -22,7 +22,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .single_segment_index_writer(RamDirectory::default(), 64_000_000)?
         .with_clustering(ClusteringConfig {
             fields: args[2..].to_vec(),
-            compression: Default::default(),
         })?;
 
     // Documents are staged until finalization. This writer does not automatically flush.

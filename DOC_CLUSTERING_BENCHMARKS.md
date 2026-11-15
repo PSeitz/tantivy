@@ -1,7 +1,8 @@
 # Document clustering benchmarks
 
-Current measurements supporting [the design](DOC_CLUSTERING.md). Superseded
-schema, admission-policy and storage-backend experiments are omitted.
+Historical measurements of compressed staging. The [current design](DOC_CLUSTERING.md)
+retains CompactDocs directly and has not yet been benchmarked. Superseded schema,
+admission-policy and storage-backend experiments are omitted.
 
 ## RAM comparison: clustering, sorting and arrival order
 
