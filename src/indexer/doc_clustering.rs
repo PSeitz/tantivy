@@ -5,7 +5,6 @@
 mod tests;
 
 use std::borrow::Cow;
-use std::cmp::Reverse;
 use std::mem::size_of;
 
 use rustc_hash::FxHashMap;
@@ -29,9 +28,8 @@ struct FieldPath {
 /// Groups use strings. Missing values and non-string endpoints share an ignored bucket.
 /// Objects are only traversed to resolve paths. Repeated fields and arrays use their
 /// first value. Grouping never changes the document.
-/// At each level, larger subtrees come first. Equal-size siblings follow their
-/// first arrival, refining the previously unspecified tie order. Documents in
-/// each leaf retain arrival order.
+/// At each level, the ignored bucket comes first, followed by string groups in
+/// ascending lexicographic order. Documents in each leaf retain arrival order.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ClusteringConfig {
@@ -76,8 +74,6 @@ struct GroupNode<T> {
     // Keep ignored values separate so even the empty string has its own group.
     ignored: Option<Box<GroupNode<T>>>,
     documents: Vec<T>,
-    num_docs: usize,
-    first_arrival: usize,
 }
 
 impl<T> Default for GroupNode<T> {
@@ -86,8 +82,6 @@ impl<T> Default for GroupNode<T> {
             children: FxHashMap::default(),
             ignored: None,
             documents: Vec::new(),
-            num_docs: 0,
-            first_arrival: 0,
         }
     }
 }
@@ -99,20 +93,15 @@ impl<T> GroupNode<T> {
         mut group_keys: impl Iterator<Item = GroupKey<'a>>,
         mem_usage: &mut usize,
     ) -> &mut Vec<T> {
-        self.num_docs += 1;
         let Some(key) = group_keys.next() else {
             return &mut self.documents;
         };
-        let first_arrival = self.children.len() + usize::from(self.ignored.is_some());
         let GroupKey::Str(key) = key else {
             return self
                 .ignored
                 .get_or_insert_with(|| {
                     *mem_usage += size_of::<Self>();
-                    Box::new(Self {
-                        first_arrival,
-                        ..Self::default()
-                    })
+                    Box::default()
                 })
                 .leaf(group_keys, mem_usage);
         };
@@ -120,13 +109,7 @@ impl<T> GroupNode<T> {
             let capacity = self.children.capacity();
             let key = key.clone().into_owned();
             *mem_usage += key.capacity();
-            self.children.insert(
-                key,
-                Self {
-                    first_arrival,
-                    ..Self::default()
-                },
-            );
+            self.children.insert(key, Self::default());
             // Include empty buckets and the trailing control-byte group.
             let bucket_growth =
                 (self.children.capacity() * 8).div_ceil(7) - (capacity * 8).div_ceil(7);
@@ -139,10 +122,6 @@ impl<T> GroupNode<T> {
             .leaf(group_keys, mem_usage)
     }
 
-    fn order_key(&self) -> (Reverse<usize>, usize) {
-        (Reverse(self.num_docs), self.first_arrival)
-    }
-
     fn group_sizes(&self) -> Vec<usize> {
         let mut sizes = Vec::new();
         self.collect_group_sizes(&mut sizes);
@@ -153,13 +132,12 @@ impl<T> GroupNode<T> {
         if !self.documents.is_empty() {
             sizes.push(self.documents.len());
         }
-        let mut children: Vec<_> = self
-            .children
-            .values()
-            .chain(self.ignored.as_deref())
-            .collect();
-        children.sort_unstable_by_key(|child| child.order_key());
-        for child in children {
+        if let Some(ignored) = &self.ignored {
+            ignored.collect_group_sizes(sizes);
+        }
+        let mut children: Vec<_> = self.children.iter().collect();
+        children.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (_, child) in children {
             child.collect_group_sizes(sizes);
         }
     }
@@ -168,14 +146,13 @@ impl<T> GroupNode<T> {
         for document in self.documents {
             visit(document)?;
         }
-        // Collecting drops group keys and the hash table before visiting children.
-        let mut children: Vec<_> = self
-            .children
-            .into_values()
-            .chain(self.ignored.map(|child| *child))
-            .collect();
-        children.sort_unstable_by_key(Self::order_key);
-        for child in children {
+        // Collecting drops the hash table before visiting children.
+        let mut children: Vec<_> = self.children.into_iter().collect();
+        children.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        if let Some(ignored) = self.ignored {
+            ignored.drain(visit)?;
+        }
+        for (_, child) in children {
             child.drain(visit)?;
         }
         Ok(())
@@ -237,6 +214,7 @@ fn group_keys<'a, D: Document>(
 pub struct DocIdGroups {
     grouping_paths: Vec<FieldPath>,
     root: GroupNode<DocId>,
+    num_docs: usize,
 }
 
 impl DocIdGroups {
@@ -245,6 +223,7 @@ impl DocIdGroups {
         Ok(Self {
             grouping_paths: grouping_paths(schema, fields)?,
             root: GroupNode::default(),
+            num_docs: 0,
         })
     }
 
@@ -253,6 +232,7 @@ impl DocIdGroups {
         self.root
             .leaf(group_keys(&self.grouping_paths, document), &mut 0)
             .push(doc_id);
+        self.num_docs += 1;
         Ok(())
     }
 
@@ -266,7 +246,7 @@ impl DocIdGroups {
     /// Supply each original ID exactly once to obtain a permutation suitable for
     /// [`crate::indexer::DocIdMapping::new_permutation`].
     pub fn into_order(self) -> Vec<DocId> {
-        let mut order = Vec::with_capacity(self.root.num_docs);
+        let mut order = Vec::with_capacity(self.num_docs);
         let result: Result<(), std::convert::Infallible> = self.root.drain(&mut |doc_id| {
             order.push(doc_id);
             Ok(())

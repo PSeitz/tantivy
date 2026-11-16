@@ -1,8 +1,56 @@
 # Document clustering benchmarks
 
-Historical measurements of compressed staging. The [current design](DOC_CLUSTERING.md)
-retains CompactDocs directly and has not yet been benchmarked. Superseded schema,
-admission-policy and storage-backend experiments are omitted.
+The cluster-order comparison below uses the retained-CompactDoc baseline. Later sections preserve
+historical compressed-staging measurements. The [current design](DOC_CLUSTERING.md)
+retains CompactDocs directly; its lifecycle CPU and memory have not yet been
+benchmarked. Superseded schema, admission-policy and storage-backend experiments
+are omitted.
+
+## Sibling cluster order: size versus arrival
+
+A matched comparison on 100,000 org 2 records changes only sibling traversal order
+at each grouping level. Leaf membership and arrival order within leaves remain
+identical. The actual Pomsky mapper/schema/tokenizers feed Tantivy
+`9c97cdebf`, with RAM output, Zstd8 and 1,000,000-byte store blocks. Externally
+computed orders feed ordinary single-segment indexing. Both descending orders
+and group boundaries exactly match `DocIdGroups` at the measured commit.
+
+Total retained index bytes, including metadata:
+
+| Sibling order | status/service (1,486 leaves) | source/service/tag.pod_name (6,172 leaves) |
+|---|---:|---:|
+| First arrival | 66,398,460 | 63,540,049 |
+| Descending size (previous policy) | 66,202,734 | 63,349,913 |
+| Ascending size | 66,082,293 | 63,113,865 |
+| Lexicographic (current policy) | **65,552,403** | **62,755,155** |
+
+Descending size saves **0.295%** and **0.299%** versus first-arrival sibling order.
+First-arrival here still groups documents; it is separate from ungrouped input
+order. Most savings come from fast fields. For source/service/pod, the compressed
+store grows by 104,238 bytes while the complete index shrinks by 190,136 bytes.
+Size ordering therefore has a small measured total-index benefit on this prefix,
+with no general guarantee that it improves each component.
+
+Lexicographic sibling order is **0.982%** and **0.939%** smaller than descending
+size here. Its ignored bucket comes first, unlike the historical missing-last
+field-sort experiment below. Clustering now uses this lexicographic policy,
+retaining arrival order within each leaf. Generalization beyond this prefix
+remains unmeasured.
+
+All eight runs pass 800,000 exact stored-document comparisons, exact permutation
+and leaf-membership/order checks, and matching ordinal-addressed semantic
+fingerprints covering terms/postings/frequencies/positions, fast fields,
+fieldnorms and token totals. Both historical descending totals reproduce exactly.
+The driver/order tree is newly implemented, mapper/input adapters recovered
+exactly, and the validator's reconstruction is documented in the artifacts.
+
+One prefix, one schema and one run per layout. No timing, memory, query-performance
+or production flush-budget claim. The export lacks original stored tags/runtime
+metadata, and all layouts include the same stored-only validation ordinal.
+This measures adapted-export indexing, separate from production preprocessing.
+
+Full component sizes, source hashes, recovery/build notes, reproduction, saved
+indexes and orders: `/tmp/cluster-size-order.yHR2dW/{REPORT.md,README.md,results/}`.
 
 ## RAM comparison: clustering, sorting and arrival order
 

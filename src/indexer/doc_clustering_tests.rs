@@ -74,14 +74,10 @@ proptest! {
             remap.add_document(document.clone()).unwrap();
             documents.push(document);
         }
-        // A flat reference: rank every prefix by population, then its first arrival.
-        // No production key extraction, grouping tree, or traversal is reused.
+        // Generated key ranks follow string order, with None (ignored) first.
+        // A flat sort independently checks tree traversal and stable leaf order.
         let mut order: Vec<_> = (0..rows.len()).collect();
-        order.sort_by_key(|&i| {
-            let parent: Vec<_> = (0..keys.len()).filter(|&j| keys[j].0 == keys[i].0).collect();
-            let leaf: Vec<_> = (0..keys.len()).filter(|&j| keys[j] == keys[i]).collect();
-            (Reverse(parent.len()), parent[0], Reverse(leaf.len()), leaf[0], i)
-        });
+        order.sort_by_key(|&i| (keys[i], i));
         let sizes: Vec<_> = order.chunk_by(|&a, &b| keys[a] == keys[b]).map(|group| group.len()).collect();
         prop_assert_eq!(groups.group_sizes(), sizes.clone());
         prop_assert_eq!(writer.clustering_group_sizes(), Some(sizes));
@@ -126,12 +122,12 @@ fn clustering_borrows_string_keys() {
             assert!(matches!(key, GroupKey::Str(Cow::Borrowed(_))));
             groups.leaf(std::iter::once(key), &mut 0).push(());
         }
-        assert_eq!(groups.children[text].num_docs, 2);
+        assert_eq!(groups.children[text].documents.len(), 2);
     }
     groups
         .leaf(std::iter::once(GroupKey::Ignored), &mut 0)
         .push(());
-    assert_eq!(groups.group_sizes(), vec![2, 2, 2, 1]);
+    assert_eq!(groups.group_sizes(), vec![1, 2, 2, 2]);
 }
 
 #[test]
