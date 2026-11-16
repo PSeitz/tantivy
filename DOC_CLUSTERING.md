@@ -45,8 +45,8 @@ Indexing errors are reported during finalization.
 - Repeated fields and arrays use the first value.
 - Missing values, empty arrays, non-string values and paths ending at an object
   share an ignored bucket, separate from the empty string.
-- Larger subtrees come first at every level. Equal-size siblings follow their
-  first arrival. Documents within each leaf retain arrival order.
+- At every level, the ignored bucket comes first, followed by string groups in
+  ascending lexicographic order. Documents within each leaf retain arrival order.
 - `clustering_group_sizes()` returns leaf counts in traversal order.
 - `DocIdGroups` provides the same grouping for caller-supplied IDs without
   retaining documents, for callers using manual remapping instead.
