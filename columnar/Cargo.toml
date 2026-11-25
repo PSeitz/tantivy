@@ -1,6 +1,6 @@
 [package]
 name = "tantivy-columnar"
-version = "0.7.0"
+version = "0.27.0"
 edition = "2024"
 license = "MIT"
 homepage = "https://github.com/quickwit-oss/tantivy"
@@ -12,18 +12,21 @@ categories = ["database-implementations", "data-structures", "compression"]
 itertools = "0.14.0"
 fastdivide = "0.4.0"
 
-stacker = { version= "0.7", path = "../stacker", package="tantivy-stacker"}
-sstable = { version= "0.7", path = "../sstable", package = "tantivy-sstable" }
-common = { version= "0.11", path = "../common", package = "tantivy-common" }
-tantivy-bitpacker = { version= "0.10", path = "../bitpacker/" }
+stacker = { version= "0.27", path = "../stacker", package="tantivy-stacker"}
+sstable = { version= "0.27", path = "../sstable", package = "tantivy-sstable" }
+common = { version= "0.27", path = "../common", package = "tantivy-common" }
+tantivy-bitpacker = { version= "0.27", path = "../bitpacker/" }
 serde = "1.0.152"
 downcast-rs = "2.0.1"
 rand = "0.9"
+# OnPair16 string compression, used by the plain codec of Str and Bytes columns.
+onpair = { version = "0.2.1", optional = true }
 
 [dev-dependencies]
 proptest = "1"
 more-asserts = "0.3.1"
 binggan = "0.17.0"
+serde_json = "1"
 
 [[bench]]
 name = "bench_merge"
@@ -63,3 +66,6 @@ harness = false
 
 [features]
 zstd-compression = ["sstable/zstd-compression"]
+# Compresses the blocks of plain-encoded Str and Bytes columns with OnPair16.
+# Without it, blocks are written raw, and reading an OnPair16 block returns an error.
+plain_codec = ["dep:onpair"]

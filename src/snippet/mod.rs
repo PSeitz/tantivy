@@ -101,7 +101,7 @@ impl FragmentCandidate {
     /// if the token is one of the terms, the score
     /// and highlighted fields are updated in the fragment.
     fn try_add_token(&mut self, token: &Token, terms: &BTreeMap<String, Score>) {
-        self.stop_offset = token.offset_to;
+        self.stop_offset = self.stop_offset.max(token.offset_to);
 
         if let Some(&score) = terms.get(&token.text.to_lowercase()) {
             self.score += score;
@@ -224,7 +224,11 @@ fn search_fragments(
     let mut fragment = FragmentCandidate::new(0);
     let mut fragments: Vec<FragmentCandidate> = vec![];
     while let Some(next) = token_stream.next() {
-        if (next.offset_to - fragment.start_offset) > max_num_chars {
+        // Offsets are in bytes, and a char is at least one byte, so the chars
+        // only need to be counted once the fragment is longer than `max_num_chars` bytes.
+        if (next.offset_to - fragment.start_offset) > max_num_chars
+            && text[fragment.start_offset..next.offset_to].chars().count() > max_num_chars
+        {
             if fragment.score > 0.0 {
                 fragments.push(fragment)
             };
@@ -501,7 +505,7 @@ mod tests {
     use crate::query::QueryParser;
     use crate::schema::{Schema, TEXT};
     use crate::snippet::SnippetGenerator;
-    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer};
+    use crate::tokenizer::{NgramTokenizer, SimpleTokenizer, Token};
     use crate::Index;
 
     const TEST_TEXT: &str = r#"Rust is a systems programming language sponsored by
@@ -550,6 +554,24 @@ Survey in 2016, 2017, and 2018."#;
     }
 
     #[test]
+    fn test_snippet_with_overlapping_tokens() {
+        let terms = btreemap! { "abc".to_string() => 1.0 };
+        let mut fragment = super::FragmentCandidate::new(0);
+        // A whole token followed by a shorter token at the same offset.
+        for text in ["abc", "a"] {
+            let token = Token {
+                text: text.to_string(),
+                offset_from: 0,
+                offset_to: text.len(),
+                ..Token::default()
+            };
+            fragment.try_add_token(&token, &terms);
+        }
+        let snippet = select_best_fragment_combination(&[fragment], "abc");
+        assert_eq!(snippet.to_html(), "<b>abc</b>");
+    }
+
+    #[test]
     fn test_snippet_scored_fragment() {
         {
             let terms = btreemap! {
@@ -590,6 +612,28 @@ Survey in 2016, 2017, and 2018."#;
             let snippet = select_best_fragment_combination(&fragments[..], TEST_TEXT);
             assert_eq!(snippet.to_html(), "programming <b>language</b>")
         }
+    }
+
+    #[test]
+    fn test_snippet_max_num_chars_counts_chars_not_bytes() {
+        // Every Cyrillic letter takes 2 bytes in UTF-8.
+        let text = "русский текст русский текст";
+        let terms = btreemap! { String::from("текст") => 1.0 };
+        let fragments = search_fragments(
+            &mut From::from(SimpleTokenizer::default()),
+            text,
+            &terms,
+            20,
+        );
+        assert_eq!(fragments.len(), 2);
+        for fragment in &fragments {
+            let fragment_text = &text[fragment.start_offset..fragment.stop_offset];
+            assert!(fragment_text.chars().count() <= 20);
+        }
+        let snippet = select_best_fragment_combination(&fragments[..], text);
+        // "русский текст" is 13 chars (25 bytes), so it fits within 20 chars.
+        assert_eq!(snippet.fragment, "русский текст");
+        assert_eq!(snippet.to_html(), "русский <b>текст</b>");
     }
 
     #[test]

@@ -11,7 +11,7 @@ repository = "https://github.com/quickwit-oss/tantivy"
 readme = "README.md"
 keywords = ["search", "information", "retrieval"]
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.91"
 exclude = ["benches/*.json", "benches/*.txt"]
 
 [dependencies]
@@ -81,12 +81,12 @@ jitexpr = { version = "0.1", path = "./jitexpr", optional = true }
 # Used by the jitexpr value source to intern the computed terms.
 hashbrown = { version = "0.17", default-features = false, optional = true }
 
-columnar = { version = "0.7", path = "./columnar", package = "tantivy-columnar" }
-sstable = { version = "0.7", path = "./sstable", package = "tantivy-sstable", optional = true }
-stacker = { version = "0.7", path = "./stacker", package = "tantivy-stacker" }
-query-grammar = { version = "0.26.0", path = "./query-grammar", package = "tantivy-query-grammar" }
-tantivy-bitpacker = { version = "0.10", path = "./bitpacker" }
-common = { version = "0.11", path = "./common/", package = "tantivy-common" }
+columnar = { version = "0.27", path = "./columnar", package = "tantivy-columnar" }
+sstable = { version = "0.27", path = "./sstable", package = "tantivy-sstable", optional = true }
+stacker = { version = "0.27", path = "./stacker", package = "tantivy-stacker" }
+query-grammar = { version = "0.27", path = "./query-grammar", package = "tantivy-query-grammar" }
+tantivy-bitpacker = { version = "0.27", path = "./bitpacker" }
+common = { version = "0.27", path = "./common/", package = "tantivy-common" }
 tokenizer-api = { version = "0.7", path = "./tokenizer-api", package = "tantivy-tokenizer-api" }
 sketches-ddsketch = { version = "0.4", features = ["use_serde"] }
 datasketches = { version = "0.5.0", features = ["hll"] }
@@ -139,7 +139,7 @@ debug-assertions = true
 overflow-checks = true
 
 [features]
-default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
+default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer", "plain_codec"]
 stemmer = ["frostem"]
 mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []
@@ -150,10 +150,13 @@ zstd-compression = ["zstd"]
 # enable zstd-compression in columnar (and sstable)
 columnar-zstd-compression = ["columnar/zstd-compression"]
 
+# OnPair16 compression of plain-encoded Str and Bytes columns in columnar.
+plain_codec = ["columnar/plain_codec"]
+
 failpoints = ["fail", "fail/failpoints"]
 unstable = []                            # useful for benches.
 
-quickwit = ["sstable", "futures-util", "futures-channel"]
+quickwit = ["sstable", "futures-util", "futures-channel", "common/quickwit"]
 jitexpr = ["dep:jitexpr", "dep:hashbrown"]
 
 # Compares only the hash of a string when indexing data.

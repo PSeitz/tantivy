@@ -125,6 +125,8 @@ fn dynamic_column_to_u64_monotonic(dynamic_column: DynamicColumn) -> Option<Colu
         DynamicColumn::F64(column) => Some(column.to_u64_monotonic()),
         DynamicColumn::DateTime(column) => Some(column.to_u64_monotonic()),
         DynamicColumn::IpAddr(_) | DynamicColumn::Bytes(_) | DynamicColumn::Str(_) => None,
+        #[cfg(feature = "plain_codec")]
+        DynamicColumn::PlainBytes(_) | DynamicColumn::PlainStr(_) => None,
     }
 }
 
@@ -208,6 +210,13 @@ fn merge_column(
                     Some(DynamicColumn::Bytes(bytes_column)) => {
                         column_indexes.push(bytes_column.term_ord_column.index.clone());
                         bytes_columns.push(Some(bytes_column));
+                    }
+                    #[cfg(feature = "plain_codec")]
+                    Some(DynamicColumn::PlainStr(_) | DynamicColumn::PlainBytes(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "merging plain-encoded columns is not supported",
+                        ));
                     }
                     _ => {
                         column_indexes.push(ColumnIndex::Empty {
@@ -471,6 +480,8 @@ fn min_max_if_numerical(column: &DynamicColumn) -> Option<(NumericalValue, Numer
         | DynamicColumn::DateTime(_)
         | DynamicColumn::Bytes(_)
         | DynamicColumn::Str(_) => None,
+        #[cfg(feature = "plain_codec")]
+        DynamicColumn::PlainBytes(_) | DynamicColumn::PlainStr(_) => None,
     }
 }
 
