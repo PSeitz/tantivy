@@ -282,28 +282,32 @@ impl CompactDoc {
                 // addresses of the elements in node_data
                 // Reusing a vec would be nicer, but it's not easy because of the recursion
                 // A global vec would work if every writer get it's discriminator
-                let mut addresses = Vec::new();
+                let mut addresses = Vec::with_capacity(elements.len() * 2);
+                let mut count = 0u32;
                 for elem in elements {
                     let value_addr = self.add_value(elem);
                     write_into(&mut addresses, value_addr);
+                    count += 1;
                 }
                 ValueAddr {
                     type_id,
-                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
+                    val_addr: write_container_into(&mut self.node_data, count, &addresses),
                 }
             }
             ReferenceValue::Object(entries) => {
                 // addresses of the elements in node_data
-                let mut addresses = Vec::new();
+                let mut addresses = Vec::with_capacity(entries.len() * 4);
+                let mut count = 0u32;
                 for (key, value) in entries {
                     let key_addr = self.add_value_leaf(ReferenceValueLeaf::Str(key));
                     let value_addr = self.add_value(value);
                     write_into(&mut addresses, key_addr);
                     write_into(&mut addresses, value_addr);
+                    count += 1;
                 }
                 ValueAddr {
                     type_id,
-                    val_addr: write_bytes_into(&mut self.node_data, &addresses),
+                    val_addr: write_container_into(&mut self.node_data, count, &addresses),
                 }
             }
         }
@@ -359,6 +363,20 @@ fn write_bytes_into(vec: &mut Vec<u8>, data: &[u8]) -> u32 {
     let len_vint_bytes = serialize_vint_u32(data.len() as u32, &mut buf);
     vec.extend_from_slice(len_vint_bytes);
     vec.extend_from_slice(data);
+    pos
+}
+
+/// Write a container entry count followed by its serialized address bytes.
+fn write_container_into(vec: &mut Vec<u8>, count: u32, addresses: &[u8]) -> u32 {
+    let pos = vec.len() as u32;
+    let mut count_buf = [0u8; 8];
+    let count_vint_bytes = serialize_vint_u32(count, &mut count_buf);
+    let mut len_buf = [0u8; 8];
+    let total_len = (count_vint_bytes.len() + addresses.len()) as u32;
+    let len_vint_bytes = serialize_vint_u32(total_len, &mut len_buf);
+    vec.extend_from_slice(len_vint_bytes);
+    vec.extend_from_slice(count_vint_bytes);
+    vec.extend_from_slice(addresses);
     pos
 }
 
@@ -620,15 +638,18 @@ impl<'a> From<&ReferenceValueLeaf<'a>> for ValueType {
 pub struct CompactDocObjectIter<'a> {
     container: &'a CompactDoc,
     node_addresses_slice: &'a [u8],
+    remaining: usize,
 }
 
 impl<'a> CompactDocObjectIter<'a> {
     fn new(container: &'a CompactDoc, addr: Addr) -> io::Result<Self> {
-        // Objects are `&[ValueAddr]` serialized into bytes
-        let node_addresses_slice = container.extract_bytes(addr);
+        // Objects are `VInt(count)` followed by `&[ValueAddr]` serialized into bytes
+        let mut node_addresses_slice = container.extract_bytes(addr);
+        let remaining = VInt::deserialize(&mut node_addresses_slice)?.0 as usize;
         Ok(Self {
             container,
             node_addresses_slice,
+            remaining,
         })
     }
 }
@@ -637,34 +658,44 @@ impl<'a> Iterator for CompactDocObjectIter<'a> {
     type Item = (&'a str, CompactDocValue<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.node_addresses_slice.is_empty() {
+        if self.remaining == 0 {
             return None;
         }
         let key_addr = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
         let key = self.container.extract_str(key_addr.val_addr);
         let value = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
+        self.remaining -= 1;
         let value = CompactDocValue {
             container: self.container,
             value_addr: value,
         };
         Some((key, value))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl ExactSizeIterator for CompactDocObjectIter<'_> {}
 
 #[derive(Debug, Clone)]
 /// The Iterator for the array values in the compact document
 pub struct CompactDocArrayIter<'a> {
     container: &'a CompactDoc,
     node_addresses_slice: &'a [u8],
+    remaining: usize,
 }
 
 impl<'a> CompactDocArrayIter<'a> {
     fn new(container: &'a CompactDoc, addr: Addr) -> io::Result<Self> {
-        // Arrays are &[ValueAddr] serialized into bytes
-        let node_addresses_slice = container.extract_bytes(addr);
+        // Arrays are `VInt(count)` followed by `&[ValueAddr]` serialized into bytes
+        let mut node_addresses_slice = container.extract_bytes(addr);
+        let remaining = VInt::deserialize(&mut node_addresses_slice)?.0 as usize;
         Ok(Self {
             container,
             node_addresses_slice,
+            remaining,
         })
     }
 }
@@ -673,17 +704,24 @@ impl<'a> Iterator for CompactDocArrayIter<'a> {
     type Item = CompactDocValue<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.node_addresses_slice.is_empty() {
+        if self.remaining == 0 {
             return None;
         }
         let value = ValueAddr::deserialize(&mut self.node_addresses_slice).ok()?;
+        self.remaining -= 1;
         let value = CompactDocValue {
             container: self.container,
             value_addr: value,
         };
         Some(value)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl ExactSizeIterator for CompactDocArrayIter<'_> {}
 
 impl Document for CompactDoc {
     type Value<'a> = CompactDocValue<'a>;
@@ -800,6 +838,42 @@ mod tests {
         let actual_json: serde_json::Value = serde_json::from_str(&json).unwrap();
         let expected_json: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(actual_json["json"][0], expected_json);
+    }
+
+    #[test]
+    fn test_compact_doc_iter_exact_size() {
+        let mut schema_builder = Schema::builder();
+        let json_field = schema_builder.add_json_field("json", TEXT);
+        let json_val: std::collections::BTreeMap<String, OwnedValue> =
+            serde_json::from_str(r#"{"a": [1, 2, 3], "b": [], "c": {}}"#).unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_object(json_field, json_val);
+
+        let val = doc.get_first(json_field).unwrap();
+        let mut obj = val.as_object().unwrap();
+        assert_eq!(obj.len(), 3);
+        assert_eq!(obj.size_hint(), (3, Some(3)));
+
+        let (k1, v1) = obj.next().unwrap();
+        assert_eq!(k1, "a");
+        assert_eq!(obj.len(), 2);
+        let mut arr = v1.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.size_hint(), (3, Some(3)));
+        assert!(arr.next().is_some());
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.count(), 2);
+
+        let (k2, v2) = obj.next().unwrap();
+        assert_eq!(k2, "b");
+        assert_eq!(v2.as_array().unwrap().len(), 0);
+        assert_eq!(obj.len(), 1);
+
+        let (k3, v3) = obj.next().unwrap();
+        assert_eq!(k3, "c");
+        assert_eq!(v3.as_object().unwrap().len(), 0);
+        assert_eq!(obj.len(), 0);
+        assert!(obj.next().is_none());
     }
 
     // TODO: Should this be re-added with the serialize method

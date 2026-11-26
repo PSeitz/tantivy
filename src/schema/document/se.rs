@@ -46,8 +46,8 @@ where W: Write
                         ReferenceValueLeaf::Str(&pre_tokenized_text.text),
                     ))?;
                 }
-                _ => {
-                    serializer.serialize_value(value_access.as_value())?;
+                value => {
+                    serializer.serialize_value(value)?;
                 }
             }
 
@@ -143,10 +143,6 @@ where W: Write
             ReferenceValue::Array(elements) => {
                 self.write_type_code(type_codes::ARRAY_CODE)?;
 
-                // Somewhat unfortunate that we do this here however, writing the
-                // length at the end of the complicates things quite considerably.
-                let elements: Vec<V> = elements.collect();
-
                 let mut serializer = BinaryArraySerializer::begin(elements.len(), self.writer)?;
 
                 for value in elements {
@@ -158,13 +154,9 @@ where W: Write
             ReferenceValue::Object(object) => {
                 self.write_type_code(type_codes::OBJECT_CODE)?;
 
-                // Somewhat unfortunate that we do this here however, writing the
-                // length at the end of the complicates things quite considerably.
-                let entries: Vec<(&str, V)> = object.collect();
+                let mut serializer = BinaryObjectSerializer::begin(object.len(), self.writer)?;
 
-                let mut serializer = BinaryObjectSerializer::begin(entries.len(), self.writer)?;
-
-                for (key, value) in entries {
+                for (key, value) in object {
                     serializer.serialize_entry(key, value.as_value())?;
                 }
 

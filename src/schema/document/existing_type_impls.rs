@@ -268,6 +268,16 @@ impl<'a> Iterator for JsonObjectIter<'a> {
         let (key, value) = self.0.next()?;
         Some((key, value))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for JsonObjectIter<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 // Custom document types

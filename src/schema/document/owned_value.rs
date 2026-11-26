@@ -468,6 +468,16 @@ impl<'a> Iterator for ObjectMapIter<'a> {
         let (key, value) = self.0.next()?;
         Some((key.as_str(), value))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for ObjectMapIter<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 #[cfg(test)]
