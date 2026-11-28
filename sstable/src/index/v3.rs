@@ -4,7 +4,7 @@ use std::sync::Arc;
 use common::{BinarySerializable, FixedSize, OwnedBytes};
 use tantivy_bitpacker::{BitPacker, compute_num_bits};
 use tantivy_fst::raw::{Fst, Output};
-use tantivy_fst::{Automaton, Map, Streamer};
+use tantivy_fst::{Automaton, Map};
 
 use super::{BlockAddr, BlockStartAddr};
 use crate::block_match_automaton::can_block_match_automaton;
@@ -85,12 +85,7 @@ impl SSTableIndexV3 {
             }
         }
 
-        while !node.is_final() {
-            let t = node.transition(0);
-            out = out.cat(t.out);
-            node = fst.node(t.addr);
-        }
-        Some(out.cat(node.final_output()).value())
+        Some(leftmost_value(fst, node.addr(), out))
     }
 
     /// Get the [`BlockAddr`] of the block that would contain `key`.
@@ -118,50 +113,88 @@ impl SSTableIndexV3 {
         &'a self,
         automaton: &'a impl Automaton,
     ) -> impl Iterator<Item = (u64, BlockAddr)> + 'a {
-        // this is more complicated than other index formats: we don't have a ready made list of
-        // blocks, and instead need to stream-decode the sstable.
-
+        let fst = self.fst_index.as_fst();
+        let start = automaton.start();
+        let mut stack = Vec::new();
+        if !fst.is_empty() && automaton.can_match(&start) {
+            stack.push((fst.root().addr(), Output::zero(), 0, start));
+        }
         GetBlockForAutomaton {
-            streamer: self.fst_index.stream(),
+            fst,
             block_addr_store: &self.block_addr_store,
-            prev_key: None,
             automaton,
+            stack,
+            key_buf: Vec::new(),
+            prev_key: None,
         }
     }
 }
 
-// TODO we iterate over the entire Map to find matching blocks,
-// we could manually iterate on the underlying Fst and skip whole branches if our Automaton says
-// cannot match. this isn't as bad as it sounds given the fst is a lot smaller than the rest of the
-// sstable.
-// To do that, we can't use tantivy_fst's Stream with an automaton, as we need to know 2 consecutive
-// fst keys to form a proper opinion on whether this is a match, which we want translate into a
-// single automaton
+fn leftmost_value(fst: &Fst<OwnedBytes>, addr: usize, mut out: Output) -> u64 {
+    let mut node = fst.node(addr);
+    while !node.is_final() {
+        let t = node.transition(0);
+        out = out.cat(t.out);
+        node = fst.node(t.addr);
+    }
+    out.cat(node.final_output()).value()
+}
+
 struct GetBlockForAutomaton<'a, A: Automaton> {
-    streamer: tantivy_fst::map::Stream<'a>,
+    fst: &'a Fst<OwnedBytes>,
     block_addr_store: &'a BlockAddrStore,
-    prev_key: Option<Vec<u8>>,
     automaton: &'a A,
+    // (node_addr, out, step, state); step 0 checks is_final(), step >= 1 visits transition step -
+    // 1.
+    stack: Vec<(usize, Output, usize, A::State)>,
+    key_buf: Vec<u8>,
+    prev_key: Option<Vec<u8>>,
 }
 
 impl<A: Automaton> Iterator for GetBlockForAutomaton<'_, A> {
     type Item = (u64, BlockAddr);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((new_key, block_id)) = self.streamer.next() {
-            if let Some(prev_key) = self.prev_key.as_mut() {
-                if can_block_match_automaton(Some(prev_key), new_key, self.automaton) {
-                    prev_key.clear();
-                    prev_key.extend_from_slice(new_key);
-                    return Some((block_id, self.block_addr_store.get(block_id).unwrap()));
+        while let Some((addr, out, step, state)) = self.stack.last_mut() {
+            let node = self.fst.node(*addr);
+            let cur = *step;
+            *step += 1;
+
+            let (leaf_addr, leaf_out) = if cur == 0 {
+                if !node.is_final() {
+                    continue;
                 }
-                prev_key.clear();
-                prev_key.extend_from_slice(new_key);
+                (*addr, *out)
+            } else if cur - 1 < node.len() {
+                let t = node.transition(cur - 1);
+                let next_state = self.automaton.accept(state, t.inp);
+                let next_out = out.cat(t.out);
+                self.key_buf.push(t.inp);
+                if self.automaton.can_match(&next_state) {
+                    self.stack.push((t.addr, next_out, 0, next_state));
+                    continue;
+                }
+                // Dead subtree: every key in `[key_buf, max_key(t)]` cannot match, so `key_buf` is
+                // exact both as the end bound for `(prev_key, min_key(t)]` and as the next
+                // prev_key.
+                (t.addr, next_out)
             } else {
-                self.prev_key = Some(new_key.to_owned());
-                if can_block_match_automaton(None, new_key, self.automaton) {
-                    return Some((block_id, self.block_addr_store.get(block_id).unwrap()));
-                }
+                self.stack.pop();
+                self.key_buf.pop();
+                continue;
+            };
+
+            let matches =
+                can_block_match_automaton(self.prev_key.as_deref(), &self.key_buf, self.automaton);
+            let prev = self.prev_key.get_or_insert_with(Vec::new);
+            prev.clear();
+            prev.extend_from_slice(&self.key_buf);
+            if cur > 0 {
+                self.key_buf.pop();
+            }
+            if matches {
+                let block_id = leftmost_value(self.fst, leaf_addr, leaf_out);
+                return Some((block_id, self.block_addr_store.get(block_id).unwrap()));
             }
         }
         None
@@ -809,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_locate_with_key_matches_fst_range() {
-        use tantivy_fst::IntoStreamer;
+        use tantivy_fst::{IntoStreamer, Streamer};
 
         let mut builder = SSTableIndexBuilder::default();
         let keys: &[&[u8]] = &[b"ba", b"baa", b"bad", b"cat", b"dog", b"doge"];
@@ -834,6 +867,82 @@ mod tests {
                 .next()
                 .map(|(_, id)| id);
             assert_eq!(index.locate_with_key(probe), expected, "probe={probe:?}");
+        }
+    }
+
+    #[test]
+    fn test_get_block_for_automaton_matches_full_scan() {
+        use tantivy_fst::Streamer;
+        use tantivy_fst::automaton::{AlwaysMatch, Automaton, Subsequence};
+
+        fn assert_matches<A: Automaton>(index: &SSTableIndexV3, automaton: &A) {
+            let mut stream = index.fst_index.stream();
+            let mut prev: Option<Vec<u8>> = None;
+            let mut expected = Vec::new();
+            while let Some((key, block_id)) = stream.next() {
+                if can_block_match_automaton(prev.as_deref(), key, automaton) {
+                    expected.push((block_id, index.block_addr_store.get(block_id).unwrap()));
+                }
+                prev = Some(key.to_vec());
+            }
+            let got: Vec<_> = index.get_block_for_automaton(automaton).collect();
+            assert_eq!(got, expected);
+        }
+
+        fn build_index(keys: &[impl AsRef<[u8]>]) -> SSTableIndexV3 {
+            let mut builder = SSTableIndexBuilder::default();
+            for (i, key) in keys.iter().enumerate() {
+                builder.add_block(key.as_ref(), i * 10..(i + 1) * 10, (i * 5) as u64);
+            }
+            let mut buf = Vec::new();
+            let fst_len = builder.serialize(&mut buf).unwrap();
+            SSTableIndexV3::load(OwnedBytes::new(buf), fst_len).unwrap()
+        }
+
+        let fixed: &[&[&[u8]]] = &[
+            &[b"", b"a", b"ab", b"abc", b"b"],
+            &[b"apple", b"h99", b"j00", b"zoo"],
+            &[b"\x00", b"in", b"inter", b"intering", b"ja", b"\xff"],
+        ];
+        let mut indices: Vec<SSTableIndexV3> = fixed.iter().map(|ks| build_index(ks)).collect();
+
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 33) as usize
+        };
+        for _ in 0..30 {
+            let mut keys: Vec<Vec<u8>> = (0..(next() % 60) + 2)
+                .map(|_| {
+                    (0..next() % 7)
+                        .map(|_| b"abcdefghij"[next() % 10])
+                        .collect()
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            if keys.len() >= 2 {
+                indices.push(build_index(&keys));
+            }
+        }
+
+        for index in &indices {
+            for pat in ["", "a", "ab", "d", "h", "i", "inter", "intering", "j", "zz"] {
+                let b = pat.as_bytes().to_vec();
+                assert_matches(index, &EqBuffer(b.clone()));
+                assert_matches(index, &EqBuffer(b.clone()).starts_with());
+                let anchored = EqBuffer(b)
+                    .starts_with()
+                    .intersection(Subsequence::new("g"));
+                assert_matches(index, &anchored);
+            }
+            assert_matches(index, &Subsequence::new("ing"));
+            let union = EqBuffer(b"a".to_vec())
+                .starts_with()
+                .union(EqBuffer(b"i".to_vec()).starts_with());
+            assert_matches(index, &union);
+            assert_matches(index, &AlwaysMatch);
+            assert_matches(index, &AlwaysMatch.complement());
         }
     }
 }
